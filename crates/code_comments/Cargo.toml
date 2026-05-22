@@ -12,6 +12,9 @@ workspace = true
 path = "src/code_comments.rs"
 
 [dependencies]
+acp_thread.workspace = true
+agent-client-protocol.workspace = true
+agent_ui.workspace = true
 anyhow.workspace = true
 collections.workspace = true
 db.workspace = true

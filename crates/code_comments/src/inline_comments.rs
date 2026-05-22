@@ -15,8 +15,9 @@ use text::{Bias, Point};
 use workspace::Workspace;
 
 use crate::{
-    AddComment, CommentAnchor, CommentKind, CommentStatus, CommentStore, CommentThread, ThreadId,
-    comment_card::CommentCard, registry::comment_store,
+    AddComment, CommentAnchor, CommentKind, CommentStatus, CommentStore, CommentThread,
+    SendTasksToAgent, ThreadId, agent_integration, comment_card::CommentCard,
+    registry::comment_store,
 };
 
 /// Registers the `AddComment` workspace action and attaches comment rendering
@@ -24,6 +25,7 @@ use crate::{
 pub fn init(cx: &mut App) {
     cx.observe_new::<Workspace>(|workspace, _window, _cx| {
         workspace.register_action(add_comment);
+        workspace.register_action(send_tasks);
     })
     .detach();
 
@@ -108,9 +110,13 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     let Some(store) = resolve_store(editor, cx) else {
         return;
     };
+    let Some(workspace) = editor.workspace() else {
+        return;
+    };
     if editor.addon::<InlineCommentsAddon>().is_none() {
         return;
     }
+    let workspace = workspace.downgrade();
 
     let multibuffer = editor.buffer().clone();
     let mb_snapshot = multibuffer.read(cx).snapshot(cx);
@@ -181,7 +187,8 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
             continue;
         }
         let height = block_height(thread);
-        let card = cx.new(|cx| CommentCard::new(store.clone(), *id, window, cx));
+        let card =
+            cx.new(|cx| CommentCard::new(store.clone(), *id, workspace.clone(), window, cx));
         properties.push(BlockProperties {
             placement: BlockPlacement::Below(*anchor),
             height: Some(height),
@@ -240,6 +247,20 @@ fn add_comment(
         return;
     };
     store.update(cx, |store, cx| store.upsert_thread(thread, cx));
+}
+
+/// `SendTasksToAgent` handler: delivers every open task-kind comment to the
+/// active agent thread.
+fn send_tasks(
+    workspace: &mut Workspace,
+    _: &SendTasksToAgent,
+    _window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(store) = comment_store(workspace, cx) else {
+        return;
+    };
+    agent_integration::send_tasks_to_agent(workspace, store, cx);
 }
 
 fn build_thread(
