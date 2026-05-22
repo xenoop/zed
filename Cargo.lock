@@ -3181,6 +3181,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "code_comments"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "db",
+ "gpui",
+ "log",
+ "util",
+ "uuid",
+ "workspace",
+]
+
+[[package]]
 name = "codespan-reporting"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
