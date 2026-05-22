@@ -4,16 +4,21 @@
 
 use editor::Editor;
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable, Subscription, Window, div,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable, Subscription, WeakEntity, Window, div,
 };
 use ui::prelude::*;
+use workspace::Workspace;
 
-use crate::{CommentAuthor, CommentNode, CommentStatus, CommentStore, CommentThread, ThreadId};
+use crate::{
+    CommentAuthor, CommentKind, CommentNode, CommentStatus, CommentStore, CommentThread, ThreadId,
+    agent_integration,
+};
 
 /// A rendered inline comment thread. One card exists per visible thread.
 pub struct CommentCard {
     store: Entity<CommentStore>,
     thread_id: ThreadId,
+    workspace: WeakEntity<Workspace>,
     /// Input for composing the root comment or a reply.
     input: Entity<Editor>,
     _observe_store: Subscription,
@@ -23,6 +28,7 @@ impl CommentCard {
     pub fn new(
         store: Entity<CommentStore>,
         thread_id: ThreadId,
+        workspace: WeakEntity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -31,9 +37,36 @@ impl CommentCard {
         Self {
             store,
             thread_id,
+            workspace,
             input,
             _observe_store,
         }
+    }
+
+    /// Cycles the thread's kind: Comment → Question → Task → Comment.
+    fn cycle_kind(&mut self, cx: &mut Context<Self>) {
+        let thread_id = self.thread_id;
+        self.store.update(cx, |store, cx| {
+            let next = match store.thread(thread_id).map(|thread| thread.kind) {
+                Some(CommentKind::Comment) => CommentKind::Question,
+                Some(CommentKind::Question) => CommentKind::Task,
+                _ => CommentKind::Comment,
+            };
+            store.set_thread_kind(thread_id, next, cx);
+        });
+    }
+
+    /// Sends this thread to the active agent thread; the agent's reply is
+    /// appended to the comment tree.
+    fn send_to_agent(&mut self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let store = self.store.clone();
+        let thread_id = self.thread_id;
+        workspace.update(cx, |workspace, cx| {
+            agent_integration::send_thread_to_agent(workspace, store, thread_id, cx);
+        });
     }
 
     pub fn thread_id(&self) -> ThreadId {
@@ -151,18 +184,45 @@ impl Render for CommentCard {
         let collapsed = thread.collapsed;
         let node_count = thread.nodes.len();
         let thread_key = thread.id.0.to_string();
+        let kind_label = match thread.kind {
+            CommentKind::Comment => "Comment",
+            CommentKind::Question => "Question",
+            CommentKind::Task => "Task",
+        };
 
         let header = h_flex()
             .w_full()
             .justify_between()
             .child(
-                Label::new(if resolved { "Resolved" } else { "Comment" })
-                    .size(LabelSize::Small)
-                    .color(if resolved { Color::Success } else { Color::Muted }),
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new(
+                            SharedString::from(format!("kind-{thread_key}")),
+                            kind_label,
+                        )
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(|this, _, _, cx| this.cycle_kind(cx))),
+                    )
+                    .when(resolved, |this| {
+                        this.child(
+                            Label::new("Resolved")
+                                .size(LabelSize::Small)
+                                .color(Color::Success),
+                        )
+                    }),
             )
             .child(
                 h_flex()
                     .gap_1()
+                    .child(
+                        Button::new(
+                            SharedString::from(format!("agent-{thread_key}")),
+                            "Send to agent",
+                        )
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(|this, _, _, cx| this.send_to_agent(cx))),
+                    )
                     .child(
                         Button::new(
                             SharedString::from(format!("collapse-{thread_key}")),

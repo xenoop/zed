@@ -351,6 +351,19 @@ impl CommentStore {
         }
     }
 
+    /// Sets a thread's comment kind (Comment / Question / Task).
+    pub fn set_thread_kind(
+        &mut self,
+        thread_id: ThreadId,
+        kind: CommentKind,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(thread) = self.thread_mut(thread_id) {
+            thread.kind = kind;
+            self.changed(cx);
+        }
+    }
+
     /// Sets a thread's collapsed/expanded state.
     pub fn set_thread_collapsed(
         &mut self,

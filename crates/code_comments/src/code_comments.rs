@@ -5,6 +5,7 @@
 //! comment-card block rendering, and—​in later phases—​agent integration and
 //! remote sync.
 
+mod agent_integration;
 mod comment_card;
 mod comment_store;
 mod inline_comments;
@@ -24,7 +25,9 @@ actions!(
     code_comments,
     [
         /// Adds an inline comment on the selected line or range.
-        AddComment
+        AddComment,
+        /// Sends every open task-kind comment to the active agent thread.
+        SendTasksToAgent
     ]
 );
 
