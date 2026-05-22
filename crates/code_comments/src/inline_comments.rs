@@ -12,7 +12,7 @@ use editor::{
 use gpui::{App, AppContext as _, Context, Entity, IntoElement, Subscription, Window};
 use multi_buffer::{Anchor, MultiBufferSnapshot};
 use settings::Settings as _;
-use text::{Bias, Point};
+use text::{Bias, BufferSnapshot, Point};
 use util::ResultExt as _;
 use workspace::Workspace;
 
@@ -50,6 +50,7 @@ struct InlineCommentsAddon {
 
 struct ThreadBlock {
     block_id: CustomBlockId,
+    card: Entity<CommentCard>,
     height: u32,
 }
 
@@ -126,7 +127,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     let mb_snapshot = multibuffer.read(cx).snapshot(cx);
     let buffers = multibuffer.read(cx).all_buffers();
 
-    let mut desired: HashMap<ThreadId, (CommentThread, Anchor)> = HashMap::default();
+    let mut desired: HashMap<ThreadId, (CommentThread, Anchor, bool)> = HashMap::default();
     for buffer in buffers {
         let buffer = buffer.read(cx);
         let Some(path) = buffer.file().map(|file| file.path().clone()) else {
@@ -137,12 +138,11 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
             continue;
         }
         let buffer_snapshot = buffer.text_snapshot();
-        let max_row = buffer_snapshot.max_point().row;
         for thread in threads {
-            let row = thread.anchor.start_row.min(max_row);
+            let (row, anchored) = resolve_row(&buffer_snapshot, &thread.anchor);
             let text_anchor = buffer_snapshot.anchor_after(Point::new(row, 0));
             if let Some(anchor) = mb_snapshot.anchor_in_excerpt(text_anchor) {
-                desired.insert(thread.id, (thread, anchor));
+                desired.insert(thread.id, (thread, anchor, anchored));
             }
         }
     }
@@ -168,15 +168,19 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
         editor.remove_blocks(removed, None, cx);
     }
 
-    // Resize blocks whose comment count changed.
+    // Resize blocks whose comment count changed, and refresh the outdated
+    // state of every card still on screen.
     let mut resizes = HashMap::default();
     for (id, block) in blocks.iter_mut() {
-        if let Some((thread, _)) = desired.get(id) {
+        if let Some((thread, _, anchored)) = desired.get(id) {
             let height = block_height(thread);
             if height != block.height {
                 block.height = height;
                 resizes.insert(block.block_id, height);
             }
+            block
+                .card
+                .update(cx, |card, cx| card.set_anchored(*anchored, cx));
         }
     }
     if !resizes.is_empty() {
@@ -186,32 +190,80 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     // Insert blocks for newly visible threads.
     let mut properties = Vec::new();
     let mut pending = Vec::new();
-    for (id, (thread, anchor)) in &desired {
+    for (id, (thread, anchor, anchored)) in &desired {
         if blocks.contains_key(id) {
             continue;
         }
         let height = block_height(thread);
-        let card =
-            cx.new(|cx| CommentCard::new(store.clone(), *id, workspace.clone(), window, cx));
+        let card = cx.new(|cx| {
+            CommentCard::new(store.clone(), *id, workspace.clone(), *anchored, window, cx)
+        });
+        let card_for_block = card.clone();
         properties.push(BlockProperties {
             placement: BlockPlacement::Below(*anchor),
             height: Some(height),
             style: BlockStyle::Flex,
-            render: Arc::new(move |_cx: &mut BlockContext| card.clone().into_any_element()),
+            render: Arc::new(move |_cx: &mut BlockContext| {
+                card_for_block.clone().into_any_element()
+            }),
             priority: 0,
         });
-        pending.push((*id, height));
+        pending.push((*id, height, card));
     }
     if !properties.is_empty() {
         let block_ids = editor.insert_blocks(properties, None, cx);
-        for ((id, height), block_id) in pending.into_iter().zip(block_ids) {
-            blocks.insert(id, ThreadBlock { block_id, height });
+        for ((id, height, card), block_id) in pending.into_iter().zip(block_ids) {
+            blocks.insert(
+                id,
+                ThreadBlock {
+                    block_id,
+                    card,
+                    height,
+                },
+            );
         }
     }
 
     if let Some(addon) = editor.addon_mut::<InlineCommentsAddon>() {
         addon.blocks = blocks;
     }
+}
+
+/// Resolves a thread's display row against the current buffer using its stored
+/// fingerprint. Returns the row to anchor the card to and whether the comment
+/// is still anchored — `false` marks it outdated.
+///
+/// If the fingerprinted line moved, it is found by scanning a window around the
+/// stored row; if it cannot be found at all, the comment is flagged outdated
+/// and left at its stored row.
+fn resolve_row(snapshot: &BufferSnapshot, anchor: &CommentAnchor) -> (u32, bool) {
+    let max_row = snapshot.max_point().row;
+    let stored = anchor.start_row.min(max_row);
+    if anchor.fingerprint.is_empty() {
+        return (stored, true);
+    }
+    if line_text(snapshot, stored) == anchor.fingerprint {
+        return (stored, true);
+    }
+    const WINDOW: u32 = 80;
+    let lo = anchor.start_row.saturating_sub(WINDOW);
+    let hi = (anchor.start_row + WINDOW).min(max_row);
+    for row in lo..=hi {
+        if line_text(snapshot, row) == anchor.fingerprint {
+            return (row, true);
+        }
+    }
+    (stored, false)
+}
+
+fn line_text(snapshot: &BufferSnapshot, row: u32) -> String {
+    let start = Point::new(row, 0);
+    let end = snapshot.clip_point(Point::new(row, u32::MAX), Bias::Left);
+    snapshot
+        .text_for_range(start..end)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// Estimated block height in display rows. Refined as the card content grows.

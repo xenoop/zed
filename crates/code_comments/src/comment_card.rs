@@ -19,6 +19,9 @@ pub struct CommentCard {
     store: Entity<CommentStore>,
     thread_id: ThreadId,
     workspace: WeakEntity<Workspace>,
+    /// Whether the comment is still anchored to matching code; `false` renders
+    /// an "Outdated" badge.
+    anchored: bool,
     /// Input for composing the root comment or a reply.
     input: Entity<Editor>,
     _observe_store: Subscription,
@@ -29,6 +32,7 @@ impl CommentCard {
         store: Entity<CommentStore>,
         thread_id: ThreadId,
         workspace: WeakEntity<Workspace>,
+        anchored: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -38,8 +42,17 @@ impl CommentCard {
             store,
             thread_id,
             workspace,
+            anchored,
             input,
             _observe_store,
+        }
+    }
+
+    /// Updates whether the comment is still anchored to matching code.
+    pub fn set_anchored(&mut self, anchored: bool, cx: &mut Context<Self>) {
+        if self.anchored != anchored {
+            self.anchored = anchored;
+            cx.notify();
         }
     }
 
@@ -209,6 +222,13 @@ impl Render for CommentCard {
                             Label::new("Resolved")
                                 .size(LabelSize::Small)
                                 .color(Color::Success),
+                        )
+                    })
+                    .when(!self.anchored, |this| {
+                        this.child(
+                            Label::new("Outdated")
+                                .size(LabelSize::Small)
+                                .color(Color::Warning),
                         )
                     }),
             )
