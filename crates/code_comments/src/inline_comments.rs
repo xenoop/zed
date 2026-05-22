@@ -10,7 +10,7 @@ use editor::{
     display_map::{BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId},
 };
 use gpui::{App, AppContext as _, Context, Entity, IntoElement, Subscription, Window};
-use multi_buffer::MultiBufferSnapshot;
+use multi_buffer::{Anchor, MultiBufferSnapshot};
 use text::{Bias, Point};
 use workspace::Workspace;
 
@@ -36,10 +36,10 @@ pub fn init(cx: &mut App) {
 }
 
 /// Per-editor state, stored as an editor addon so it is dropped together with
-/// the editor (taking its comment-card entities and subscription with it).
+/// the editor (taking its comment-card entities and subscriptions with it).
 struct InlineCommentsAddon {
     blocks: HashMap<ThreadId, ThreadBlock>,
-    _subscription: Subscription,
+    _subscriptions: Vec<Subscription>,
 }
 
 struct ThreadBlock {
@@ -61,42 +61,81 @@ fn attach_to_editor(editor: &mut Editor, window: &mut Window, cx: &mut Context<E
     if editor.addon::<InlineCommentsAddon>().is_some() {
         return;
     }
-    if editor.project_path(cx).is_none() {
-        return;
-    }
+    // Comments are workspace-local; editors with no workspace (input fields,
+    // previews) get no store and are skipped.
     let Some(store) = resolve_store(editor, cx) else {
         return;
     };
 
-    let subscription = cx.subscribe_in(&store, window, |editor, _store, _event, window, cx| {
-        refresh(editor, window, cx);
-    });
+    let mut subscriptions = Vec::new();
+    subscriptions.push(cx.subscribe_in(
+        &store,
+        window,
+        |editor, _store, _event, window, cx| {
+            refresh(editor, window, cx);
+        },
+    ));
+    // The Project Diff multibuffer adds and removes file excerpts over time;
+    // refresh so comment cards follow their excerpts.
+    let multibuffer = editor.buffer().clone();
+    subscriptions.push(cx.subscribe_in(
+        &multibuffer,
+        window,
+        |editor, _multibuffer, event, window, cx| {
+            if matches!(
+                event,
+                multi_buffer::Event::BufferRangesUpdated { .. }
+                    | multi_buffer::Event::BuffersRemoved { .. }
+            ) {
+                refresh(editor, window, cx);
+            }
+        },
+    ));
     editor.register_addon(InlineCommentsAddon {
         blocks: HashMap::default(),
-        _subscription: subscription,
+        _subscriptions: subscriptions,
     });
     refresh(editor, window, cx);
 }
 
 /// Reconciles the editor's comment-card blocks with the store: removes blocks
 /// for deleted threads, inserts blocks for new ones, and resizes the rest.
+///
+/// Works buffer-by-buffer so it covers both singleton file editors and the
+/// Project Diff multibuffer: each thread's stored buffer position is lifted to
+/// a multibuffer anchor via `anchor_in_excerpt`.
 fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     let Some(store) = resolve_store(editor, cx) else {
-        return;
-    };
-    let Some(path) = editor.project_path(cx).map(|project_path| project_path.path) else {
         return;
     };
     if editor.addon::<InlineCommentsAddon>().is_none() {
         return;
     }
 
-    let desired: HashMap<ThreadId, CommentThread> = store
-        .read(cx)
-        .threads_for_file(&path)
-        .iter()
-        .map(|thread| (thread.id, thread.clone()))
-        .collect();
+    let multibuffer = editor.buffer().clone();
+    let mb_snapshot = multibuffer.read(cx).snapshot(cx);
+    let buffers = multibuffer.read(cx).all_buffers();
+
+    let mut desired: HashMap<ThreadId, (CommentThread, Anchor)> = HashMap::default();
+    for buffer in buffers {
+        let buffer = buffer.read(cx);
+        let Some(path) = buffer.file().map(|file| file.path().clone()) else {
+            continue;
+        };
+        let threads = store.read(cx).threads_for_file(&path).to_vec();
+        if threads.is_empty() {
+            continue;
+        }
+        let buffer_snapshot = buffer.text_snapshot();
+        let max_row = buffer_snapshot.max_point().row;
+        for thread in threads {
+            let row = thread.anchor.start_row.min(max_row);
+            let text_anchor = buffer_snapshot.anchor_after(Point::new(row, 0));
+            if let Some(anchor) = mb_snapshot.anchor_in_excerpt(text_anchor) {
+                desired.insert(thread.id, (thread, anchor));
+            }
+        }
+    }
 
     let mut blocks = editor
         .addon_mut::<InlineCommentsAddon>()
@@ -122,7 +161,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     // Resize blocks whose comment count changed.
     let mut resizes = HashMap::default();
     for (id, block) in blocks.iter_mut() {
-        if let Some(thread) = desired.get(id) {
+        if let Some((thread, _)) = desired.get(id) {
             let height = block_height(thread);
             if height != block.height {
                 block.height = height;
@@ -134,21 +173,17 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
         editor.resize_blocks(resizes, None, cx);
     }
 
-    // Insert blocks for newly added threads.
-    let snapshot = editor.buffer().read(cx).snapshot(cx);
-    let max_row = snapshot.max_point().row;
+    // Insert blocks for newly visible threads.
     let mut properties = Vec::new();
     let mut pending = Vec::new();
-    for (id, thread) in &desired {
+    for (id, (thread, anchor)) in &desired {
         if blocks.contains_key(id) {
             continue;
         }
-        let row = thread.anchor.start_row.min(max_row);
-        let anchor = snapshot.anchor_after(Point::new(row, 0));
         let height = block_height(thread);
         let card = cx.new(|cx| CommentCard::new(store.clone(), *id, window, cx));
         properties.push(BlockProperties {
-            placement: BlockPlacement::Below(anchor),
+            placement: BlockPlacement::Below(*anchor),
             height: Some(height),
             style: BlockStyle::Flex,
             render: Arc::new(move |_cx: &mut BlockContext| card.clone().into_any_element()),
