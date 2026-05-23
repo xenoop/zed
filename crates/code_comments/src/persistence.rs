@@ -1,9 +1,9 @@
 //! Workspace-local sqlite persistence for inline code comments.
 //!
-//! Mirrors the breakpoint / `file_folds` persistence pattern: comment threads
-//! and their nodes are stored keyed by `workspace_id`, with positions kept as
-//! row/column pairs plus a text fingerprint so they can be re-anchored after
-//! the file changes.
+//! Mirrors the breakpoint / `file_folds` persistence pattern: conversations
+//! and their comments are stored keyed by `workspace_id`, with positions kept
+//! as row/column pairs plus a text fingerprint so they can be re-anchored
+//! after the file changes.
 
 use anyhow::Result;
 use db::{
@@ -16,11 +16,11 @@ use db::{
 };
 use workspace::{WorkspaceDb, WorkspaceId};
 
-/// One persisted comment thread (without its `workspace_id`, which is implied
+/// One persisted conversation (without its `workspace_id`, which is implied
 /// by the query).
 #[derive(Clone, Debug)]
-pub struct DbThreadRow {
-    pub thread_id: String,
+pub struct DbConversationRow {
+    pub conversation_id: String,
     pub path: String,
     pub start_row: u32,
     pub start_column: u32,
@@ -32,31 +32,31 @@ pub struct DbThreadRow {
     pub collapsed: bool,
 }
 
-/// One persisted comment node (a single message within a thread's tree).
+/// One persisted comment (a single message within a conversation's tree).
 #[derive(Clone, Debug)]
-pub struct DbNodeRow {
-    pub thread_id: String,
-    pub node_id: String,
-    pub parent_id: Option<String>,
+pub struct DbCommentRow {
+    pub conversation_id: String,
+    pub comment_id: String,
+    pub in_reply_to: Option<String>,
     pub author_kind: i64,
     pub author_login: Option<String>,
     pub body: String,
     pub created_at: i64,
     pub remote_id: Option<i64>,
-    /// Per-node CommentKind (Comment / Question / Task). Defaults to 0 for
+    /// Per-comment CommentKind (Comment / Question / Task). Defaults to 0 for
     /// rows persisted before this column existed.
     pub kind: i64,
 }
 
-impl StaticColumnCount for DbThreadRow {
+impl StaticColumnCount for DbConversationRow {
     fn column_count() -> usize {
         10
     }
 }
 
-impl Bind for DbThreadRow {
+impl Bind for DbConversationRow {
     fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
-        let next = statement.bind(&self.thread_id, start_index)?;
+        let next = statement.bind(&self.conversation_id, start_index)?;
         let next = statement.bind(&self.path, next)?;
         let next = statement.bind(&self.start_row, next)?;
         let next = statement.bind(&self.start_column, next)?;
@@ -70,9 +70,9 @@ impl Bind for DbThreadRow {
     }
 }
 
-impl Column for DbThreadRow {
+impl Column for DbConversationRow {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
-        let (thread_id, next) = Column::column(statement, start_index)?;
+        let (conversation_id, next) = Column::column(statement, start_index)?;
         let (path, next) = Column::column(statement, next)?;
         let (start_row, next) = Column::column(statement, next)?;
         let (start_column, next) = Column::column(statement, next)?;
@@ -84,7 +84,7 @@ impl Column for DbThreadRow {
         let (collapsed, next) = Column::column(statement, next)?;
         Ok((
             Self {
-                thread_id,
+                conversation_id,
                 path,
                 start_row,
                 start_column,
@@ -100,17 +100,17 @@ impl Column for DbThreadRow {
     }
 }
 
-impl StaticColumnCount for DbNodeRow {
+impl StaticColumnCount for DbCommentRow {
     fn column_count() -> usize {
         9
     }
 }
 
-impl Bind for DbNodeRow {
+impl Bind for DbCommentRow {
     fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
-        let next = statement.bind(&self.thread_id, start_index)?;
-        let next = statement.bind(&self.node_id, next)?;
-        let next = statement.bind(&self.parent_id, next)?;
+        let next = statement.bind(&self.conversation_id, start_index)?;
+        let next = statement.bind(&self.comment_id, next)?;
+        let next = statement.bind(&self.in_reply_to, next)?;
         let next = statement.bind(&self.author_kind, next)?;
         let next = statement.bind(&self.author_login, next)?;
         let next = statement.bind(&self.body, next)?;
@@ -121,11 +121,11 @@ impl Bind for DbNodeRow {
     }
 }
 
-impl Column for DbNodeRow {
+impl Column for DbCommentRow {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
-        let (thread_id, next) = Column::column(statement, start_index)?;
-        let (node_id, next) = Column::column(statement, next)?;
-        let (parent_id, next) = Column::column(statement, next)?;
+        let (conversation_id, next) = Column::column(statement, start_index)?;
+        let (comment_id, next) = Column::column(statement, next)?;
+        let (in_reply_to, next) = Column::column(statement, next)?;
         let (author_kind, next) = Column::column(statement, next)?;
         let (author_login, next) = Column::column(statement, next)?;
         let (body, next) = Column::column(statement, next)?;
@@ -134,9 +134,9 @@ impl Column for DbNodeRow {
         let (kind, next) = Column::column(statement, next)?;
         Ok((
             Self {
-                thread_id,
-                node_id,
-                parent_id,
+                conversation_id,
+                comment_id,
+                in_reply_to,
                 author_kind,
                 author_login,
                 body,
@@ -154,6 +154,9 @@ pub struct CommentsDb(db::sqlez::thread_safe_connection::ThreadSafeConnection);
 impl db::sqlez::domain::Domain for CommentsDb {
     const NAME: &str = stringify!(CommentsDb);
 
+    // Historical migrations are immutable — once a row has run against a
+    // user's database, the string can never change. Schema renames live in
+    // ALTER migrations appended at the end.
     const MIGRATIONS: &[&str] = &[
         sql! (
             CREATE TABLE comment_threads (
@@ -193,6 +196,17 @@ impl db::sqlez::domain::Domain for CommentsDb {
         sql! (
             ALTER TABLE comment_nodes ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;
         ),
+        // Rename tables and columns to the universal-model vocabulary
+        // (conversation / comment / in_reply_to). The Rust types and SQL
+        // queries below use the post-rename names.
+        sql! (
+            ALTER TABLE comment_threads RENAME TO conversations;
+            ALTER TABLE comment_nodes RENAME TO comments;
+            ALTER TABLE conversations RENAME COLUMN thread_id TO conversation_id;
+            ALTER TABLE comments RENAME COLUMN thread_id TO conversation_id;
+            ALTER TABLE comments RENAME COLUMN node_id TO comment_id;
+            ALTER TABLE comments RENAME COLUMN parent_id TO in_reply_to;
+        ),
     ];
 }
 
@@ -200,56 +214,56 @@ db::static_connection!(CommentsDb, [WorkspaceDb]);
 
 impl CommentsDb {
     query! {
-        pub fn load_threads(workspace_id: WorkspaceId) -> Result<Vec<DbThreadRow>> {
-            SELECT thread_id, path, start_row, start_column, end_row, end_column,
+        pub fn load_conversations(workspace_id: WorkspaceId) -> Result<Vec<DbConversationRow>> {
+            SELECT conversation_id, path, start_row, start_column, end_row, end_column,
                    fingerprint, kind, status, collapsed
-            FROM comment_threads
+            FROM conversations
             WHERE workspace_id = ?
         }
     }
 
     query! {
-        pub fn load_nodes(workspace_id: WorkspaceId) -> Result<Vec<DbNodeRow>> {
-            SELECT thread_id, node_id, parent_id, author_kind, author_login,
+        pub fn load_comments(workspace_id: WorkspaceId) -> Result<Vec<DbCommentRow>> {
+            SELECT conversation_id, comment_id, in_reply_to, author_kind, author_login,
                    body, created_at, remote_id, kind
-            FROM comment_nodes
+            FROM comments
             WHERE workspace_id = ?
         }
     }
 
-    /// Atomically replaces every persisted thread and node for the workspace.
-    /// Comment volume per workspace is small, so a full rewrite keeps the
-    /// store and the database trivially consistent.
+    /// Atomically replaces every persisted conversation and comment for the
+    /// workspace. Comment volume per workspace is small, so a full rewrite
+    /// keeps the store and the database trivially consistent.
     pub async fn replace_all(
         &self,
         workspace_id: WorkspaceId,
-        threads: Vec<DbThreadRow>,
-        nodes: Vec<DbNodeRow>,
+        conversations: Vec<DbConversationRow>,
+        comments: Vec<DbCommentRow>,
     ) -> Result<()> {
         self.write(move |conn| {
             conn.exec_bound(sql!(
-                DELETE FROM comment_threads WHERE workspace_id = ?;
+                DELETE FROM conversations WHERE workspace_id = ?;
             ))?(workspace_id)?;
             conn.exec_bound(sql!(
-                DELETE FROM comment_nodes WHERE workspace_id = ?;
+                DELETE FROM comments WHERE workspace_id = ?;
             ))?(workspace_id)?;
 
-            for thread in threads {
+            for conversation in conversations {
                 conn.exec_bound(sql!(
-                    INSERT OR REPLACE INTO comment_threads
-                        (workspace_id, thread_id, path, start_row, start_column,
+                    INSERT OR REPLACE INTO conversations
+                        (workspace_id, conversation_id, path, start_row, start_column,
                          end_row, end_column, fingerprint, kind, status, collapsed)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                ))?((workspace_id, thread))?;
+                ))?((workspace_id, conversation))?;
             }
 
-            for node in nodes {
+            for comment in comments {
                 conn.exec_bound(sql!(
-                    INSERT OR REPLACE INTO comment_nodes
-                        (workspace_id, thread_id, node_id, parent_id, author_kind,
+                    INSERT OR REPLACE INTO comments
+                        (workspace_id, conversation_id, comment_id, in_reply_to, author_kind,
                          author_login, body, created_at, remote_id, kind)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                ))?((workspace_id, node))?;
+                ))?((workspace_id, comment))?;
             }
 
             Ok(())

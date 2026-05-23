@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use util::{ResultExt as _, rel_path::RelPath};
 
 use crate::{
-    CommentAnchor, CommentAuthor, CommentKind, CommentNode, CommentStatus, CommentStore,
-    CommentThread, ThreadId,
+    CommentAnchor, CommentAuthor, CommentKind, Comment, ConversationStatus, CommentStore,
+    Conversation, ConversationId,
 };
 
 /// Git context handed to a sync provider.
@@ -148,7 +148,7 @@ fn merge_remote_comments(
 ) -> Vec<OutgoingComment> {
     store.update(cx, |store, cx| {
         let known: std::collections::HashSet<i64> = store
-            .all_threads()
+            .all_conversations()
             .flat_map(|thread| thread.nodes.iter())
             .filter_map(|node| node.remote_id)
             .collect();
@@ -178,9 +178,9 @@ fn merge_remote_comments(
                 }
             }
 
-            store.upsert_thread(
-                CommentThread {
-                    id: ThreadId::new(),
+            store.upsert_conversation(
+                Conversation {
+                    id: ConversationId::new(),
                     file,
                     anchor: CommentAnchor {
                         start_row: root.row,
@@ -190,7 +190,7 @@ fn merge_remote_comments(
                         fingerprint: String::new(),
                     },
                     kind: CommentKind::Comment,
-                    status: CommentStatus::Open,
+                    status: ConversationStatus::Open,
                     nodes,
                     collapsed: false,
                 },
@@ -200,7 +200,7 @@ fn merge_remote_comments(
 
         // Local-only comments (no remote id) become outgoing pushes.
         let mut outgoing = Vec::new();
-        for thread in store.all_threads() {
+        for thread in store.all_conversations() {
             for node in &thread.nodes {
                 if node.remote_id.is_some() {
                     continue;
@@ -220,8 +220,8 @@ fn merge_remote_comments(
     })
 }
 
-fn remote_node(comment: &RemoteComment, parent: Option<crate::CommentId>) -> CommentNode {
-    let mut node = CommentNode::new(
+fn remote_node(comment: &RemoteComment, parent: Option<crate::CommentId>) -> Comment {
+    let mut node = Comment::new(
         CommentAuthor::Remote {
             login: comment.author_login.clone(),
         },

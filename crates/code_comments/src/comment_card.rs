@@ -1,8 +1,8 @@
-//! The [`CommentCard`] view: a stack of independent per-comment cards rendered
+//! The [`ConversationCard`] view: a stack of independent per-comment cards rendered
 //! as a block decoration below the anchored line, in the spirit of a GitHub PR
 //! review thread.
 //!
-//! Each [`CommentNode`] gets its own bordered card with author, kind badge,
+//! Each [`Comment`] gets its own bordered card with author, kind badge,
 //! body, and per-comment actions (cycle kind, send to agent, reply). Resolve /
 //! collapse / delete remain thread-wide and live on the root card.
 
@@ -18,8 +18,8 @@ use ui::prelude::*;
 use workspace::Workspace;
 
 use crate::{
-    CommentAuthor, CommentId, CommentKind, CommentNode, CommentStatus, CommentStore, CommentThread,
-    ThreadId, agent_integration,
+    CommentAuthor, CommentId, CommentKind, Comment, ConversationStatus, CommentStore, Conversation,
+    ConversationId, agent_integration,
 };
 
 const THREAD_MAX_WIDTH_PX: f32 = 680.0;
@@ -56,9 +56,9 @@ enum ReplyTarget {
 }
 
 /// A rendered inline comment thread. One card exists per visible thread.
-pub struct CommentCard {
+pub struct ConversationCard {
     store: Entity<CommentStore>,
-    thread_id: ThreadId,
+    conversation_id: ConversationId,
     workspace: WeakEntity<Workspace>,
     /// Whether the comment is still anchored to matching code; `false` renders
     /// an "Outdated" badge on the root card.
@@ -80,10 +80,10 @@ pub struct CommentCard {
     _observe_store: Subscription,
 }
 
-impl CommentCard {
+impl ConversationCard {
     pub fn new(
         store: Entity<CommentStore>,
-        thread_id: ThreadId,
+        conversation_id: ConversationId,
         workspace: WeakEntity<Workspace>,
         anchored: bool,
         window: &mut Window,
@@ -93,7 +93,7 @@ impl CommentCard {
         let _observe_store = cx.observe(&store, |_, _, cx| cx.notify());
         Self {
             store,
-            thread_id,
+            conversation_id,
             workspace,
             anchored,
             input,
@@ -122,7 +122,7 @@ impl CommentCard {
     /// Refreshes the markdown-entity cache to match the current thread state:
     /// builds a new `Markdown` for nodes we haven't seen, replaces the entity
     /// whose body changed, and evicts nodes that no longer exist.
-    fn sync_markdown_cache(&mut self, thread: &CommentThread, cx: &mut Context<Self>) {
+    fn sync_markdown_cache(&mut self, thread: &Conversation, cx: &mut Context<Self>) {
         let live: std::collections::HashSet<CommentId> =
             thread.nodes.iter().map(|node| node.id).collect();
         self.markdown_cache.retain(|id, _| live.contains(id));
@@ -195,14 +195,14 @@ impl CommentCard {
         }
     }
 
-    pub fn thread_id(&self) -> ThreadId {
-        self.thread_id
+    pub fn conversation_id(&self) -> ConversationId {
+        self.conversation_id
     }
 
     fn cycle_node_kind(&mut self, node_id: CommentId, cx: &mut Context<Self>) {
-        let thread_id = self.thread_id;
+        let conversation_id = self.conversation_id;
         self.store.update(cx, |store, cx| {
-            let current = store.thread(thread_id).and_then(|thread| {
+            let current = store.thread(conversation_id).and_then(|thread| {
                 thread.nodes.iter().find(|node| node.id == node_id).map(|node| node.kind)
             });
             let next = match current {
@@ -210,47 +210,47 @@ impl CommentCard {
                 Some(CommentKind::Question) => CommentKind::Task,
                 _ => CommentKind::Comment,
             };
-            store.set_node_kind(thread_id, node_id, next, cx);
+            store.set_comment_kind(conversation_id, node_id, next, cx);
         });
     }
 
-    fn send_node_to_agent(&mut self, node_id: CommentId, cx: &mut Context<Self>) {
+    fn send_comment_to_agent(&mut self, node_id: CommentId, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
         let store = self.store.clone();
-        let thread_id = self.thread_id;
+        let conversation_id = self.conversation_id;
         workspace.update(cx, |workspace, cx| {
-            agent_integration::send_node_to_agent(workspace, store, thread_id, node_id, cx);
+            agent_integration::send_comment_to_agent(workspace, store, conversation_id, node_id, cx);
         });
     }
 
     fn toggle_resolved(&mut self, cx: &mut Context<Self>) {
-        let thread_id = self.thread_id;
+        let conversation_id = self.conversation_id;
         self.store.update(cx, |store, cx| {
-            let next = match store.thread(thread_id).map(|thread| thread.status) {
-                Some(CommentStatus::Resolved) => CommentStatus::Open,
-                _ => CommentStatus::Resolved,
+            let next = match store.thread(conversation_id).map(|thread| thread.status) {
+                Some(ConversationStatus::Resolved) => ConversationStatus::Open,
+                _ => ConversationStatus::Resolved,
             };
-            store.set_thread_status(thread_id, next, cx);
+            store.set_conversation_status(conversation_id, next, cx);
         });
     }
 
     fn toggle_collapsed(&mut self, cx: &mut Context<Self>) {
-        let thread_id = self.thread_id;
+        let conversation_id = self.conversation_id;
         self.store.update(cx, |store, cx| {
             let collapsed = store
-                .thread(thread_id)
+                .thread(conversation_id)
                 .map(|thread| thread.collapsed)
                 .unwrap_or(false);
-            store.set_thread_collapsed(thread_id, !collapsed, cx);
+            store.set_conversation_collapsed(conversation_id, !collapsed, cx);
         });
     }
 
     fn delete_thread(&mut self, cx: &mut Context<Self>) {
-        let thread_id = self.thread_id;
+        let conversation_id = self.conversation_id;
         self.store
-            .update(cx, |store, cx| store.remove_thread(thread_id, cx));
+            .update(cx, |store, cx| store.remove_conversation(conversation_id, cx));
     }
 
     fn open_reply(&mut self, node_id: CommentId, window: &mut Window, cx: &mut Context<Self>) {
@@ -278,11 +278,11 @@ impl CommentCard {
         if body.is_empty() {
             return;
         }
-        let thread_id = self.thread_id;
+        let conversation_id = self.conversation_id;
         self.store.update(cx, |store, cx| {
-            store.add_node(
-                thread_id,
-                CommentNode::new(CommentAuthor::User, body, parent, CommentKind::Comment),
+            store.add_comment(
+                conversation_id,
+                Comment::new(CommentAuthor::User, body, parent, CommentKind::Comment),
                 cx,
             );
         });
@@ -361,7 +361,7 @@ impl CommentCard {
 
     fn render_node(
         &self,
-        node: &CommentNode,
+        node: &Comment,
         state: NodeRenderState,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -508,7 +508,7 @@ impl CommentCard {
                     )
                     .label_size(LabelSize::Small)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.send_node_to_agent(node_id, cx)
+                        this.send_comment_to_agent(node_id, cx)
                     })),
                 )
             })
@@ -574,20 +574,20 @@ impl CommentCard {
             .into_any_element()
     }
 
-    fn render_tree(&self, thread: &CommentThread, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn render_tree(&self, thread: &Conversation, cx: &mut Context<Self>) -> Vec<AnyElement> {
         // Depth-first walk: children render directly under their parent so the
         // visual order mirrors reply nesting. If a node's subtree is
         // collapsed, its descendants are skipped (but the node itself still
         // renders, with a "N replies hidden" indicator).
         fn walk(
-            card: &CommentCard,
-            thread: &CommentThread,
-            node: &CommentNode,
+            card: &ConversationCard,
+            thread: &Conversation,
+            node: &Comment,
             is_root: bool,
             depth: usize,
             resolved: bool,
             collapsed: bool,
-            cx: &mut Context<CommentCard>,
+            cx: &mut Context<ConversationCard>,
             out: &mut Vec<AnyElement>,
         ) {
             let subtree_collapsed = card.subtree_collapsed.contains(&node.id);
@@ -609,7 +609,7 @@ impl CommentCard {
             }
         }
 
-        let resolved = thread.status == CommentStatus::Resolved;
+        let resolved = thread.status == ConversationStatus::Resolved;
         let collapsed = thread.collapsed;
         let mut out = Vec::new();
         if let Some(root) = thread.root() {
@@ -620,7 +620,7 @@ impl CommentCard {
 }
 
 /// Total descendants under `root_id` in the thread tree.
-fn count_descendants(thread: &CommentThread, root_id: CommentId) -> usize {
+fn count_descendants(thread: &Conversation, root_id: CommentId) -> usize {
     let mut count = 0;
     let mut stack = vec![root_id];
     while let Some(id) = stack.pop() {
@@ -632,15 +632,15 @@ fn count_descendants(thread: &CommentThread, root_id: CommentId) -> usize {
     count
 }
 
-impl Focusable for CommentCard {
+impl Focusable for ConversationCard {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.input.focus_handle(cx)
     }
 }
 
-impl Render for CommentCard {
+impl Render for ConversationCard {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(thread) = self.store.read(cx).thread(self.thread_id).cloned() else {
+        let Some(thread) = self.store.read(cx).thread(self.conversation_id).cloned() else {
             return div();
         };
 
@@ -648,8 +648,8 @@ impl Render for CommentCard {
         // walk the tree and render with `&self`.
         self.sync_markdown_cache(&thread, cx);
 
-        let thread_key = thread.id.0.to_string();
-        let resolved = thread.status == CommentStatus::Resolved;
+        let conversation_key = thread.id.0.to_string();
+        let resolved = thread.status == ConversationStatus::Resolved;
         let user_collapsed = thread.collapsed;
         // Resolved threads auto-collapse to a compact strip so closed
         // conversations don't keep eating editor space. The user can inflate
@@ -660,11 +660,11 @@ impl Render for CommentCard {
         let column = v_flex().w_full().gap_2().my_1();
 
         let column = if show_compact {
-            column.child(self.render_compact_strip(&thread, resolved, &thread_key, cx))
+            column.child(self.render_compact_strip(&thread, resolved, &conversation_key, cx))
         } else if thread.root().is_none() {
             // Empty thread (just created): the composer IS the only thing in
             // the thread.
-            column.child(self.render_bottom_composer(&thread, &thread_key, cx))
+            column.child(self.render_bottom_composer(&thread, &conversation_key, cx))
         } else {
             // Tree of node cards + (idle) Reply affordance or (active) bottom
             // composer. The inline per-card reply takes precedence when open.
@@ -672,10 +672,10 @@ impl Render for CommentCard {
             let column = column.children(nodes);
             match self.reply_target {
                 ReplyTarget::None => {
-                    column.child(self.render_reply_affordance(&thread_key, cx))
+                    column.child(self.render_reply_affordance(&conversation_key, cx))
                 }
                 ReplyTarget::Bottom => {
-                    column.child(self.render_bottom_composer(&thread, &thread_key, cx))
+                    column.child(self.render_bottom_composer(&thread, &conversation_key, cx))
                 }
                 ReplyTarget::Node(_) => column,
             }
@@ -686,19 +686,19 @@ impl Render for CommentCard {
     }
 }
 
-impl CommentCard {
+impl ConversationCard {
     /// One-line summary used when the thread is collapsed or resolved.
     /// Avoids the full bordered card chrome so closed threads recede into the
     /// background.
     fn render_compact_strip(
         &self,
-        thread: &CommentThread,
+        thread: &Conversation,
         resolved: bool,
-        thread_key: &str,
+        conversation_key: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
-        let group_name = SharedString::from(format!("strip-{thread_key}"));
+        let group_name = SharedString::from(format!("strip-{conversation_key}"));
         let node_count = thread.nodes.len();
 
         // Distinct unique authors, in first-seen order, capped to keep the
@@ -757,7 +757,7 @@ impl CommentCard {
                     .visible_on_hover(group_name)
                     .child(
                         Button::new(
-                            SharedString::from(format!("expand-{thread_key}")),
+                            SharedString::from(format!("expand-{conversation_key}")),
                             "Expand",
                         )
                         .label_size(LabelSize::Small)
@@ -769,12 +769,12 @@ impl CommentCard {
                                 // already inflated, this branch shouldn't fire
                             }
                             this.set_force_expanded(true, cx);
-                            let thread_id = this.thread_id;
+                            let conversation_id = this.conversation_id;
                             this.store.update(cx, |store, cx| {
-                                if let Some(t) = store.thread(thread_id)
+                                if let Some(t) = store.thread(conversation_id)
                                     && t.collapsed
                                 {
-                                    store.set_thread_collapsed(thread_id, false, cx);
+                                    store.set_conversation_collapsed(conversation_id, false, cx);
                                 }
                             });
                         })),
@@ -782,7 +782,7 @@ impl CommentCard {
                     .when(resolved, |this| {
                         this.child(
                             Button::new(
-                                SharedString::from(format!("reopen-{thread_key}")),
+                                SharedString::from(format!("reopen-{conversation_key}")),
                                 "Reopen",
                             )
                             .label_size(LabelSize::Small)
@@ -794,7 +794,7 @@ impl CommentCard {
                     })
                     .child(
                         IconButton::new(
-                            SharedString::from(format!("strip-delete-{thread_key}")),
+                            SharedString::from(format!("strip-delete-{conversation_key}")),
                             IconName::Trash,
                         )
                         .icon_size(IconSize::Small)
@@ -808,13 +808,13 @@ impl CommentCard {
     /// the bottom of a non-empty thread. Click expands the bottom composer
     /// (via `open_bottom_reply`) so we don't show an unfilled input by
     /// default.
-    fn render_reply_affordance(&self, thread_key: &str, cx: &mut Context<Self>) -> AnyElement {
+    fn render_reply_affordance(&self, conversation_key: &str, cx: &mut Context<Self>) -> AnyElement {
         h_flex()
             .w_full()
             .justify_end()
             .child(
                 Button::new(
-                    SharedString::from(format!("reply-affordance-{thread_key}")),
+                    SharedString::from(format!("reply-affordance-{conversation_key}")),
                     "Reply",
                 )
                 .label_size(LabelSize::Small)
@@ -831,8 +831,8 @@ impl CommentCard {
     /// empty thread becomes the root.
     fn render_bottom_composer(
         &self,
-        thread: &CommentThread,
-        thread_key: &str,
+        thread: &Conversation,
+        conversation_key: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
@@ -857,7 +857,7 @@ impl CommentCard {
             .child(self.render_input(
                 parent,
                 label,
-                format!("bottom-{thread_key}"),
+                format!("bottom-{conversation_key}"),
                 cx,
             ))
             .into_any_element()

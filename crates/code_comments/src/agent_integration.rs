@@ -13,8 +13,8 @@ use util::ResultExt as _;
 use workspace::Workspace;
 
 use crate::{
-    CommentAuthor, CommentId, CommentKind, CommentNode, CommentStatus, CommentStore,
-    CommentThread, ThreadId,
+    CommentAuthor, CommentId, CommentKind, Comment, ConversationStatus, CommentStore,
+    Conversation, ConversationId,
 };
 
 /// The agent thread currently focused in the workspace's agent panel.
@@ -27,7 +27,7 @@ fn active_thread(workspace: &Workspace, cx: &App) -> Option<Entity<AcpThread>> {
 
 /// Renders one comment thread as structured feedback for the agent: file,
 /// line range, the anchored line, and the comment tree.
-fn build_feedback(thread: &CommentThread) -> String {
+fn build_feedback(thread: &Conversation) -> String {
     let mut text = format!(
         "Inline code comment on `{}` (lines {}-{}):\n",
         thread.file.as_unix_str(),
@@ -56,21 +56,21 @@ fn text_block(text: String) -> Vec<acp::ContentBlock> {
 /// Sends a single thread to the active agent thread and appends the agent's
 /// reply to the comment tree as an `Agent`-authored node.
 ///
-/// Currently unused — the UI now calls [`send_node_to_agent`] from each
+/// Currently unused — the UI now calls [`send_comment_to_agent`] from each
 /// per-comment "Send to agent" button. Kept for a future thread-level
 /// "send all" entry point.
 #[allow(dead_code)]
-pub(crate) fn send_thread_to_agent(
+pub(crate) fn send_conversation_to_agent(
     workspace: &Workspace,
     store: Entity<CommentStore>,
-    thread_id: ThreadId,
+    conversation_id: ConversationId,
     cx: &mut App,
 ) {
     let Some(acp_thread) = active_thread(workspace, cx) else {
         log::warn!("code_comments: no active agent thread to send the comment to");
         return;
     };
-    let Some(thread) = store.read(cx).thread(thread_id).cloned() else {
+    let Some(thread) = store.read(cx).thread(conversation_id).cloned() else {
         return;
     };
 
@@ -98,11 +98,11 @@ pub(crate) fn send_thread_to_agent(
         if !answer.trim().is_empty() {
             store.update(cx, |store, cx| {
                 let parent = store
-                    .thread(thread_id)
+                    .thread(conversation_id)
                     .and_then(|thread| thread.root().map(|root| root.id));
-                store.add_node(
-                    thread_id,
-                    CommentNode::new(
+                store.add_comment(
+                    conversation_id,
+                    Comment::new(
                         CommentAuthor::Agent,
                         answer,
                         parent,
@@ -120,10 +120,10 @@ pub(crate) fn send_thread_to_agent(
 /// node and its ancestor chain (so the agent sees the conversation leading up
 /// to the comment, not unrelated siblings). The agent's reply is appended as
 /// a child of the source node.
-pub(crate) fn send_node_to_agent(
+pub(crate) fn send_comment_to_agent(
     workspace: &Workspace,
     store: Entity<CommentStore>,
-    thread_id: ThreadId,
+    conversation_id: ConversationId,
     node_id: CommentId,
     cx: &mut App,
 ) {
@@ -131,11 +131,11 @@ pub(crate) fn send_node_to_agent(
         log::warn!("code_comments: no active agent thread to send the comment to");
         return;
     };
-    let Some(thread) = store.read(cx).thread(thread_id).cloned() else {
+    let Some(thread) = store.read(cx).thread(conversation_id).cloned() else {
         return;
     };
     let Some(prompt) = build_node_feedback(&thread, node_id) else {
-        log::warn!("code_comments: send_node_to_agent could not find node {node_id:?}");
+        log::warn!("code_comments: send_comment_to_agent could not find node {node_id:?}");
         return;
     };
 
@@ -154,9 +154,9 @@ pub(crate) fn send_node_to_agent(
 
         if !answer.trim().is_empty() {
             store.update(cx, |store, cx| {
-                store.add_node(
-                    thread_id,
-                    CommentNode::new(
+                store.add_comment(
+                    conversation_id,
+                    Comment::new(
                         CommentAuthor::Agent,
                         answer,
                         Some(node_id),
@@ -190,7 +190,7 @@ fn assistant_reply_markdown(acp_thread: &AcpThread, entries_before: usize, cx: &
     pieces.join("\n\n").trim().to_string()
 }
 
-/// Builds the prompt for `send_node_to_agent`.
+/// Builds the prompt for `send_comment_to_agent`.
 ///
 /// Layout:
 /// 1. The target comment's body verbatim — the actual question/task the agent
@@ -203,11 +203,11 @@ fn assistant_reply_markdown(acp_thread: &AcpThread, entries_before: usize, cx: &
 ///    - `►► ` marks the target node;
 ///    - parents that already have an `Agent` reply get a `(replied)` suffix;
 ///    - the whole thread is suffixed with `(resolved)` when applicable.
-fn build_node_feedback(thread: &CommentThread, target: CommentId) -> Option<String> {
+fn build_node_feedback(thread: &Conversation, target: CommentId) -> Option<String> {
     let target_node = thread.nodes.iter().find(|node| node.id == target)?;
     let root = thread.root()?;
 
-    let resolved_suffix = if thread.status == CommentStatus::Resolved {
+    let resolved_suffix = if thread.status == ConversationStatus::Resolved {
         " (resolved)"
     } else {
         ""
@@ -235,7 +235,7 @@ fn build_node_feedback(thread: &CommentThread, target: CommentId) -> Option<Stri
 }
 
 /// `:N` for a single-line anchor, `:N-M` for a range. 1-indexed for display.
-fn format_line_range(thread: &CommentThread) -> String {
+fn format_line_range(thread: &Conversation) -> String {
     let start = thread.anchor.start_row + 1;
     let end = thread.anchor.end_row + 1;
     if start == end {
@@ -249,8 +249,8 @@ fn format_line_range(thread: &CommentThread) -> String {
 /// marking the targeted node with `►► ` so it stands out in the prompt.
 fn append_subtree(
     out: &mut String,
-    thread: &CommentThread,
-    node: &CommentNode,
+    thread: &Conversation,
+    node: &Comment,
     depth: usize,
     target: CommentId,
 ) {
@@ -294,10 +294,10 @@ pub(crate) fn send_tasks_to_agent(
     store: Entity<CommentStore>,
     cx: &mut App,
 ) {
-    let tasks: Vec<CommentThread> = store
+    let tasks: Vec<Conversation> = store
         .read(cx)
-        .all_threads()
-        .filter(|thread| thread.kind == CommentKind::Task && thread.status == CommentStatus::Open)
+        .all_conversations()
+        .filter(|thread| thread.kind == CommentKind::Task && thread.status == ConversationStatus::Open)
         .cloned()
         .collect();
     if tasks.is_empty() {

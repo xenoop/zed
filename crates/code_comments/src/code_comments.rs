@@ -1,6 +1,6 @@
 //! Persistent, nested inline code comments for Zed.
 //!
-//! This crate owns the comment data model ([`CommentThread`] / [`CommentNode`]),
+//! This crate owns the comment data model ([`Conversation`] / [`Comment`]),
 //! its workspace-local sqlite persistence ([`CommentsDb`]), the per-editor
 //! comment-card block rendering, agent integration, and a pluggable remote
 //! sync layer.
@@ -16,10 +16,10 @@ mod registry;
 mod sync_custom;
 mod sync_github;
 
-pub use comment_card::CommentCard;
+pub use comment_card::ConversationCard;
 pub use comment_store::{
-    CommentAnchor, CommentAuthor, CommentId, CommentKind, CommentNode, CommentStatus, CommentStore,
-    CommentStoreEvent, CommentThread, ThreadId,
+    CommentAnchor, CommentAuthor, CommentId, CommentKind, Comment, ConversationStatus, CommentStore,
+    CommentStoreEvent, Conversation, ConversationId,
 };
 pub use comment_sync::{
     CommentSyncProvider, CommentSyncRegistry, OutgoingComment, RemoteComment, RepoContext,

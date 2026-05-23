@@ -17,10 +17,11 @@ use util::ResultExt as _;
 use workspace::Workspace;
 
 use crate::{
-    AddComment, CodeCommentsSettings, CommentAnchor, CommentKind, CommentStatus, CommentStore,
-    CommentSyncProvider, CommentSyncRegistry, CommentThread, RepoContext, SendTasksToAgent,
-    SyncComments, ThreadId, agent_integration, comment_card::CommentCard, comment_sync,
-    registry::comment_store, sync_custom::CustomCommandSyncProvider,
+    AddComment, CodeCommentsSettings, CommentAnchor, CommentKind, ConversationStatus,
+    CommentStore, CommentSyncProvider, CommentSyncRegistry, Conversation, ConversationId,
+    RepoContext, SendTasksToAgent, SyncComments, agent_integration,
+    comment_card::ConversationCard, comment_sync, registry::comment_store,
+    sync_custom::CustomCommandSyncProvider,
 };
 
 /// Registers the `AddComment` workspace action and attaches comment rendering
@@ -80,13 +81,13 @@ struct InlineCommentsAddon {
     /// re-enter `workspace.update` (which would double-lease the workspace
     /// when refresh fires from inside the `AddComment` action handler).
     store: Entity<CommentStore>,
-    blocks: HashMap<ThreadId, ThreadBlock>,
+    blocks: HashMap<ConversationId, ThreadBlock>,
     _subscriptions: Vec<Subscription>,
 }
 
 struct ThreadBlock {
     block_id: CustomBlockId,
-    card: Entity<CommentCard>,
+    card: Entity<ConversationCard>,
     height: u32,
 }
 
@@ -188,13 +189,13 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     let mb_snapshot = multibuffer.read(cx).snapshot(cx);
     let buffers = multibuffer.read(cx).all_buffers();
 
-    let mut desired: HashMap<ThreadId, (CommentThread, Anchor, bool)> = HashMap::default();
+    let mut desired: HashMap<ConversationId, (Conversation, Anchor, bool)> = HashMap::default();
     for buffer in buffers {
         let buffer = buffer.read(cx);
         let Some(path) = buffer.file().map(|file| file.path().clone()) else {
             continue;
         };
-        let threads = store.read(cx).threads_for_file(&path).to_vec();
+        let threads = store.read(cx).conversations_for_file(&path).to_vec();
         if threads.is_empty() {
             continue;
         }
@@ -217,7 +218,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
         .unwrap_or_default();
 
     // Remove blocks whose threads no longer exist.
-    let stale: Vec<ThreadId> = blocks
+    let stale: Vec<ConversationId> = blocks
         .keys()
         .copied()
         .filter(|id| !desired.contains_key(id))
@@ -260,7 +261,7 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
         }
         let height = block_height(thread);
         let card = cx.new(|cx| {
-            CommentCard::new(store.clone(), *id, workspace.clone(), *anchored, window, cx)
+            ConversationCard::new(store.clone(), *id, workspace.clone(), *anchored, window, cx)
         });
         let card_for_block = card.clone();
         properties.push(BlockProperties {
@@ -337,7 +338,7 @@ fn line_text(snapshot: &BufferSnapshot, row: u32) -> String {
 /// input (~5 rows). Bigger than strictly needed but avoids clipping; the card
 /// is left-aligned and capped in width so the extra space is not visually
 /// noisy.
-fn block_height(thread: &CommentThread) -> u32 {
+fn block_height(thread: &Conversation) -> u32 {
     if thread.collapsed {
         return 4;
     }
@@ -387,7 +388,7 @@ fn add_comment(
     editor.update(cx, |editor, cx| {
         attach_with_store(editor, store_for_attach, window, cx)
     });
-    store.update(cx, |store, cx| store.upsert_thread(thread, cx));
+    store.update(cx, |store, cx| store.upsert_conversation(thread, cx));
 }
 
 /// `SendTasksToAgent` handler: delivers every open task-kind comment to the
@@ -460,7 +461,7 @@ fn build_thread(
     editor: &mut Editor,
     window: &mut Window,
     cx: &mut Context<Editor>,
-) -> Option<CommentThread> {
+) -> Option<Conversation> {
     let display_snapshot = editor.snapshot(window, cx);
     let selection = editor.selections.newest::<Point>(&display_snapshot);
     let multi_buffer = editor.buffer().clone();
@@ -476,8 +477,8 @@ fn build_thread(
     let path = buffer.file().map(|file| file.path().clone())?;
 
     let text_snapshot = buffer.text_snapshot();
-    Some(CommentThread {
-        id: ThreadId::new(),
+    Some(Conversation {
+        id: ConversationId::new(),
         file: path,
         anchor: CommentAnchor {
             start_row: buffer_point.row,
@@ -487,7 +488,7 @@ fn build_thread(
             fingerprint: line_text(&text_snapshot, buffer_point.row),
         },
         kind: CommentKind::Comment,
-        status: CommentStatus::Open,
+        status: ConversationStatus::Open,
         nodes: Vec::new(),
         collapsed: false,
     })

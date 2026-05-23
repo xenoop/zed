@@ -9,25 +9,25 @@ use util::{ResultExt as _, rel_path::RelPath};
 use uuid::Uuid;
 use workspace::WorkspaceId;
 
-use crate::persistence::{CommentsDb, DbNodeRow, DbThreadRow};
+use crate::persistence::{CommentsDb, DbCommentRow, DbConversationRow};
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Stable identifier for a comment thread.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct ThreadId(pub Uuid);
+pub struct ConversationId(pub Uuid);
 
 /// Stable identifier for a single comment node within a thread.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct CommentId(pub Uuid);
 
-impl ThreadId {
+impl ConversationId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 }
 
-impl Default for ThreadId {
+impl Default for ConversationId {
     fn default() -> Self {
         Self::new()
     }
@@ -77,24 +77,24 @@ impl CommentKind {
 
 /// Whether a comment thread is still open or has been resolved by the user.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum CommentStatus {
+pub enum ConversationStatus {
     #[default]
     Open,
     Resolved,
 }
 
-impl CommentStatus {
+impl ConversationStatus {
     fn to_db(self) -> i64 {
         match self {
-            CommentStatus::Open => 0,
-            CommentStatus::Resolved => 1,
+            ConversationStatus::Open => 0,
+            ConversationStatus::Resolved => 1,
         }
     }
 
     fn from_db(value: i64) -> Self {
         match value {
-            1 => CommentStatus::Resolved,
-            _ => CommentStatus::Open,
+            1 => ConversationStatus::Resolved,
+            _ => ConversationStatus::Open,
         }
     }
 }
@@ -144,10 +144,10 @@ pub struct CommentAnchor {
 
 /// A single message within a thread's comment tree.
 #[derive(Clone, Debug)]
-pub struct CommentNode {
+pub struct Comment {
     pub id: CommentId,
     /// `None` for the thread's root comment.
-    pub parent_id: Option<CommentId>,
+    pub in_reply_to: Option<CommentId>,
     pub author: CommentAuthor,
     pub body: String,
     /// Per-node classification. Lets individual replies be tagged as a
@@ -160,16 +160,16 @@ pub struct CommentNode {
     pub remote_id: Option<i64>,
 }
 
-impl CommentNode {
+impl Comment {
     pub fn new(
         author: CommentAuthor,
         body: String,
-        parent_id: Option<CommentId>,
+        in_reply_to: Option<CommentId>,
         kind: CommentKind,
     ) -> Self {
         Self {
             id: CommentId::new(),
-            parent_id,
+            in_reply_to,
             author,
             body,
             kind,
@@ -182,34 +182,34 @@ impl CommentNode {
 /// A comment thread: a root comment plus a tree of replies, anchored to a
 /// range in one file.
 #[derive(Clone, Debug)]
-pub struct CommentThread {
-    pub id: ThreadId,
+pub struct Conversation {
+    pub id: ConversationId,
     /// Worktree-relative path of the commented file.
     pub file: Arc<RelPath>,
     pub anchor: CommentAnchor,
     pub kind: CommentKind,
-    pub status: CommentStatus,
-    /// Flat node list; the tree is formed via `CommentNode::parent_id`.
-    pub nodes: Vec<CommentNode>,
+    pub status: ConversationStatus,
+    /// Flat node list; the tree is formed via `Comment::in_reply_to`.
+    pub nodes: Vec<Comment>,
     pub collapsed: bool,
 }
 
-impl CommentThread {
+impl Conversation {
     /// The root comment of the thread, if it has one.
-    pub fn root(&self) -> Option<&CommentNode> {
-        self.nodes.iter().find(|node| node.parent_id.is_none())
+    pub fn root(&self) -> Option<&Comment> {
+        self.nodes.iter().find(|node| node.in_reply_to.is_none())
     }
 
     /// Direct replies to the given node, oldest first.
-    pub fn children<'a>(&'a self, parent: CommentId) -> impl Iterator<Item = &'a CommentNode> {
+    pub fn children<'a>(&'a self, parent: CommentId) -> impl Iterator<Item = &'a Comment> {
         self.nodes
             .iter()
-            .filter(move |node| node.parent_id == Some(parent))
+            .filter(move |node| node.in_reply_to == Some(parent))
     }
 
-    fn to_db_rows(&self) -> (DbThreadRow, Vec<DbNodeRow>) {
-        let thread_row = DbThreadRow {
-            thread_id: self.id.0.to_string(),
+    fn to_db_rows(&self) -> (DbConversationRow, Vec<DbCommentRow>) {
+        let thread_row = DbConversationRow {
+            conversation_id: self.id.0.to_string(),
             path: self.file.to_proto(),
             start_row: self.anchor.start_row,
             start_column: self.anchor.start_column,
@@ -225,10 +225,10 @@ impl CommentThread {
             .iter()
             .map(|node| {
                 let (author_kind, author_login) = node.author.to_db();
-                DbNodeRow {
-                    thread_id: self.id.0.to_string(),
-                    node_id: node.id.0.to_string(),
-                    parent_id: node.parent_id.map(|id| id.0.to_string()),
+                DbCommentRow {
+                    conversation_id: self.id.0.to_string(),
+                    comment_id: node.id.0.to_string(),
+                    in_reply_to: node.in_reply_to.map(|id| id.0.to_string()),
                     author_kind,
                     author_login,
                     body: node.body.clone(),
@@ -253,7 +253,7 @@ pub enum CommentStoreEvent {
 /// [`CommentsDb`], and notifies observers on every change.
 pub struct CommentStore {
     workspace_id: WorkspaceId,
-    threads_by_file: HashMap<Arc<RelPath>, Vec<CommentThread>>,
+    conversations_by_file: HashMap<Arc<RelPath>, Vec<Conversation>>,
     save_task: Option<Task<()>>,
 }
 
@@ -265,7 +265,7 @@ impl CommentStore {
     pub fn new(workspace_id: WorkspaceId, cx: &mut Context<Self>) -> Self {
         let mut store = Self {
             workspace_id,
-            threads_by_file: HashMap::default(),
+            conversations_by_file: HashMap::default(),
             save_task: None,
         };
         store.load(cx);
@@ -277,32 +277,32 @@ impl CommentStore {
     }
 
     /// Threads anchored in the given file, in insertion order.
-    pub fn threads_for_file(&self, path: &RelPath) -> &[CommentThread] {
-        self.threads_by_file
+    pub fn conversations_for_file(&self, path: &RelPath) -> &[Conversation] {
+        self.conversations_by_file
             .get(path)
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
 
     /// Every thread across every file.
-    pub fn all_threads(&self) -> impl Iterator<Item = &CommentThread> {
-        self.threads_by_file.values().flatten()
+    pub fn all_conversations(&self) -> impl Iterator<Item = &Conversation> {
+        self.conversations_by_file.values().flatten()
     }
 
-    pub fn thread(&self, id: ThreadId) -> Option<&CommentThread> {
-        self.all_threads().find(|thread| thread.id == id)
+    pub fn thread(&self, id: ConversationId) -> Option<&Conversation> {
+        self.all_conversations().find(|thread| thread.id == id)
     }
 
-    fn thread_mut(&mut self, id: ThreadId) -> Option<&mut CommentThread> {
-        self.threads_by_file
+    fn conversation_mut(&mut self, id: ConversationId) -> Option<&mut Conversation> {
+        self.conversations_by_file
             .values_mut()
             .flatten()
             .find(|thread| thread.id == id)
     }
 
     /// Inserts a new thread or replaces an existing one with the same id.
-    pub fn upsert_thread(&mut self, thread: CommentThread, cx: &mut Context<Self>) {
-        let list = self.threads_by_file.entry(thread.file.clone()).or_default();
+    pub fn upsert_conversation(&mut self, thread: Conversation, cx: &mut Context<Self>) {
+        let list = self.conversations_by_file.entry(thread.file.clone()).or_default();
         if let Some(existing) = list.iter_mut().find(|t| t.id == thread.id) {
             *existing = thread;
         } else {
@@ -312,37 +312,37 @@ impl CommentStore {
     }
 
     /// Removes a thread and all of its nodes.
-    pub fn remove_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+    pub fn remove_conversation(&mut self, id: ConversationId, cx: &mut Context<Self>) {
         let mut removed = false;
-        for list in self.threads_by_file.values_mut() {
+        for list in self.conversations_by_file.values_mut() {
             let before = list.len();
             list.retain(|thread| thread.id != id);
             removed |= list.len() != before;
         }
         if removed {
-            self.threads_by_file.retain(|_, list| !list.is_empty());
+            self.conversations_by_file.retain(|_, list| !list.is_empty());
             self.changed(cx);
         }
     }
 
     /// Appends a node (a reply or an agent answer) to a thread.
-    pub fn add_node(&mut self, thread_id: ThreadId, node: CommentNode, cx: &mut Context<Self>) {
-        if let Some(thread) = self.thread_mut(thread_id) {
+    pub fn add_comment(&mut self, conversation_id: ConversationId, node: Comment, cx: &mut Context<Self>) {
+        if let Some(thread) = self.conversation_mut(conversation_id) {
             thread.nodes.push(node);
             self.changed(cx);
         }
     }
 
     /// Replaces the body of an existing node.
-    pub fn update_node_body(
+    pub fn update_comment_body(
         &mut self,
-        thread_id: ThreadId,
-        node_id: CommentId,
+        conversation_id: ConversationId,
+        comment_id: CommentId,
         body: String,
         cx: &mut Context<Self>,
     ) {
-        if let Some(thread) = self.thread_mut(thread_id)
-            && let Some(node) = thread.nodes.iter_mut().find(|node| node.id == node_id)
+        if let Some(thread) = self.conversation_mut(conversation_id)
+            && let Some(node) = thread.nodes.iter_mut().find(|node| node.id == comment_id)
         {
             node.body = body;
             self.changed(cx);
@@ -350,26 +350,26 @@ impl CommentStore {
     }
 
     /// Sets a thread's resolved/open status.
-    pub fn set_thread_status(
+    pub fn set_conversation_status(
         &mut self,
-        thread_id: ThreadId,
-        status: CommentStatus,
+        conversation_id: ConversationId,
+        status: ConversationStatus,
         cx: &mut Context<Self>,
     ) {
-        if let Some(thread) = self.thread_mut(thread_id) {
+        if let Some(thread) = self.conversation_mut(conversation_id) {
             thread.status = status;
             self.changed(cx);
         }
     }
 
     /// Sets a thread's comment kind (Comment / Question / Task).
-    pub fn set_thread_kind(
+    pub fn set_conversation_kind(
         &mut self,
-        thread_id: ThreadId,
+        conversation_id: ConversationId,
         kind: CommentKind,
         cx: &mut Context<Self>,
     ) {
-        if let Some(thread) = self.thread_mut(thread_id) {
+        if let Some(thread) = self.conversation_mut(conversation_id) {
             thread.kind = kind;
             self.changed(cx);
         }
@@ -378,15 +378,15 @@ impl CommentStore {
     /// Sets a single node's kind. Independent of the thread-level kind so an
     /// individual reply can be tagged as a Question/Task (e.g. for an agent
     /// "handled in <commit>" answer) without changing the whole thread.
-    pub fn set_node_kind(
+    pub fn set_comment_kind(
         &mut self,
-        thread_id: ThreadId,
-        node_id: CommentId,
+        conversation_id: ConversationId,
+        comment_id: CommentId,
         kind: CommentKind,
         cx: &mut Context<Self>,
     ) {
-        if let Some(thread) = self.thread_mut(thread_id)
-            && let Some(node) = thread.nodes.iter_mut().find(|node| node.id == node_id)
+        if let Some(thread) = self.conversation_mut(conversation_id)
+            && let Some(node) = thread.nodes.iter_mut().find(|node| node.id == comment_id)
         {
             node.kind = kind;
             self.changed(cx);
@@ -394,13 +394,13 @@ impl CommentStore {
     }
 
     /// Sets a thread's collapsed/expanded state.
-    pub fn set_thread_collapsed(
+    pub fn set_conversation_collapsed(
         &mut self,
-        thread_id: ThreadId,
+        conversation_id: ConversationId,
         collapsed: bool,
         cx: &mut Context<Self>,
     ) {
-        if let Some(thread) = self.thread_mut(thread_id) {
+        if let Some(thread) = self.conversation_mut(conversation_id) {
             thread.collapsed = collapsed;
             self.changed(cx);
         }
@@ -425,10 +425,10 @@ impl CommentStore {
         }));
     }
 
-    fn to_db_rows(&self) -> (Vec<DbThreadRow>, Vec<DbNodeRow>) {
+    fn to_db_rows(&self) -> (Vec<DbConversationRow>, Vec<DbCommentRow>) {
         let mut threads = Vec::new();
         let mut nodes = Vec::new();
-        for thread in self.all_threads() {
+        for thread in self.all_conversations() {
             let (thread_row, mut node_rows) = thread.to_db_rows();
             threads.push(thread_row);
             nodes.append(&mut node_rows);
@@ -442,15 +442,15 @@ impl CommentStore {
         cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_spawn(async move {
-                    let threads = db.load_threads(workspace_id)?;
-                    let nodes = db.load_nodes(workspace_id)?;
+                    let threads = db.load_conversations(workspace_id)?;
+                    let nodes = db.load_comments(workspace_id)?;
                     anyhow::Ok((threads, nodes))
                 })
                 .await;
             match loaded {
                 Ok((threads, nodes)) => {
                     this.update(cx, |this, cx| {
-                        this.threads_by_file = build_index(threads, nodes);
+                        this.conversations_by_file = build_index(threads, nodes);
                         cx.emit(CommentStoreEvent::Changed);
                         cx.notify();
                     })
@@ -472,32 +472,32 @@ fn now_timestamp() -> i64 {
 
 /// Rebuilds the in-memory thread index from rows loaded out of the database.
 fn build_index(
-    threads: Vec<DbThreadRow>,
-    nodes: Vec<DbNodeRow>,
-) -> HashMap<Arc<RelPath>, Vec<CommentThread>> {
-    let mut nodes_by_thread: HashMap<String, Vec<CommentNode>> = HashMap::default();
+    threads: Vec<DbConversationRow>,
+    nodes: Vec<DbCommentRow>,
+) -> HashMap<Arc<RelPath>, Vec<Conversation>> {
+    let mut nodes_by_thread: HashMap<String, Vec<Comment>> = HashMap::default();
     for row in nodes {
-        let Some(node) = node_from_row(&row) else {
+        let Some(node) = comment_from_row(&row) else {
             continue;
         };
         nodes_by_thread
-            .entry(row.thread_id)
+            .entry(row.conversation_id)
             .or_default()
             .push(node);
     }
 
-    let mut index: HashMap<Arc<RelPath>, Vec<CommentThread>> = HashMap::default();
+    let mut index: HashMap<Arc<RelPath>, Vec<Conversation>> = HashMap::default();
     for row in threads {
-        let Ok(id) = Uuid::parse_str(&row.thread_id) else {
-            log::error!("skipping comment thread with invalid id {:?}", row.thread_id);
+        let Ok(id) = Uuid::parse_str(&row.conversation_id) else {
+            log::error!("skipping comment thread with invalid id {:?}", row.conversation_id);
             continue;
         };
         let Ok(file) = RelPath::from_proto(&row.path) else {
             log::error!("skipping comment thread with invalid path {:?}", row.path);
             continue;
         };
-        let thread = CommentThread {
-            id: ThreadId(id),
+        let thread = Conversation {
+            id: ConversationId(id),
             file: file.clone(),
             anchor: CommentAnchor {
                 start_row: row.start_row,
@@ -507,8 +507,8 @@ fn build_index(
                 fingerprint: row.fingerprint,
             },
             kind: CommentKind::from_db(row.kind),
-            status: CommentStatus::from_db(row.status),
-            nodes: nodes_by_thread.remove(&row.thread_id).unwrap_or_default(),
+            status: ConversationStatus::from_db(row.status),
+            nodes: nodes_by_thread.remove(&row.conversation_id).unwrap_or_default(),
             collapsed: row.collapsed,
         };
         index.entry(file).or_default().push(thread);
@@ -516,17 +516,17 @@ fn build_index(
     index
 }
 
-fn node_from_row(row: &DbNodeRow) -> Option<CommentNode> {
-    let id = Uuid::parse_str(&row.node_id)
-        .map_err(|_| log::error!("skipping comment node with invalid id {:?}", row.node_id))
+fn comment_from_row(row: &DbCommentRow) -> Option<Comment> {
+    let id = Uuid::parse_str(&row.comment_id)
+        .map_err(|_| log::error!("skipping comment node with invalid id {:?}", row.comment_id))
         .ok()?;
-    let parent_id = match &row.parent_id {
+    let in_reply_to = match &row.in_reply_to {
         Some(parent) => Some(CommentId(Uuid::parse_str(parent).ok()?)),
         None => None,
     };
-    Some(CommentNode {
+    Some(Comment {
         id: CommentId(id),
-        parent_id,
+        in_reply_to,
         author: CommentAuthor::from_db(row.author_kind, row.author_login.clone()),
         body: row.body.clone(),
         kind: CommentKind::from_db(row.kind),
