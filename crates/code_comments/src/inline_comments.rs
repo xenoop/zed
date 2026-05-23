@@ -331,13 +331,18 @@ fn line_text(snapshot: &BufferSnapshot, row: u32) -> String {
 }
 
 /// Estimated block height in display rows. Refined as the card content grows.
+///
+/// Reserves enough rows for the thread header, each per-node card (header +
+/// body + reply button + padding ~7 rows), and one potentially-open reply
+/// input (~5 rows). Bigger than strictly needed but avoids clipping; the card
+/// is left-aligned and capped in width so the extra space is not visually
+/// noisy.
 fn block_height(thread: &CommentThread) -> u32 {
     if thread.collapsed {
         return 4;
     }
     let nodes = thread.nodes.len().max(1) as u32;
-    // Header + each comment (~3 rows) + the compose area.
-    3 + nodes * 3 + 4
+    3 + nodes * 7 + 6
 }
 
 fn resolve_store(editor: &Editor, cx: &mut App) -> Option<Entity<CommentStore>> {

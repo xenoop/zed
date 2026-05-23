@@ -3195,6 +3195,7 @@ dependencies = [
  "gpui",
  "language",
  "log",
+ "markdown",
  "multi_buffer",
  "project",
  "serde",
