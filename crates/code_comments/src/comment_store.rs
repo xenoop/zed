@@ -150,6 +150,10 @@ pub struct CommentNode {
     pub parent_id: Option<CommentId>,
     pub author: CommentAuthor,
     pub body: String,
+    /// Per-node classification. Lets individual replies be tagged as a
+    /// Question or Task even when the rest of the thread is something else
+    /// (so an agent can answer with a Task-tagged "handled in <commit>" reply).
+    pub kind: CommentKind,
     /// Unix timestamp (seconds).
     pub created_at: i64,
     /// Identifier on the remote provider, once synced.
@@ -157,12 +161,18 @@ pub struct CommentNode {
 }
 
 impl CommentNode {
-    pub fn new(author: CommentAuthor, body: String, parent_id: Option<CommentId>) -> Self {
+    pub fn new(
+        author: CommentAuthor,
+        body: String,
+        parent_id: Option<CommentId>,
+        kind: CommentKind,
+    ) -> Self {
         Self {
             id: CommentId::new(),
             parent_id,
             author,
             body,
+            kind,
             created_at: now_timestamp(),
             remote_id: None,
         }
@@ -224,6 +234,7 @@ impl CommentThread {
                     body: node.body.clone(),
                     created_at: node.created_at,
                     remote_id: node.remote_id,
+                    kind: node.kind.to_db(),
                 }
             })
             .collect();
@@ -364,6 +375,24 @@ impl CommentStore {
         }
     }
 
+    /// Sets a single node's kind. Independent of the thread-level kind so an
+    /// individual reply can be tagged as a Question/Task (e.g. for an agent
+    /// "handled in <commit>" answer) without changing the whole thread.
+    pub fn set_node_kind(
+        &mut self,
+        thread_id: ThreadId,
+        node_id: CommentId,
+        kind: CommentKind,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(thread) = self.thread_mut(thread_id)
+            && let Some(node) = thread.nodes.iter_mut().find(|node| node.id == node_id)
+        {
+            node.kind = kind;
+            self.changed(cx);
+        }
+    }
+
     /// Sets a thread's collapsed/expanded state.
     pub fn set_thread_collapsed(
         &mut self,
@@ -500,6 +529,7 @@ fn node_from_row(row: &DbNodeRow) -> Option<CommentNode> {
         parent_id,
         author: CommentAuthor::from_db(row.author_kind, row.author_login.clone()),
         body: row.body.clone(),
+        kind: CommentKind::from_db(row.kind),
         created_at: row.created_at,
         remote_id: row.remote_id,
     })

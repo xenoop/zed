@@ -43,6 +43,9 @@ pub struct DbNodeRow {
     pub body: String,
     pub created_at: i64,
     pub remote_id: Option<i64>,
+    /// Per-node CommentKind (Comment / Question / Task). Defaults to 0 for
+    /// rows persisted before this column existed.
+    pub kind: i64,
 }
 
 impl StaticColumnCount for DbThreadRow {
@@ -99,7 +102,7 @@ impl Column for DbThreadRow {
 
 impl StaticColumnCount for DbNodeRow {
     fn column_count() -> usize {
-        8
+        9
     }
 }
 
@@ -113,6 +116,7 @@ impl Bind for DbNodeRow {
         let next = statement.bind(&self.body, next)?;
         let next = statement.bind(&self.created_at, next)?;
         let next = statement.bind(&self.remote_id, next)?;
+        let next = statement.bind(&self.kind, next)?;
         Ok(next)
     }
 }
@@ -127,6 +131,7 @@ impl Column for DbNodeRow {
         let (body, next) = Column::column(statement, next)?;
         let (created_at, next) = Column::column(statement, next)?;
         let (remote_id, next) = Column::column(statement, next)?;
+        let (kind, next) = Column::column(statement, next)?;
         Ok((
             Self {
                 thread_id,
@@ -137,6 +142,7 @@ impl Column for DbNodeRow {
                 body,
                 created_at,
                 remote_id,
+                kind,
             },
             next,
         ))
@@ -148,41 +154,46 @@ pub struct CommentsDb(db::sqlez::thread_safe_connection::ThreadSafeConnection);
 impl db::sqlez::domain::Domain for CommentsDb {
     const NAME: &str = stringify!(CommentsDb);
 
-    const MIGRATIONS: &[&str] = &[sql! (
-        CREATE TABLE comment_threads (
-            workspace_id INTEGER NOT NULL,
-            thread_id TEXT NOT NULL,
-            path TEXT NOT NULL,
-            start_row INTEGER NOT NULL,
-            start_column INTEGER NOT NULL,
-            end_row INTEGER NOT NULL,
-            end_column INTEGER NOT NULL,
-            fingerprint TEXT NOT NULL,
-            kind INTEGER NOT NULL,
-            status INTEGER NOT NULL,
-            collapsed INTEGER NOT NULL,
-            PRIMARY KEY (workspace_id, thread_id),
-            FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
-                ON DELETE CASCADE
-                ON UPDATE CASCADE
-        ) STRICT;
+    const MIGRATIONS: &[&str] = &[
+        sql! (
+            CREATE TABLE comment_threads (
+                workspace_id INTEGER NOT NULL,
+                thread_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                start_row INTEGER NOT NULL,
+                start_column INTEGER NOT NULL,
+                end_row INTEGER NOT NULL,
+                end_column INTEGER NOT NULL,
+                fingerprint TEXT NOT NULL,
+                kind INTEGER NOT NULL,
+                status INTEGER NOT NULL,
+                collapsed INTEGER NOT NULL,
+                PRIMARY KEY (workspace_id, thread_id),
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                    ON DELETE CASCADE
+                    ON UPDATE CASCADE
+            ) STRICT;
 
-        CREATE TABLE comment_nodes (
-            workspace_id INTEGER NOT NULL,
-            thread_id TEXT NOT NULL,
-            node_id TEXT NOT NULL,
-            parent_id TEXT,
-            author_kind INTEGER NOT NULL,
-            author_login TEXT,
-            body TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            remote_id INTEGER,
-            PRIMARY KEY (workspace_id, thread_id, node_id),
-            FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
-                ON DELETE CASCADE
-                ON UPDATE CASCADE
-        ) STRICT;
-    )];
+            CREATE TABLE comment_nodes (
+                workspace_id INTEGER NOT NULL,
+                thread_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                parent_id TEXT,
+                author_kind INTEGER NOT NULL,
+                author_login TEXT,
+                body TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                remote_id INTEGER,
+                PRIMARY KEY (workspace_id, thread_id, node_id),
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                    ON DELETE CASCADE
+                    ON UPDATE CASCADE
+            ) STRICT;
+        ),
+        sql! (
+            ALTER TABLE comment_nodes ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;
+        ),
+    ];
 }
 
 db::static_connection!(CommentsDb, [WorkspaceDb]);
@@ -200,7 +211,7 @@ impl CommentsDb {
     query! {
         pub fn load_nodes(workspace_id: WorkspaceId) -> Result<Vec<DbNodeRow>> {
             SELECT thread_id, node_id, parent_id, author_kind, author_login,
-                   body, created_at, remote_id
+                   body, created_at, remote_id, kind
             FROM comment_nodes
             WHERE workspace_id = ?
         }
@@ -236,8 +247,8 @@ impl CommentsDb {
                 conn.exec_bound(sql!(
                     INSERT OR REPLACE INTO comment_nodes
                         (workspace_id, thread_id, node_id, parent_id, author_kind,
-                         author_login, body, created_at, remote_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                         author_login, body, created_at, remote_id, kind)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 ))?((workspace_id, node))?;
             }
 

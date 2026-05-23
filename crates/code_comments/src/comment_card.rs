@@ -98,7 +98,7 @@ impl CommentCard {
                 .and_then(|thread| thread.root().map(|root| root.id));
             store.add_node(
                 thread_id,
-                CommentNode::new(CommentAuthor::User, body, parent),
+                CommentNode::new(CommentAuthor::User, body, parent, CommentKind::Comment),
                 cx,
             );
         });

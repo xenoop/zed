@@ -227,6 +227,7 @@ fn remote_node(comment: &RemoteComment, parent: Option<crate::CommentId>) -> Com
         },
         comment.body.clone(),
         parent,
+        crate::CommentKind::Comment,
     );
     node.remote_id = comment.remote_id.parse::<i64>().ok();
     node

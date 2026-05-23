@@ -94,7 +94,7 @@ pub(crate) fn send_thread_to_agent(
                     .and_then(|thread| thread.root().map(|root| root.id));
                 store.add_node(
                     thread_id,
-                    CommentNode::new(CommentAuthor::Agent, answer, parent),
+                    CommentNode::new(CommentAuthor::Agent, answer, parent, CommentKind::Comment),
                     cx,
                 );
             });
