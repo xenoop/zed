@@ -479,6 +479,7 @@ fn build_thread(
     let text_snapshot = buffer.text_snapshot();
     Some(Conversation {
         id: ConversationId::new(),
+        change_id: None,
         file: path,
         anchor: CommentAnchor {
             start_row: buffer_point.row,
@@ -486,6 +487,7 @@ fn build_thread(
             end_row: buffer_point.row,
             end_column: buffer_point.column,
             fingerprint: line_text(&text_snapshot, buffer_point.row),
+            revision: None,
         },
         kind: CommentKind::Comment,
         status: ConversationStatus::Open,

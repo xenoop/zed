@@ -130,8 +130,20 @@ impl CommentAuthor {
     }
 }
 
-/// The persisted position of a thread: a row/column range plus a text
-/// fingerprint of the anchored line(s) used for best-effort re-anchoring.
+/// Opaque identifier for a code-review change (PR / MR / CL / change-set).
+/// The provider defines what this string means; we never parse it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ChangeId(pub String);
+
+/// Opaque identifier for a specific revision of a change (commit SHA,
+/// patchset id, snapshot ref — provider-defined). Used by the re-anchoring
+/// path to ask the local VCS where a comment's anchored line is now.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct RevisionId(pub String);
+
+/// The persisted position of a conversation: a row/column range plus a text
+/// fingerprint of the anchored line(s) used for best-effort re-anchoring,
+/// and the revision the anchor was originally computed against.
 #[derive(Clone, Debug, Default)]
 pub struct CommentAnchor {
     pub start_row: u32,
@@ -140,6 +152,9 @@ pub struct CommentAnchor {
     pub end_column: u32,
     /// Trimmed text of the anchored line(s) at creation time.
     pub fingerprint: String,
+    /// Revision the comment was anchored against, when known. `None` for
+    /// purely local comments that were never tied to a provider revision.
+    pub revision: Option<RevisionId>,
 }
 
 /// A single message within a thread's comment tree.
@@ -179,11 +194,15 @@ impl Comment {
     }
 }
 
-/// A comment thread: a root comment plus a tree of replies, anchored to a
-/// range in one file.
+/// A conversation: a root comment plus a tree of replies, anchored to a
+/// range in one file and (when synced with a provider) attached to a
+/// specific code-review change.
 #[derive(Clone, Debug)]
 pub struct Conversation {
     pub id: ConversationId,
+    /// Code-review change this conversation belongs to (PR / MR / CL).
+    /// `None` for purely local conversations not associated with a change.
+    pub change_id: Option<ChangeId>,
     /// Worktree-relative path of the commented file.
     pub file: Arc<RelPath>,
     pub anchor: CommentAnchor,
@@ -210,12 +229,14 @@ impl Conversation {
     fn to_db_rows(&self) -> (DbConversationRow, Vec<DbCommentRow>) {
         let thread_row = DbConversationRow {
             conversation_id: self.id.0.to_string(),
+            change_id: self.change_id.as_ref().map(|id| id.0.clone()),
             path: self.file.to_proto(),
             start_row: self.anchor.start_row,
             start_column: self.anchor.start_column,
             end_row: self.anchor.end_row,
             end_column: self.anchor.end_column,
             fingerprint: self.anchor.fingerprint.clone(),
+            anchor_revision: self.anchor.revision.as_ref().map(|r| r.0.clone()),
             kind: self.kind.to_db(),
             status: self.status.to_db(),
             collapsed: self.collapsed,
@@ -498,6 +519,7 @@ fn build_index(
         };
         let thread = Conversation {
             id: ConversationId(id),
+            change_id: row.change_id.map(ChangeId),
             file: file.clone(),
             anchor: CommentAnchor {
                 start_row: row.start_row,
@@ -505,6 +527,7 @@ fn build_index(
                 end_row: row.end_row,
                 end_column: row.end_column,
                 fingerprint: row.fingerprint,
+                revision: row.anchor_revision.map(RevisionId),
             },
             kind: CommentKind::from_db(row.kind),
             status: ConversationStatus::from_db(row.status),

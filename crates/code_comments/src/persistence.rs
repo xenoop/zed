@@ -21,12 +21,18 @@ use workspace::{WorkspaceDb, WorkspaceId};
 #[derive(Clone, Debug)]
 pub struct DbConversationRow {
     pub conversation_id: String,
+    /// Provider-defined change identifier (PR / MR / CL). `None` for
+    /// purely local conversations not tied to any change.
+    pub change_id: Option<String>,
     pub path: String,
     pub start_row: u32,
     pub start_column: u32,
     pub end_row: u32,
     pub end_column: u32,
     pub fingerprint: String,
+    /// Provider-defined revision the anchor was originally computed
+    /// against. `None` when the anchor isn't tied to a specific revision.
+    pub anchor_revision: Option<String>,
     pub kind: i64,
     pub status: i64,
     pub collapsed: bool,
@@ -50,19 +56,21 @@ pub struct DbCommentRow {
 
 impl StaticColumnCount for DbConversationRow {
     fn column_count() -> usize {
-        10
+        12
     }
 }
 
 impl Bind for DbConversationRow {
     fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
         let next = statement.bind(&self.conversation_id, start_index)?;
+        let next = statement.bind(&self.change_id, next)?;
         let next = statement.bind(&self.path, next)?;
         let next = statement.bind(&self.start_row, next)?;
         let next = statement.bind(&self.start_column, next)?;
         let next = statement.bind(&self.end_row, next)?;
         let next = statement.bind(&self.end_column, next)?;
         let next = statement.bind(&self.fingerprint, next)?;
+        let next = statement.bind(&self.anchor_revision, next)?;
         let next = statement.bind(&self.kind, next)?;
         let next = statement.bind(&self.status, next)?;
         let next = statement.bind(&self.collapsed, next)?;
@@ -73,24 +81,28 @@ impl Bind for DbConversationRow {
 impl Column for DbConversationRow {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
         let (conversation_id, next) = Column::column(statement, start_index)?;
+        let (change_id, next) = Column::column(statement, next)?;
         let (path, next) = Column::column(statement, next)?;
         let (start_row, next) = Column::column(statement, next)?;
         let (start_column, next) = Column::column(statement, next)?;
         let (end_row, next) = Column::column(statement, next)?;
         let (end_column, next) = Column::column(statement, next)?;
         let (fingerprint, next) = Column::column(statement, next)?;
+        let (anchor_revision, next) = Column::column(statement, next)?;
         let (kind, next) = Column::column(statement, next)?;
         let (status, next) = Column::column(statement, next)?;
         let (collapsed, next) = Column::column(statement, next)?;
         Ok((
             Self {
                 conversation_id,
+                change_id,
                 path,
                 start_row,
                 start_column,
                 end_row,
                 end_column,
                 fingerprint,
+                anchor_revision,
                 kind,
                 status,
                 collapsed,
@@ -207,6 +219,13 @@ impl db::sqlez::domain::Domain for CommentsDb {
             ALTER TABLE comments RENAME COLUMN node_id TO comment_id;
             ALTER TABLE comments RENAME COLUMN parent_id TO in_reply_to;
         ),
+        // Make a conversation aware of which code-review change it belongs
+        // to and which revision its anchor was originally computed against.
+        // Both are nullable for legacy local-only conversations.
+        sql! (
+            ALTER TABLE conversations ADD COLUMN change_id TEXT;
+            ALTER TABLE conversations ADD COLUMN anchor_revision TEXT;
+        ),
     ];
 }
 
@@ -215,8 +234,8 @@ db::static_connection!(CommentsDb, [WorkspaceDb]);
 impl CommentsDb {
     query! {
         pub fn load_conversations(workspace_id: WorkspaceId) -> Result<Vec<DbConversationRow>> {
-            SELECT conversation_id, path, start_row, start_column, end_row, end_column,
-                   fingerprint, kind, status, collapsed
+            SELECT conversation_id, change_id, path, start_row, start_column, end_row,
+                   end_column, fingerprint, anchor_revision, kind, status, collapsed
             FROM conversations
             WHERE workspace_id = ?
         }
@@ -251,9 +270,10 @@ impl CommentsDb {
             for conversation in conversations {
                 conn.exec_bound(sql!(
                     INSERT OR REPLACE INTO conversations
-                        (workspace_id, conversation_id, path, start_row, start_column,
-                         end_row, end_column, fingerprint, kind, status, collapsed)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        (workspace_id, conversation_id, change_id, path, start_row,
+                         start_column, end_row, end_column, fingerprint,
+                         anchor_revision, kind, status, collapsed)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 ))?((workspace_id, conversation))?;
             }
 

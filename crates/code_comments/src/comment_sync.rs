@@ -181,6 +181,7 @@ fn merge_remote_comments(
             store.upsert_conversation(
                 Conversation {
                     id: ConversationId::new(),
+                    change_id: None,
                     file,
                     anchor: CommentAnchor {
                         start_row: root.row,
@@ -188,6 +189,7 @@ fn merge_remote_comments(
                         end_row: root.row,
                         end_column: 0,
                         fingerprint: String::new(),
+                        revision: None,
                     },
                     kind: CommentKind::Comment,
                     status: ConversationStatus::Open,

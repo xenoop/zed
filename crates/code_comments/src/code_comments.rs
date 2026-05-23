@@ -18,8 +18,8 @@ mod sync_github;
 
 pub use comment_card::ConversationCard;
 pub use comment_store::{
-    CommentAnchor, CommentAuthor, CommentId, CommentKind, Comment, ConversationStatus, CommentStore,
-    CommentStoreEvent, Conversation, ConversationId,
+    ChangeId, Comment, CommentAnchor, CommentAuthor, CommentId, CommentKind, CommentStore,
+    CommentStoreEvent, Conversation, ConversationId, ConversationStatus, RevisionId,
 };
 pub use comment_sync::{
     CommentSyncProvider, CommentSyncRegistry, OutgoingComment, RemoteComment, RepoContext,
