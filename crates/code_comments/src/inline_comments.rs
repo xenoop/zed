@@ -26,13 +26,45 @@ use crate::{
 /// Registers the `AddComment` workspace action and attaches comment rendering
 /// to every editor as it is created.
 pub fn init(cx: &mut App) {
-    cx.observe_new::<Workspace>(|workspace, _window, _cx| {
+    cx.observe_new::<Workspace>(|workspace, window, cx| {
         workspace.register_action(add_comment);
         workspace.register_action(send_tasks);
         workspace.register_action(sync_comments);
+
+        // `observe_new::<Editor>` fires before the editor's workspace handle
+        // is wired up, so attaching from there silently fails. `ItemAdded`
+        // fires after the editor is mounted into a pane (including for tabs
+        // restored on workspace open), so it's the reliable hook.
+        //
+        // We resolve the store from the `&mut Workspace` the subscription
+        // hands us — going through `attach_to_editor`'s `resolve_store` would
+        // call `workspace.update(...)`, and `ItemAdded` can fire while the
+        // workspace is already being updated (e.g. during deserialization),
+        // double-leasing the entity and panicking.
+        if let Some(window) = window {
+            let workspace_entity = cx.entity();
+            cx.subscribe_in(
+                &workspace_entity,
+                window,
+                |workspace, _, event, window, cx| {
+                    if let workspace::Event::ItemAdded { item } = event
+                        && let Some(editor) = item.act_as::<Editor>(cx)
+                        && let Some(store) = comment_store(workspace, cx)
+                    {
+                        editor.update(cx, |editor, cx| {
+                            attach_with_store(editor, store, window, cx)
+                        });
+                    }
+                },
+            )
+            .detach();
+        }
     })
     .detach();
 
+    // Keep the eager `observe_new::<Editor>` path too: for editors created
+    // inside a workspace context (e.g. via AddComment's on-demand attach), it
+    // can succeed and saves us a round-trip through the workspace event.
     cx.observe_new::<Editor>(|editor, window, cx| {
         if let Some(window) = window {
             attach_to_editor(editor, window, cx);
@@ -44,6 +76,10 @@ pub fn init(cx: &mut App) {
 /// Per-editor state, stored as an editor addon so it is dropped together with
 /// the editor (taking its comment-card entities and subscriptions with it).
 struct InlineCommentsAddon {
+    /// Cached store handle. We stash it here so `refresh` doesn't need to
+    /// re-enter `workspace.update` (which would double-lease the workspace
+    /// when refresh fires from inside the `AddComment` action handler).
+    store: Entity<CommentStore>,
     blocks: HashMap<ThreadId, ThreadBlock>,
     _subscriptions: Vec<Subscription>,
 }
@@ -71,8 +107,26 @@ fn attach_to_editor(editor: &mut Editor, window: &mut Window, cx: &mut Context<E
     // Comments are workspace-local; editors with no workspace (input fields,
     // previews) get no store and are skipped.
     let Some(store) = resolve_store(editor, cx) else {
+        // Most editors that hit this path are input fields, prompts, popovers,
+        // etc. that have no workspace and never want comments.
+        log::debug!("code_comments: attach_to_editor skipped (no store at attach time)");
         return;
     };
+    attach_with_store(editor, store, window, cx);
+}
+
+/// Attaches the addon using an already-resolved store. The on-demand path used
+/// by `add_comment` calls this directly to avoid re-entering `workspace.update`
+/// (which would double-lease the workspace entity and panic).
+fn attach_with_store(
+    editor: &mut Editor,
+    store: Entity<CommentStore>,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    if editor.addon::<InlineCommentsAddon>().is_some() {
+        return;
+    }
 
     let mut subscriptions = Vec::new();
     subscriptions.push(cx.subscribe_in(
@@ -99,6 +153,7 @@ fn attach_to_editor(editor: &mut Editor, window: &mut Window, cx: &mut Context<E
         },
     ));
     editor.register_addon(InlineCommentsAddon {
+        store,
         blocks: HashMap::default(),
         _subscriptions: subscriptions,
     });
@@ -112,15 +167,21 @@ fn attach_to_editor(editor: &mut Editor, window: &mut Window, cx: &mut Context<E
 /// Project Diff multibuffer: each thread's stored buffer position is lifted to
 /// a multibuffer anchor via `anchor_in_excerpt`.
 fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
-    let Some(store) = resolve_store(editor, cx) else {
+    // Read the store from the addon to avoid re-entering `workspace.update`
+    // (which `resolve_store` would do, and which panics when refresh fires
+    // while the workspace is already being updated — e.g. from within the
+    // `AddComment` action handler).
+    let Some(store) = editor
+        .addon::<InlineCommentsAddon>()
+        .map(|addon| addon.store.clone())
+    else {
+        log::warn!("code_comments: refresh skipped (editor has no addon)");
         return;
     };
     let Some(workspace) = editor.workspace() else {
+        log::warn!("code_comments: refresh skipped (editor has no workspace)");
         return;
     };
-    if editor.addon::<InlineCommentsAddon>().is_none() {
-        return;
-    }
     let workspace = workspace.downgrade();
 
     let multibuffer = editor.buffer().clone();
@@ -294,14 +355,30 @@ fn add_comment(
         .active_item(cx)
         .and_then(|item| item.act_as::<Editor>(cx))
     else {
+        log::warn!("code_comments: no active editor for AddComment");
         return;
     };
     let Some(store) = comment_store(workspace, cx) else {
+        log::warn!(
+            "code_comments: workspace has no database_id, comment store unavailable (open a saved project)"
+        );
         return;
     };
     let Some(thread) = editor.update(cx, |editor, cx| build_thread(editor, window, cx)) else {
+        log::warn!(
+            "code_comments: build_thread returned None (file likely has no project_path; save it under a worktree)"
+        );
         return;
     };
+    // The `observe_new::<Editor>` callback fires during workspace startup,
+    // before the editor's workspace handle is ready, so most editors never get
+    // the addon attached. Attach now, on demand, with the store we already
+    // resolved — going through `attach_to_editor` would re-enter
+    // `workspace.update` and double-lease the workspace entity.
+    let store_for_attach = store.clone();
+    editor.update(cx, |editor, cx| {
+        attach_with_store(editor, store_for_attach, window, cx)
+    });
     store.update(cx, |store, cx| store.upsert_thread(thread, cx));
 }
 
