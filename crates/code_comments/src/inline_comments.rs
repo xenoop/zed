@@ -10,7 +10,7 @@ use editor::{
     display_map::{BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId},
 };
 use gpui::{App, AppContext as _, Context, Entity, IntoElement, Subscription, Window};
-use multi_buffer::{Anchor, MultiBufferSnapshot};
+use multi_buffer::Anchor;
 use settings::Settings as _;
 use text::{Bias, BufferSnapshot, Point};
 use util::ResultExt as _;
@@ -202,6 +202,9 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
         for thread in threads {
             let (row, anchored) = resolve_row(&buffer_snapshot, &thread.anchor);
             let text_anchor = buffer_snapshot.anchor_after(Point::new(row, 0));
+            // `anchor_in_excerpt` returning None is normal in the Project Diff
+            // multibuffer when a comment is on a line outside any visible
+            // hunk, so we just skip it instead of logging.
             if let Some(anchor) = mb_snapshot.anchor_in_excerpt(text_anchor) {
                 desired.insert(thread.id, (thread, anchor, anchored));
             }
@@ -453,21 +456,30 @@ fn build_thread(
     window: &mut Window,
     cx: &mut Context<Editor>,
 ) -> Option<CommentThread> {
-    let path = editor.project_path(cx)?.path;
     let display_snapshot = editor.snapshot(window, cx);
     let selection = editor.selections.newest::<Point>(&display_snapshot);
-    let start = selection.start;
-    let end = selection.end;
-    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let multi_buffer = editor.buffer().clone();
+    let multi_snapshot = multi_buffer.read(cx).snapshot(cx);
+
+    // Resolve the underlying buffer + buffer-local point from the primary
+    // selection. Works for both singleton-file editors and the Project Diff
+    // multibuffer (where there's no editor-wide `project_path`).
+    let (buffer_snapshot, buffer_point) = multi_snapshot.point_to_buffer_point(selection.start)?;
+    let buffer_id = buffer_snapshot.remote_id();
+    let buffer_entity = multi_buffer.read(cx).buffer(buffer_id)?;
+    let buffer = buffer_entity.read(cx);
+    let path = buffer.file().map(|file| file.path().clone())?;
+
+    let text_snapshot = buffer.text_snapshot();
     Some(CommentThread {
         id: ThreadId::new(),
         file: path,
         anchor: CommentAnchor {
-            start_row: start.row,
-            start_column: start.column,
-            end_row: end.row,
-            end_column: end.column,
-            fingerprint: line_fingerprint(&snapshot, start.row),
+            start_row: buffer_point.row,
+            start_column: buffer_point.column,
+            end_row: buffer_point.row,
+            end_column: buffer_point.column,
+            fingerprint: line_text(&text_snapshot, buffer_point.row),
         },
         kind: CommentKind::Comment,
         status: CommentStatus::Open,
@@ -476,15 +488,3 @@ fn build_thread(
     })
 }
 
-/// Trimmed text of the anchored line, stored for best-effort re-anchoring.
-fn line_fingerprint(snapshot: &MultiBufferSnapshot, row: u32) -> String {
-    let max_row = snapshot.max_point().row;
-    let row = row.min(max_row);
-    let start = Point::new(row, 0);
-    let end = snapshot.clip_point(Point::new(row, u32::MAX), Bias::Left);
-    snapshot
-        .text_for_range(start..end)
-        .collect::<String>()
-        .trim()
-        .to_string()
-}
