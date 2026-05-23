@@ -11,17 +11,13 @@ use editor::{
 };
 use gpui::{App, AppContext as _, Context, Entity, IntoElement, Subscription, Window};
 use multi_buffer::Anchor;
-use settings::Settings as _;
 use text::{Bias, BufferSnapshot, Point};
-use util::ResultExt as _;
 use workspace::Workspace;
 
 use crate::{
-    AddComment, CodeCommentsSettings, CommentAnchor, CommentKind, ConversationStatus,
-    CommentStore, CommentSyncProvider, CommentSyncRegistry, Conversation, ConversationId,
-    RepoContext, SendTasksToAgent, SyncComments, agent_integration,
-    comment_card::ConversationCard, comment_sync, registry::comment_store,
-    sync_custom::CustomCommandSyncProvider,
+    AddComment, CommentAnchor, CommentKind, CommentStore, Conversation, ConversationId,
+    ConversationStatus, SendTasksToAgent, agent_integration,
+    comment_card::ConversationCard, registry::comment_store,
 };
 
 /// Registers the `AddComment` workspace action and attaches comment rendering
@@ -30,7 +26,6 @@ pub fn init(cx: &mut App) {
     cx.observe_new::<Workspace>(|workspace, window, cx| {
         workspace.register_action(add_comment);
         workspace.register_action(send_tasks);
-        workspace.register_action(sync_comments);
 
         // `observe_new::<Editor>` fires before the editor's workspace handle
         // is wired up, so attaching from there silently fails. `ItemAdded`
@@ -403,58 +398,6 @@ fn send_tasks(
         return;
     };
     agent_integration::send_tasks_to_agent(workspace, store, cx);
-}
-
-/// `SyncComments` handler: resolves the configured sync provider and runs a
-/// pull/push against the remote review unit.
-fn sync_comments(
-    workspace: &mut Workspace,
-    _: &SyncComments,
-    _window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
-    let settings = CodeCommentsSettings::get_global(cx).clone();
-    if !settings.sync.enabled {
-        log::info!("code_comments: remote sync is disabled in settings");
-        return;
-    }
-    let Some(store) = comment_store(workspace, cx) else {
-        return;
-    };
-    let Some(worktree_root) = workspace
-        .project()
-        .read(cx)
-        .visible_worktrees(cx)
-        .next()
-        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-    else {
-        return;
-    };
-
-    let provider: Arc<dyn CommentSyncProvider> = if settings.sync.provider == "custom" {
-        Arc::new(CustomCommandSyncProvider::new(
-            settings.sync.custom_detect_command.clone(),
-            settings.sync.custom_fetch_command.clone(),
-            settings.sync.custom_push_command.clone(),
-        ))
-    } else if let Some(provider) = CommentSyncRegistry::get(cx, &settings.sync.provider) {
-        provider
-    } else {
-        log::error!(
-            "code_comments: unknown sync provider {:?}",
-            settings.sync.provider
-        );
-        return;
-    };
-
-    let ctx = RepoContext { worktree_root };
-    let configured_unit = Some(settings.sync.review_unit.clone());
-    cx.spawn(async move |_workspace, cx| {
-        comment_sync::sync(provider, ctx, configured_unit, store, cx)
-            .await
-            .log_err();
-    })
-    .detach();
 }
 
 fn build_thread(
