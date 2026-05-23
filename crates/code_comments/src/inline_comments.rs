@@ -15,10 +15,14 @@ use text::{Bias, BufferSnapshot, Point};
 use workspace::Workspace;
 
 use crate::{
-    AddComment, CommentAnchor, CommentKind, CommentStore, Conversation, ConversationId,
-    ConversationStatus, SendTasksToAgent, agent_integration,
-    comment_card::ConversationCard, registry::comment_store,
+    AddComment, CodeCommentsSettings, CodeReviewRegistry, CommentAnchor, CommentKind,
+    CommentStore, Conversation, ConversationId, ConversationStatus, RepoContext,
+    SendTasksToAgent, agent_integration, comment_card::ConversationCard,
+    registry::{ChangeTracker, change_tracker, comment_store},
 };
+use project::git_store::{GitStoreEvent, RepositoryEvent};
+use settings::Settings as _;
+use util::ResultExt as _;
 
 /// Registers the `AddComment` workspace action and attaches comment rendering
 /// to every editor as it is created.
@@ -46,14 +50,17 @@ pub fn init(cx: &mut App) {
                     if let workspace::Event::ItemAdded { item } = event
                         && let Some(editor) = item.act_as::<Editor>(cx)
                         && let Some(store) = comment_store(workspace, cx)
+                        && let Some(tracker) = change_tracker(workspace, cx)
                     {
                         editor.update(cx, |editor, cx| {
-                            attach_with_store(editor, store, window, cx)
+                            attach_with_state(editor, store, tracker, window, cx)
                         });
                     }
                 },
             )
             .detach();
+
+            setup_change_tracking(workspace, window, cx);
         }
     })
     .detach();
@@ -76,6 +83,10 @@ struct InlineCommentsAddon {
     /// re-enter `workspace.update` (which would double-lease the workspace
     /// when refresh fires from inside the `AddComment` action handler).
     store: Entity<CommentStore>,
+    /// Cached change-tracker handle. Same rationale as `store` — `refresh`
+    /// reads the active change id from this instead of going through
+    /// `workspace.update`.
+    change_tracker: Entity<ChangeTracker>,
     blocks: HashMap<ConversationId, ThreadBlock>,
     _subscriptions: Vec<Subscription>,
 }
@@ -102,21 +113,23 @@ fn attach_to_editor(editor: &mut Editor, window: &mut Window, cx: &mut Context<E
     }
     // Comments are workspace-local; editors with no workspace (input fields,
     // previews) get no store and are skipped.
-    let Some(store) = resolve_store(editor, cx) else {
+    let Some((store, tracker)) = resolve_workspace_state(editor, cx) else {
         // Most editors that hit this path are input fields, prompts, popovers,
         // etc. that have no workspace and never want comments.
-        log::debug!("code_comments: attach_to_editor skipped (no store at attach time)");
+        log::debug!("code_comments: attach_to_editor skipped (no state at attach time)");
         return;
     };
-    attach_with_store(editor, store, window, cx);
+    attach_with_state(editor, store, tracker, window, cx);
 }
 
-/// Attaches the addon using an already-resolved store. The on-demand path used
-/// by `add_comment` calls this directly to avoid re-entering `workspace.update`
-/// (which would double-lease the workspace entity and panic).
-fn attach_with_store(
+/// Attaches the addon using an already-resolved store and change-tracker. The
+/// on-demand path used by `add_comment` calls this directly to avoid
+/// re-entering `workspace.update` (which would double-lease the workspace
+/// entity and panic).
+fn attach_with_state(
     editor: &mut Editor,
     store: Entity<CommentStore>,
+    change_tracker: Entity<ChangeTracker>,
     window: &mut Window,
     cx: &mut Context<Editor>,
 ) {
@@ -129,6 +142,15 @@ fn attach_with_store(
         &store,
         window,
         |editor, _store, _event, window, cx| {
+            refresh(editor, window, cx);
+        },
+    ));
+    // Active change can shift (branch switch, new PR detected): when it
+    // does, re-render so the visible conversations match the new scope.
+    subscriptions.push(cx.subscribe_in(
+        &change_tracker,
+        window,
+        |editor, _tracker, _event, window, cx| {
             refresh(editor, window, cx);
         },
     ));
@@ -150,6 +172,7 @@ fn attach_with_store(
     ));
     editor.register_addon(InlineCommentsAddon {
         store,
+        change_tracker,
         blocks: HashMap::default(),
         _subscriptions: subscriptions,
     });
@@ -163,14 +186,16 @@ fn attach_with_store(
 /// Project Diff multibuffer: each thread's stored buffer position is lifted to
 /// a multibuffer anchor via `anchor_in_excerpt`.
 fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
-    // Read the store from the addon to avoid re-entering `workspace.update`
-    // (which `resolve_store` would do, and which panics when refresh fires
-    // while the workspace is already being updated — e.g. from within the
-    // `AddComment` action handler).
-    let Some(store) = editor
-        .addon::<InlineCommentsAddon>()
-        .map(|addon| addon.store.clone())
-    else {
+    // Read the store + tracker from the addon to avoid re-entering
+    // `workspace.update` (which the resolver would do, and which panics when
+    // refresh fires while the workspace is already being updated — e.g. from
+    // within the `AddComment` action handler).
+    let Some((store, current_change_id)) = editor.addon::<InlineCommentsAddon>().map(|addon| {
+        (
+            addon.store.clone(),
+            addon.change_tracker.read(cx).current_change_id().cloned(),
+        )
+    }) else {
         log::warn!("code_comments: refresh skipped (editor has no addon)");
         return;
     };
@@ -190,7 +215,17 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
         let Some(path) = buffer.file().map(|file| file.path().clone()) else {
             continue;
         };
-        let threads = store.read(cx).conversations_for_file(&path).to_vec();
+        let threads: Vec<Conversation> = store
+            .read(cx)
+            .conversations_for_file(&path)
+            .iter()
+            // Conversations are scoped to the active change. A conversation
+            // with no change_id (legacy local-only) is visible only when no
+            // change is active; change-scoped ones are visible only when
+            // they match the current change.
+            .filter(|thread| thread.change_id == current_change_id)
+            .cloned()
+            .collect();
         if threads.is_empty() {
             continue;
         }
@@ -341,9 +376,16 @@ fn block_height(thread: &Conversation) -> u32 {
     3 + nodes * 7 + 6
 }
 
-fn resolve_store(editor: &Editor, cx: &mut App) -> Option<Entity<CommentStore>> {
+fn resolve_workspace_state(
+    editor: &Editor,
+    cx: &mut App,
+) -> Option<(Entity<CommentStore>, Entity<ChangeTracker>)> {
     let workspace = editor.workspace()?;
-    workspace.update(cx, |workspace, cx| comment_store(workspace, cx))
+    workspace.update(cx, |workspace, cx| {
+        let store = comment_store(workspace, cx)?;
+        let tracker = change_tracker(workspace, cx)?;
+        Some((store, tracker))
+    })
 }
 
 /// `AddComment` handler: creates an open, empty comment thread anchored to the
@@ -368,20 +410,29 @@ fn add_comment(
         );
         return;
     };
-    let Some(thread) = editor.update(cx, |editor, cx| build_thread(editor, window, cx)) else {
+    let Some(tracker) = change_tracker(workspace, cx) else {
+        return;
+    };
+    let current_change_id = tracker.read(cx).current_change_id().cloned();
+    let Some(mut thread) = editor.update(cx, |editor, cx| build_thread(editor, window, cx)) else {
         log::warn!(
             "code_comments: build_thread returned None (file likely has no project_path; save it under a worktree)"
         );
         return;
     };
+    // Tag the new conversation with whatever change is currently active so
+    // it shows up in the right scope (and not in other branches).
+    thread.change_id = current_change_id;
+
     // The `observe_new::<Editor>` callback fires during workspace startup,
     // before the editor's workspace handle is ready, so most editors never get
-    // the addon attached. Attach now, on demand, with the store we already
-    // resolved — going through `attach_to_editor` would re-enter
+    // the addon attached. Attach now, on demand, with the store and tracker
+    // we already resolved — going through `attach_to_editor` would re-enter
     // `workspace.update` and double-lease the workspace entity.
     let store_for_attach = store.clone();
+    let tracker_for_attach = tracker.clone();
     editor.update(cx, |editor, cx| {
-        attach_with_store(editor, store_for_attach, window, cx)
+        attach_with_state(editor, store_for_attach, tracker_for_attach, window, cx)
     });
     store.update(cx, |store, cx| store.upsert_conversation(thread, cx));
 }
@@ -439,3 +490,69 @@ fn build_thread(
     })
 }
 
+/// Subscribes the workspace to git-store events so the per-workspace
+/// [`ChangeTracker`] keeps the active change id in sync with the worktree's
+/// HEAD, and kicks off an initial detect so the value is populated as soon
+/// as the workspace opens.
+fn setup_change_tracking(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(tracker) = change_tracker(workspace, cx) else {
+        return;
+    };
+
+    spawn_detect_current_change(workspace, tracker.clone(), cx);
+
+    let git_store = workspace.project().read(cx).git_store().clone();
+    cx.subscribe_in(
+        &git_store,
+        window,
+        move |workspace, _git_store, event, _window, cx| {
+            if matches!(
+                event,
+                GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::HeadChanged, _)
+            ) {
+                spawn_detect_current_change(workspace, tracker.clone(), cx);
+            }
+        },
+    )
+    .detach();
+}
+
+/// Resolves the configured provider, calls `detect`, and stores the result on
+/// the per-workspace [`ChangeTracker`]. When no provider is registered (or
+/// detect returns `None`), clears the tracker so the editor falls back to
+/// rendering only legacy local-only conversations.
+fn spawn_detect_current_change(
+    workspace: &Workspace,
+    tracker: Entity<ChangeTracker>,
+    cx: &mut Context<Workspace>,
+) {
+    let settings = CodeCommentsSettings::get_global(cx).clone();
+    let Some(provider) = CodeReviewRegistry::get(cx, &settings.sync.provider) else {
+        tracker.update(cx, |tracker, cx| tracker.set_current_change_id(None, cx));
+        return;
+    };
+    let Some(worktree_root) = workspace
+        .project()
+        .read(cx)
+        .visible_worktrees(cx)
+        .next()
+        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+    else {
+        return;
+    };
+    let ctx = RepoContext { worktree_root };
+    let tracker = tracker.downgrade();
+    cx.spawn(async move |_workspace, cx| {
+        let detected = provider.detect(&ctx).await.log_err().flatten();
+        tracker
+            .update(cx, |tracker, cx| {
+                tracker.set_current_change_id(detected, cx);
+            })
+            .log_err();
+    })
+    .detach();
+}
