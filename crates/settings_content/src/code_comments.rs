@@ -26,11 +26,11 @@ pub struct CommentSyncSettingsContent {
     ///
     /// Default: false
     pub enabled: Option<bool>,
-    /// Which sync provider to use. Built-in providers are `"github"` and
-    /// `"custom"`; any provider registered by another crate or extension can
-    /// also be named here.
+    /// Which sync provider to use. The built-in provider is `"custom"`
+    /// (driven by the commands configured under `custom`); any provider
+    /// registered by another crate can also be named here.
     ///
-    /// Default: "github"
+    /// Default: "custom"
     pub provider: Option<String>,
     /// The remote review unit (a pull-request / merge-request / change id).
     /// Use `"auto"` to detect it from the current branch.
@@ -50,12 +50,12 @@ pub struct CommentSyncSettingsContent {
 #[with_fallible_options]
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, Default)]
 pub struct CustomCommentSyncSettingsContent {
-    /// Command (program followed by arguments) that prints the remote review
-    /// unit id on stdout. Run in the repository root.
+    /// Command (program followed by arguments) that prints the active review
+    /// unit id on stdout, or nothing when no review is active. Run in the
+    /// repository root.
     pub detect_command: Option<Vec<String>>,
-    /// Command that prints the remote comments as a JSON array on stdout.
+    /// Command that prints the review unit's comment threads as a JSON array
+    /// on stdout. Run in the repository root with the review unit id appended
+    /// as its final argument.
     pub fetch_command: Option<Vec<String>>,
-    /// Command that receives one comment as JSON on stdin and creates it
-    /// remotely, printing the new remote id on stdout.
-    pub push_command: Option<Vec<String>>,
 }

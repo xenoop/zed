@@ -3,7 +3,7 @@
 use settings::{RegisterSetting, Settings, SettingsContent};
 
 /// Resolved `code_comments` settings.
-#[derive(Clone, Debug, RegisterSetting)]
+#[derive(Clone, Debug, PartialEq, Eq, RegisterSetting)]
 pub struct CodeCommentsSettings {
     pub enabled: bool,
     pub show_in_editor: bool,
@@ -11,18 +11,17 @@ pub struct CodeCommentsSettings {
 }
 
 /// Resolved remote-sync settings.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommentSyncSettings {
     pub enabled: bool,
-    /// Name of the sync provider to resolve against the `CommentSyncRegistry`,
-    /// or `"custom"` for the command-driven provider.
+    /// Name of the sync provider to resolve against the `CodeReviewRegistry`,
+    /// e.g. `"custom"` for the command-driven provider.
     pub provider: String,
-    /// Explicit review unit id, or `"auto"` to detect it.
+    /// Explicit review unit id, or `"auto"` to detect it via the provider.
     pub review_unit: String,
     pub auto_pull_on_open: bool,
     pub custom_detect_command: Vec<String>,
     pub custom_fetch_command: Vec<String>,
-    pub custom_push_command: Vec<String>,
 }
 
 impl Settings for CodeCommentsSettings {
@@ -35,12 +34,13 @@ impl Settings for CodeCommentsSettings {
             show_in_editor: content.show_in_editor.unwrap_or(true),
             sync: CommentSyncSettings {
                 enabled: sync.enabled.unwrap_or(false),
-                provider: sync.provider.unwrap_or_else(|| "github".to_string()),
+                provider: sync
+                    .provider
+                    .unwrap_or_else(|| crate::CUSTOM_PROVIDER_NAME.to_string()),
                 review_unit: sync.review_unit.unwrap_or_else(|| "auto".to_string()),
                 auto_pull_on_open: sync.auto_pull_on_open.unwrap_or(true),
                 custom_detect_command: custom.detect_command.unwrap_or_default(),
                 custom_fetch_command: custom.fetch_command.unwrap_or_default(),
-                custom_push_command: custom.push_command.unwrap_or_default(),
             },
         }
     }

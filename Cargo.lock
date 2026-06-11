@@ -3197,6 +3197,7 @@ dependencies = [
  "log",
  "markdown",
  "multi_buffer",
+ "parking_lot",
  "project",
  "serde",
  "serde_json",

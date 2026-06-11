@@ -25,6 +25,7 @@ language.workspace = true
 log.workspace = true
 markdown.workspace = true
 multi_buffer.workspace = true
+parking_lot.workspace = true
 project.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -36,4 +37,5 @@ uuid.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]
+db = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }

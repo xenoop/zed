@@ -53,69 +53,6 @@ fn text_block(text: String) -> Vec<acp::ContentBlock> {
     vec![acp::ContentBlock::Text(acp::TextContent::new(text))]
 }
 
-/// Sends a single thread to the active agent thread and appends the agent's
-/// reply to the comment tree as an `Agent`-authored node.
-///
-/// Currently unused — the UI now calls [`send_comment_to_agent`] from each
-/// per-comment "Send to agent" button. Kept for a future thread-level
-/// "send all" entry point.
-#[allow(dead_code)]
-pub(crate) fn send_conversation_to_agent(
-    workspace: &Workspace,
-    store: Entity<CommentStore>,
-    conversation_id: ConversationId,
-    cx: &mut App,
-) {
-    let Some(acp_thread) = active_thread(workspace, cx) else {
-        log::warn!("code_comments: no active agent thread to send the comment to");
-        return;
-    };
-    let Some(thread) = store.read(cx).thread(conversation_id).cloned() else {
-        return;
-    };
-
-    let entries_before = acp_thread.read(cx).entries().len();
-    let send = acp_thread.update(cx, |acp_thread, cx| {
-        acp_thread.send(text_block(build_feedback(&thread)), cx)
-    });
-
-    cx.spawn(async move |cx| {
-        if send.await.log_err().is_none() {
-            return;
-        }
-        let answer = acp_thread.read_with(cx, |acp_thread, cx| {
-            acp_thread
-                .entries()
-                .get(entries_before..)
-                .unwrap_or(&[])
-                .iter()
-                .filter(|entry| matches!(entry, AgentThreadEntry::AssistantMessage(_)))
-                .map(|entry| entry.to_markdown(cx))
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        });
-
-        if !answer.trim().is_empty() {
-            store.update(cx, |store, cx| {
-                let parent = store
-                    .thread(conversation_id)
-                    .and_then(|thread| thread.root().map(|root| root.id));
-                store.add_comment(
-                    conversation_id,
-                    Comment::new(
-                        CommentAuthor::Agent,
-                        answer,
-                        parent,
-                        CommentKind::Comment,
-                    ),
-                    cx,
-                );
-            });
-        }
-    })
-    .detach();
-}
-
 /// Sends a single comment node to the agent. The prompt is scoped to that
 /// node and its ancestor chain (so the agent sees the conversation leading up
 /// to the comment, not unrelated siblings). The agent's reply is appended as
@@ -320,4 +257,80 @@ pub(crate) fn send_tasks_to_agent(
         send.await.log_err();
     })
     .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ChangeId, CommentAnchor, ConversationId};
+    use util::rel_path::RelPath;
+
+    fn test_conversation() -> (Conversation, CommentId, CommentId) {
+        let root = Comment::new(
+            CommentAuthor::User,
+            "Why is this unwrap safe?".into(),
+            None,
+            CommentKind::Question,
+        );
+        let agent_reply = Comment::new(
+            CommentAuthor::Agent,
+            "The index is bounds-checked above.".into(),
+            Some(root.id),
+            CommentKind::Comment,
+        );
+        let follow_up = Comment::new(
+            CommentAuthor::User,
+            "Please add a comment saying so.".into(),
+            Some(root.id),
+            CommentKind::Task,
+        );
+        let (root_id, follow_up_id) = (root.id, follow_up.id);
+        let conversation = Conversation {
+            id: ConversationId::new(),
+            change_id: Some(ChangeId("42".into())),
+            file: RelPath::unix("src/lib.rs").unwrap().into(),
+            anchor: CommentAnchor {
+                start_row: 9,
+                end_row: 9,
+                fingerprint: "let value = items[index];".into(),
+                ..Default::default()
+            },
+            kind: CommentKind::Question,
+            status: ConversationStatus::Open,
+            nodes: vec![root, agent_reply, follow_up],
+            collapsed: false,
+        };
+        (conversation, root_id, follow_up_id)
+    }
+
+    #[test]
+    fn test_build_node_feedback_marks_target_and_replied_branches() {
+        let (conversation, _root_id, follow_up_id) = test_conversation();
+        let prompt = build_node_feedback(&conversation, follow_up_id).unwrap();
+
+        assert!(prompt.starts_with("Please add a comment saying so."));
+        assert!(prompt.contains("`src/lib.rs:10`"));
+        assert!(prompt.contains("`let value = items[index];`"));
+        assert!(prompt.contains("►► User (task): Please add a comment saying so."));
+        assert!(
+            prompt.contains("- User (question) (replied): Why is this unwrap safe?"),
+            "root with an agent reply should be marked (replied): {prompt}"
+        );
+    }
+
+    #[test]
+    fn test_build_node_feedback_missing_node() {
+        let (conversation, ..) = test_conversation();
+        assert!(build_node_feedback(&conversation, CommentId::new()).is_none());
+    }
+
+    #[test]
+    fn test_build_feedback_lists_every_node() {
+        let (conversation, ..) = test_conversation();
+        let feedback = build_feedback(&conversation);
+        assert!(feedback.contains("`src/lib.rs` (lines 10-10)"));
+        assert!(feedback.contains("- User: Why is this unwrap safe?"));
+        assert!(feedback.contains("- Agent: The index is bounds-checked above."));
+        assert!(feedback.contains("- User: Please add a comment saying so."));
+    }
 }

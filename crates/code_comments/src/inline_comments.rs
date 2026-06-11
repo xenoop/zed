@@ -9,19 +9,19 @@ use editor::{
     Editor,
     display_map::{BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId},
 };
-use gpui::{App, AppContext as _, Context, Entity, IntoElement, Subscription, Window};
+use gpui::{App, AppContext as _, Context, Entity, IntoElement, Subscription, TaskExt as _, Window};
 use multi_buffer::Anchor;
 use text::{Bias, BufferSnapshot, Point};
 use workspace::Workspace;
 
 use crate::{
-    AddComment, CodeCommentsSettings, CodeReviewRegistry, CommentAnchor, CommentKind,
+    AddComment, ChangeId, CodeCommentsSettings, CodeReviewRegistry, CommentAnchor, CommentKind,
     CommentStore, Conversation, ConversationId, ConversationStatus, RepoContext,
     SendTasksToAgent, agent_integration, comment_card::ConversationCard,
     registry::{ChangeTracker, change_tracker, comment_store},
 };
 use project::git_store::{GitStoreEvent, RepositoryEvent};
-use settings::Settings as _;
+use settings::{Settings as _, SettingsStore};
 use util::ResultExt as _;
 
 /// Registers the `AddComment` workspace action and attaches comment rendering
@@ -61,6 +61,23 @@ pub fn init(cx: &mut App) {
             .detach();
 
             setup_change_tracking(workspace, window, cx);
+
+            // Re-run change detection when the relevant settings change
+            // (sync toggled, provider or commands edited). The comparison
+            // avoids re-running external detect commands on unrelated
+            // settings changes.
+            let mut last_settings = CodeCommentsSettings::get_global(cx).clone();
+            cx.observe_global_in::<SettingsStore>(window, move |workspace, _window, cx| {
+                let settings = CodeCommentsSettings::get_global(cx).clone();
+                if settings == last_settings {
+                    return;
+                }
+                last_settings = settings;
+                if let Some(tracker) = change_tracker(workspace, cx) {
+                    spawn_change_detection(workspace, tracker, cx);
+                }
+            })
+            .detach();
         }
     })
     .detach();
@@ -154,6 +171,11 @@ fn attach_with_state(
             refresh(editor, window, cx);
         },
     ));
+    // Settings can hide comment cards (`enabled` / `show_in_editor`);
+    // re-render when they change so existing blocks are removed or restored.
+    subscriptions.push(cx.observe_global_in::<SettingsStore>(window, |editor, window, cx| {
+        refresh(editor, window, cx);
+    }));
     // The Project Diff multibuffer adds and removes file excerpts over time;
     // refresh so comment cards follow their excerpts.
     let multibuffer = editor.buffer().clone();
@@ -208,6 +230,15 @@ fn refresh(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     let multibuffer = editor.buffer().clone();
     let mb_snapshot = multibuffer.read(cx).snapshot(cx);
     let buffers = multibuffer.read(cx).all_buffers();
+
+    // When the feature is disabled (or hidden in editors), `desired` stays
+    // empty and the reconciliation below removes every existing block.
+    let settings = CodeCommentsSettings::get_global(cx);
+    let buffers = if settings.enabled && settings.show_in_editor {
+        buffers
+    } else {
+        Default::default()
+    };
 
     let mut desired: HashMap<ConversationId, (Conversation, Anchor, bool)> = HashMap::default();
     for buffer in buffers {
@@ -397,6 +428,11 @@ fn add_comment(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    let settings = CodeCommentsSettings::get_global(cx);
+    if !settings.enabled || !settings.show_in_editor {
+        log::warn!("code_comments: AddComment ignored because the feature is disabled in settings");
+        return;
+    }
     let Some(editor) = workspace
         .active_item(cx)
         .and_then(|item| item.act_as::<Editor>(cx))
@@ -430,9 +466,8 @@ fn add_comment(
     // we already resolved — going through `attach_to_editor` would re-enter
     // `workspace.update` and double-lease the workspace entity.
     let store_for_attach = store.clone();
-    let tracker_for_attach = tracker.clone();
     editor.update(cx, |editor, cx| {
-        attach_with_state(editor, store_for_attach, tracker_for_attach, window, cx)
+        attach_with_state(editor, store_for_attach, tracker, window, cx)
     });
     store.update(cx, |store, cx| store.upsert_conversation(thread, cx));
 }
@@ -503,7 +538,7 @@ fn setup_change_tracking(
         return;
     };
 
-    spawn_detect_current_change(workspace, tracker.clone(), cx);
+    spawn_change_detection(workspace, tracker.clone(), cx);
 
     let git_store = workspace.project().read(cx).git_store().clone();
     cx.subscribe_in(
@@ -514,25 +549,40 @@ fn setup_change_tracking(
                 event,
                 GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::HeadChanged, _)
             ) {
-                spawn_detect_current_change(workspace, tracker.clone(), cx);
+                spawn_change_detection(workspace, tracker.clone(), cx);
             }
         },
     )
     .detach();
 }
 
-/// Resolves the configured provider, calls `detect`, and stores the result on
-/// the per-workspace [`ChangeTracker`]. When no provider is registered (or
-/// detect returns `None`), clears the tracker so the editor falls back to
-/// rendering only legacy local-only conversations.
-fn spawn_detect_current_change(
+/// Resolves the active change and stores it on the per-workspace
+/// [`ChangeTracker`], then pulls the change's conversations from the provider
+/// and merges them into the [`CommentStore`].
+///
+/// The change comes from the `review_unit` setting when it names one
+/// explicitly, otherwise from the provider's `detect`. When sync is disabled
+/// or no provider is configured, the tracker is cleared so editors fall back
+/// to rendering only local conversations.
+fn spawn_change_detection(
     workspace: &Workspace,
     tracker: Entity<ChangeTracker>,
     cx: &mut Context<Workspace>,
 ) {
     let settings = CodeCommentsSettings::get_global(cx).clone();
-    let Some(provider) = CodeReviewRegistry::get(cx, &settings.sync.provider) else {
+    if !settings.enabled || !settings.sync.enabled {
         tracker.update(cx, |tracker, cx| tracker.set_current_change_id(None, cx));
+        return;
+    }
+    let Some(provider) = CodeReviewRegistry::get(cx, &settings.sync.provider) else {
+        log::warn!(
+            "code_comments: no code-review provider named {:?} is registered",
+            settings.sync.provider
+        );
+        tracker.update(cx, |tracker, cx| tracker.set_current_change_id(None, cx));
+        return;
+    };
+    let Some(store) = comment_store(workspace, cx) else {
         return;
     };
     let Some(worktree_root) = workspace
@@ -544,15 +594,84 @@ fn spawn_detect_current_change(
     else {
         return;
     };
-    let ctx = RepoContext { worktree_root };
+    let repo = RepoContext { worktree_root };
+    let explicit_change = (settings.sync.review_unit != "auto")
+        .then(|| ChangeId(settings.sync.review_unit.clone()));
+    let auto_pull = settings.sync.auto_pull_on_open;
     let tracker = tracker.downgrade();
+    let store = store.downgrade();
     cx.spawn(async move |_workspace, cx| {
-        let detected = provider.detect(&ctx).await.log_err().flatten();
-        tracker
-            .update(cx, |tracker, cx| {
-                tracker.set_current_change_id(detected, cx);
-            })
-            .log_err();
+        let change = match explicit_change {
+            Some(change) => Some(change),
+            None => provider.detect(&repo).await.log_err().flatten(),
+        };
+        tracker.update(cx, |tracker, cx| {
+            tracker.set_current_change_id(change.clone(), cx);
+        })?;
+        if auto_pull
+            && let Some(change) = change
+            && let Some(fetched) = provider.fetch(&repo, &change).await.log_err()
+        {
+            store.update(cx, |store, cx| {
+                store.merge_remote_conversations(&change, fetched, cx);
+            })?;
+        }
+        anyhow::Ok(())
     })
-    .detach();
+    .detach_and_log_err(cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use text::{BufferId, ReplicaId};
+
+    fn snapshot(text: &str) -> BufferSnapshot {
+        text::Buffer::new(
+            ReplicaId::LOCAL,
+            BufferId::new(1).unwrap(),
+            text.to_string(),
+        )
+        .snapshot()
+        .clone()
+    }
+
+    fn anchor(row: u32, fingerprint: &str) -> CommentAnchor {
+        CommentAnchor {
+            start_row: row,
+            end_row: row,
+            fingerprint: fingerprint.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_resolve_row_at_stored_position() {
+        let snapshot = snapshot("alpha\nbeta\ngamma");
+        assert_eq!(resolve_row(&snapshot, &anchor(1, "beta")), (1, true));
+    }
+
+    #[test]
+    fn test_resolve_row_finds_moved_line() {
+        let snapshot = snapshot("inserted\nalpha\nbeta\ngamma");
+        assert_eq!(resolve_row(&snapshot, &anchor(1, "gamma")), (3, true));
+    }
+
+    #[test]
+    fn test_resolve_row_matches_trimmed_line() {
+        let snapshot = snapshot("alpha\n    beta  \ngamma");
+        assert_eq!(resolve_row(&snapshot, &anchor(1, "beta")), (1, true));
+    }
+
+    #[test]
+    fn test_resolve_row_flags_missing_line_outdated() {
+        let snapshot = snapshot("alpha\nbeta");
+        assert_eq!(resolve_row(&snapshot, &anchor(1, "deleted line")), (1, false));
+    }
+
+    #[test]
+    fn test_resolve_row_clamps_row_past_end_of_file() {
+        let snapshot = snapshot("alpha\nbeta");
+        assert_eq!(resolve_row(&snapshot, &anchor(10, "")), (1, true));
+    }
 }

@@ -144,7 +144,7 @@ pub struct RevisionId(pub String);
 /// The persisted position of a conversation: a row/column range plus a text
 /// fingerprint of the anchored line(s) used for best-effort re-anchoring,
 /// and the revision the anchor was originally computed against.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommentAnchor {
     pub start_row: u32,
     pub start_column: u32,
@@ -158,7 +158,7 @@ pub struct CommentAnchor {
 }
 
 /// A single message within a thread's comment tree.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Comment {
     pub id: CommentId,
     /// `None` for the thread's root comment.
@@ -197,7 +197,7 @@ impl Comment {
 /// A conversation: a root comment plus a tree of replies, anchored to a
 /// range in one file and (when synced with a provider) attached to a
 /// specific code-review change.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Conversation {
     pub id: ConversationId,
     /// Code-review change this conversation belongs to (PR / MR / CL).
@@ -220,7 +220,7 @@ impl Conversation {
     }
 
     /// Direct replies to the given node, oldest first.
-    pub fn children<'a>(&'a self, parent: CommentId) -> impl Iterator<Item = &'a Comment> {
+    pub fn children(&self, parent: CommentId) -> impl Iterator<Item = &Comment> {
         self.nodes
             .iter()
             .filter(move |node| node.in_reply_to == Some(parent))
@@ -332,6 +332,20 @@ impl CommentStore {
         self.changed(cx);
     }
 
+    /// Removes a thread from the index and returns it, without persisting or
+    /// notifying; callers reinsert it (possibly under another file) and then
+    /// signal the change.
+    fn take_conversation(&mut self, id: ConversationId) -> Option<Conversation> {
+        for list in self.conversations_by_file.values_mut() {
+            if let Some(index) = list.iter().position(|thread| thread.id == id) {
+                let conversation = list.remove(index);
+                self.conversations_by_file.retain(|_, list| !list.is_empty());
+                return Some(conversation);
+            }
+        }
+        None
+    }
+
     /// Removes a thread and all of its nodes.
     pub fn remove_conversation(&mut self, id: ConversationId, cx: &mut Context<Self>) {
         let mut removed = false;
@@ -423,6 +437,65 @@ impl CommentStore {
     ) {
         if let Some(thread) = self.conversation_mut(conversation_id) {
             thread.collapsed = collapsed;
+            self.changed(cx);
+        }
+    }
+
+    /// Merges conversations fetched from a remote provider into the store.
+    ///
+    /// Fetched conversations are matched to existing ones by their root
+    /// comment's `remote_id` (within the same change), so repeated fetches
+    /// update in place instead of duplicating. Local-only state survives the
+    /// merge: replies that haven't been synced, per-node kinds, and the
+    /// collapsed flag are kept, while remote-owned state (bodies, anchors,
+    /// resolved status) is taken from the fetched copy. Conversations that no
+    /// longer appear in the fetch are kept; deleting local data based on a
+    /// possibly-partial fetch is not safe.
+    pub fn merge_remote_conversations(
+        &mut self,
+        change_id: &ChangeId,
+        fetched: Vec<Conversation>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        for conversation in fetched {
+            let Some(root_remote_id) = conversation.root().and_then(|root| root.remote_id) else {
+                log::warn!(
+                    "code_comments: skipping fetched conversation without a remote root id"
+                );
+                continue;
+            };
+            let existing = self
+                .all_conversations()
+                .find(|existing| {
+                    existing.change_id.as_ref() == Some(change_id)
+                        && existing
+                            .root()
+                            .is_some_and(|root| root.remote_id == Some(root_remote_id))
+                })
+                .map(|existing| existing.id);
+            match existing {
+                // Take the conversation out and reinsert it after merging:
+                // the fetched copy may live under a different file.
+                Some(existing_id) => {
+                    if let Some(mut existing) = self.take_conversation(existing_id) {
+                        changed |= merge_fetched_conversation(&mut existing, conversation);
+                        self.conversations_by_file
+                            .entry(existing.file.clone())
+                            .or_default()
+                            .push(existing);
+                    }
+                }
+                None => {
+                    self.conversations_by_file
+                        .entry(conversation.file.clone())
+                        .or_default()
+                        .push(conversation);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
             self.changed(cx);
         }
     }
@@ -539,6 +612,83 @@ fn build_index(
     index
 }
 
+/// Merges a freshly fetched copy of a conversation into the locally stored
+/// one, matching comments by `remote_id`. Remote-owned state (file, anchor,
+/// resolved status, comment bodies and authors) comes from the fetched copy;
+/// local-only state (the conversation id, collapsed flag, per-node kinds, and
+/// unsynced local replies) is preserved. Returns whether anything changed.
+fn merge_fetched_conversation(existing: &mut Conversation, fetched: Conversation) -> bool {
+    let snapshot = existing.clone();
+
+    existing.file = fetched.file;
+    existing.anchor = fetched.anchor;
+    existing.status = fetched.status;
+
+    let existing_by_remote: HashMap<i64, (CommentId, CommentKind)> = snapshot
+        .nodes
+        .iter()
+        .filter_map(|node| Some((node.remote_id?, (node.id, node.kind))))
+        .collect();
+
+    // First pass: decide each fetched node's final id, so replies can be
+    // re-pointed even when their parent appears later in the list.
+    let mut final_ids: HashMap<CommentId, CommentId> = HashMap::default();
+    for node in &fetched.nodes {
+        let final_id = node
+            .remote_id
+            .and_then(|remote_id| existing_by_remote.get(&remote_id))
+            .map(|(id, _)| *id)
+            .unwrap_or(node.id);
+        final_ids.insert(node.id, final_id);
+    }
+
+    let mut merged: Vec<Comment> = fetched
+        .nodes
+        .into_iter()
+        .map(|mut node| {
+            if let Some(remote_id) = node.remote_id
+                && let Some((_, kind)) = existing_by_remote.get(&remote_id)
+            {
+                node.kind = *kind;
+            }
+            node.in_reply_to = node
+                .in_reply_to
+                .and_then(|parent| final_ids.get(&parent).copied());
+            node.id = final_ids[&node.id];
+            node
+        })
+        .collect();
+
+    let root_id = merged
+        .iter()
+        .find(|node| node.in_reply_to.is_none())
+        .map(|node| node.id);
+    let merged_ids: collections::HashSet<CommentId> =
+        merged.iter().map(|node| node.id).collect();
+    let mut local_nodes: Vec<Comment> = snapshot
+        .nodes
+        .iter()
+        .filter(|node| node.remote_id.is_none())
+        .cloned()
+        .collect();
+    let local_ids: collections::HashSet<CommentId> =
+        local_nodes.iter().map(|node| node.id).collect();
+    for node in &mut local_nodes {
+        // A local reply whose remote parent disappeared from the fetch would
+        // become invisible; reattach it to the root instead.
+        if let Some(parent) = node.in_reply_to
+            && !merged_ids.contains(&parent)
+            && !local_ids.contains(&parent)
+        {
+            node.in_reply_to = root_id;
+        }
+    }
+    merged.extend(local_nodes);
+    existing.nodes = merged;
+
+    *existing != snapshot
+}
+
 fn comment_from_row(row: &DbCommentRow) -> Option<Comment> {
     let id = Uuid::parse_str(&row.comment_id)
         .map_err(|_| log::error!("skipping comment node with invalid id {:?}", row.comment_id))
@@ -556,4 +706,110 @@ fn comment_from_row(row: &DbCommentRow) -> Option<Comment> {
         created_at: row.created_at,
         remote_id: row.remote_id,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn remote_comment(remote_id: i64, in_reply_to: Option<CommentId>, body: &str) -> Comment {
+        Comment {
+            id: CommentId::new(),
+            in_reply_to,
+            author: CommentAuthor::Remote {
+                login: "alice".into(),
+            },
+            body: body.to_string(),
+            kind: CommentKind::Comment,
+            created_at: 0,
+            remote_id: Some(remote_id),
+        }
+    }
+
+    fn conversation(nodes: Vec<Comment>) -> Conversation {
+        Conversation {
+            id: ConversationId::new(),
+            change_id: Some(ChangeId("42".into())),
+            file: RelPath::unix("src/lib.rs").unwrap().into(),
+            anchor: CommentAnchor::default(),
+            kind: CommentKind::Comment,
+            status: ConversationStatus::Open,
+            nodes,
+            collapsed: false,
+        }
+    }
+
+    #[test]
+    fn test_merge_updates_remote_state_and_keeps_local_state() {
+        let root = remote_comment(1, None, "old body");
+        let mut local_reply = Comment::new(
+            CommentAuthor::User,
+            "local reply".into(),
+            Some(root.id),
+            CommentKind::Task,
+        );
+        local_reply.created_at = 5;
+        let mut existing = conversation(vec![root.clone(), local_reply.clone()]);
+        existing.collapsed = true;
+        existing.nodes[0].kind = CommentKind::Question;
+
+        let mut fetched_root = remote_comment(1, None, "edited body");
+        let fetched_reply = remote_comment(2, Some(fetched_root.id), "remote reply");
+        fetched_root.created_at = 1;
+        let mut fetched = conversation(vec![fetched_root, fetched_reply]);
+        fetched.status = ConversationStatus::Resolved;
+        fetched.anchor.start_row = 7;
+
+        assert!(merge_fetched_conversation(&mut existing, fetched));
+
+        assert_eq!(existing.status, ConversationStatus::Resolved);
+        assert_eq!(existing.anchor.start_row, 7);
+        assert!(existing.collapsed);
+        let merged_root = existing.root().unwrap();
+        assert_eq!(merged_root.id, root.id, "matched root keeps its local id");
+        assert_eq!(merged_root.body, "edited body");
+        assert_eq!(
+            merged_root.kind,
+            CommentKind::Question,
+            "local kind survives the merge"
+        );
+        let children: Vec<_> = existing.children(root.id).collect();
+        assert_eq!(children.len(), 2);
+        assert!(children.iter().any(|node| node.body == "remote reply"));
+        assert!(children.iter().any(|node| node.id == local_reply.id));
+    }
+
+    #[test]
+    fn test_merge_reattaches_local_reply_to_root_when_parent_disappears() {
+        let root = remote_comment(1, None, "root");
+        let removed = remote_comment(2, Some(root.id), "removed remotely");
+        let local_reply = Comment::new(
+            CommentAuthor::User,
+            "reply to removed".into(),
+            Some(removed.id),
+            CommentKind::Comment,
+        );
+        let mut existing = conversation(vec![root.clone(), removed, local_reply.clone()]);
+
+        let fetched = conversation(vec![remote_comment(1, None, "root")]);
+        assert!(merge_fetched_conversation(&mut existing, fetched));
+
+        let reattached = existing
+            .nodes
+            .iter()
+            .find(|node| node.id == local_reply.id)
+            .unwrap();
+        assert_eq!(reattached.in_reply_to, Some(root.id));
+    }
+
+    #[test]
+    fn test_merge_is_idempotent() {
+        let root = remote_comment(1, None, "root");
+        let reply = remote_comment(2, Some(root.id), "reply");
+        let mut existing = conversation(vec![root, reply]);
+        let fetched = existing.clone();
+
+        assert!(!merge_fetched_conversation(&mut existing, fetched.clone()));
+        assert_eq!(existing, fetched);
+    }
 }

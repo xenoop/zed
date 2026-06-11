@@ -53,6 +53,20 @@ enum ReplyTarget {
     /// User clicked Reply on a specific comment; the input is rendered inline
     /// under that node and submits as its child.
     Node(CommentId),
+    /// User clicked Edit on one of their own comments; the input is rendered
+    /// inline under that node, pre-filled with its body, and submits as a
+    /// body replacement.
+    Edit(CommentId),
+}
+
+/// What submitting the shared input editor does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputAction {
+    /// Create a new comment as a child of the given parent (`None` roots the
+    /// thread).
+    Create(Option<CommentId>),
+    /// Replace the body of an existing comment.
+    Edit(CommentId),
 }
 
 /// A rendered inline comment thread. One card exists per visible thread.
@@ -267,24 +281,58 @@ impl ConversationCard {
         cx.notify();
     }
 
-    fn cancel_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.reply_target = ReplyTarget::None;
-        self.input.update(cx, |input, cx| input.clear(window, cx));
+    fn open_edit(&mut self, node_id: CommentId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(body) = self
+            .store
+            .read(cx)
+            .thread(self.conversation_id)
+            .and_then(|thread| thread.nodes.iter().find(|node| node.id == node_id))
+            .map(|node| node.body.clone())
+        else {
+            return;
+        };
+        self.reply_target = ReplyTarget::Edit(node_id);
+        self.input
+            .update(cx, |input, cx| input.set_text(body, window, cx));
+        self.input.focus_handle(cx).focus(window, cx);
         cx.notify();
     }
 
-    fn submit(&mut self, parent: Option<CommentId>, window: &mut Window, cx: &mut Context<Self>) {
+    fn cancel_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reply_target = ReplyTarget::None;
+        self.input.update(cx, |input, cx| input.clear(window, cx));
+        // A just-created conversation with no comments only exists to host
+        // the composer; cancelling removes it entirely.
+        let conversation_id = self.conversation_id;
+        let is_empty = self
+            .store
+            .read(cx)
+            .thread(conversation_id)
+            .is_some_and(|thread| thread.nodes.is_empty());
+        if is_empty {
+            self.store
+                .update(cx, |store, cx| store.remove_conversation(conversation_id, cx));
+        }
+        cx.notify();
+    }
+
+    fn submit(&mut self, action: InputAction, window: &mut Window, cx: &mut Context<Self>) {
         let body = self.input.read(cx).text(cx).trim().to_string();
         if body.is_empty() {
             return;
         }
         let conversation_id = self.conversation_id;
-        self.store.update(cx, |store, cx| {
-            store.add_comment(
-                conversation_id,
-                Comment::new(CommentAuthor::User, body, parent, CommentKind::Comment),
-                cx,
-            );
+        self.store.update(cx, |store, cx| match action {
+            InputAction::Create(parent) => {
+                store.add_comment(
+                    conversation_id,
+                    Comment::new(CommentAuthor::User, body, parent, CommentKind::Comment),
+                    cx,
+                );
+            }
+            InputAction::Edit(node_id) => {
+                store.update_comment_body(conversation_id, node_id, body, cx);
+            }
         });
         self.input.update(cx, |input, cx| input.clear(window, cx));
         self.reply_target = ReplyTarget::None;
@@ -293,7 +341,7 @@ impl ConversationCard {
 
     fn render_input(
         &self,
-        parent: Option<CommentId>,
+        action: InputAction,
         submit_label: &'static str,
         key_suffix: String,
         cx: &mut Context<Self>,
@@ -301,10 +349,6 @@ impl ConversationCard {
         let colors = cx.theme().colors();
         let cancel_key = SharedString::from(format!("cancel-{key_suffix}"));
         let submit_key = SharedString::from(format!("submit-{key_suffix}"));
-        let show_cancel = matches!(
-            self.reply_target,
-            ReplyTarget::Node(_) | ReplyTarget::Bottom
-        );
         v_flex()
             .w_full()
             .gap_1()
@@ -322,21 +366,19 @@ impl ConversationCard {
                 h_flex()
                     .gap_1()
                     .justify_end()
-                    .when(show_cancel, |this| {
-                        this.child(
-                            Button::new(cancel_key, "Cancel")
-                                .label_size(LabelSize::Small)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.cancel_reply(window, cx)
-                                })),
-                        )
-                    })
+                    .child(
+                        Button::new(cancel_key, "Cancel")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cancel_reply(window, cx)
+                            })),
+                    )
                     .child(
                         Button::new(submit_key, submit_label)
                             .style(ButtonStyle::Filled)
                             .label_size(LabelSize::Small)
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.submit(parent, window, cx)
+                                this.submit(action, window, cx)
                             })),
                     ),
             )
@@ -383,6 +425,7 @@ impl ConversationCard {
         let node_key = node_id.0.to_string();
         let group_name = SharedString::from(format!("card-{node_key}"));
         let is_replying_here = self.reply_target == ReplyTarget::Node(node_id);
+        let is_editing_here = self.reply_target == ReplyTarget::Edit(node_id);
         let kind = node.kind;
         let show_kind_chip = kind != CommentKind::Comment;
 
@@ -512,6 +555,15 @@ impl ConversationCard {
                     })),
                 )
             })
+            .when(node.author == CommentAuthor::User, |this| {
+                this.child(
+                    Button::new(SharedString::from(format!("edit-{node_key}")), "Edit")
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_edit(node_id, window, cx)
+                        })),
+                )
+            })
             .child(
                 Button::new(SharedString::from(format!("reply-{node_key}")), "Reply")
                     .label_size(LabelSize::Small)
@@ -560,11 +612,14 @@ impl ConversationCard {
 
         if is_replying_here {
             node_card = node_card.child(self.render_input(
-                Some(node_id),
+                InputAction::Create(Some(node_id)),
                 "Reply",
-                node_key.clone(),
+                node_key,
                 cx,
             ));
+        } else if is_editing_here {
+            node_card =
+                node_card.child(self.render_input(InputAction::Edit(node_id), "Save", node_key, cx));
         }
 
         div()
@@ -677,7 +732,7 @@ impl Render for ConversationCard {
                 ReplyTarget::Bottom => {
                     column.child(self.render_bottom_composer(&thread, &conversation_key, cx))
                 }
-                ReplyTarget::Node(_) => column,
+                ReplyTarget::Node(_) | ReplyTarget::Edit(_) => column,
             }
         };
 
@@ -765,9 +820,6 @@ impl ConversationCard {
                             // Set the per-card override for resolved threads;
                             // also clear the persisted collapsed flag so
                             // non-resolved threads stay expanded across opens.
-                            if this.force_expanded {
-                                // already inflated, this branch shouldn't fire
-                            }
                             this.set_force_expanded(true, cx);
                             let conversation_id = this.conversation_id;
                             this.store.update(cx, |store, cx| {
@@ -855,7 +907,7 @@ impl ConversationCard {
             .border_color(colors.border_variant)
             .bg(colors.elevated_surface_background)
             .child(self.render_input(
-                parent,
+                InputAction::Create(parent),
                 label,
                 format!("bottom-{conversation_key}"),
                 cx,
