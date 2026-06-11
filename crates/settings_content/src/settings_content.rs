@@ -1,5 +1,6 @@
 mod action;
 mod agent;
+mod code_comments;
 mod editor;
 mod extension;
 mod fallible_options;
@@ -15,6 +16,7 @@ mod workspace;
 
 pub use action::{ActionName, ActionWithArguments};
 pub use agent::*;
+pub use code_comments::*;
 pub use editor::*;
 pub use extension::*;
 pub use fallible_options::*;
@@ -145,6 +147,9 @@ pub struct SettingsContent {
 
     pub agent: Option<AgentSettingsContent>,
     pub agent_servers: Option<AllAgentServersSettings>,
+
+    /// Configuration for inline code comments.
+    pub code_comments: Option<CodeCommentsSettingsContent>,
 
     /// Configuration of audio in Zed.
     pub audio: Option<AudioSettingsContent>,
