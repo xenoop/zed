@@ -1413,6 +1413,7 @@ mod tests {
             "open",
             "read_file",
             "rename_symbol",
+            "respond_to_review_comment",
             "thinking",
             // streaming_edit_file uses "edit_file" for permission lookups,
             // so its rules are configured under the edit_file entry.

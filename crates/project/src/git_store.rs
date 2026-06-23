@@ -502,6 +502,9 @@ pub enum GitStoreEvent {
     JobsUpdated,
     ConflictsUpdated,
     GlobalConfigurationUpdated,
+    /// An agent answered a diff-review comment. The editor that owns the comment
+    /// subscribes to the git store and applies the response to the matching hunk.
+    ReviewResponse { comment_id: usize, response: String },
 }
 
 impl EventEmitter<RepositoryEvent> for Repository {}

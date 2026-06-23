@@ -107,12 +107,14 @@ pub use element::{
 };
 pub use git::blame::BlameRenderer;
 pub(crate) use git::{DiffHunkKey, StoredReviewComment};
+#[cfg(test)]
+pub(crate) use git::ReviewCommentAuthor;
 use git::{
     DiffReviewDragState, DiffReviewOverlay, InlineBlamePopover, render_diff_hunk_controls,
     update_uncommitted_diff_for_buffer,
 };
 pub(crate) use git::{DisplayDiffHunk, PhantomDiffReviewIndicator};
-pub use git::{RenderDiffHunkControlsFn, set_blame_renderer};
+pub use git::{RenderDiffHunkControlsFn, ReviewCommentSnapshot, set_blame_renderer};
 pub use hover_popover::hover_markdown_style;
 pub use inlays::Inlay;
 pub use items::MAX_TAB_TITLE_LEN;
@@ -2077,17 +2079,28 @@ impl Editor {
             let git_store = project.read(cx).git_store().clone();
             let project = project.clone();
             project_subscriptions.push(cx.subscribe(&git_store, move |this, _, event, cx| {
-                if let GitStoreEvent::RepositoryAdded = event {
-                    this.load_diff_task = Some(
-                        update_uncommitted_diff_for_buffer(
-                            cx.entity(),
-                            &project,
-                            this.buffer.read(cx).all_buffers(),
-                            this.buffer.clone(),
-                            cx,
-                        )
-                        .shared(),
-                    );
+                match event {
+                    GitStoreEvent::RepositoryAdded => {
+                        this.load_diff_task = Some(
+                            update_uncommitted_diff_for_buffer(
+                                cx.entity(),
+                                &project,
+                                this.buffer.read(cx).all_buffers(),
+                                this.buffer.clone(),
+                                cx,
+                            )
+                            .shared(),
+                        );
+                    }
+                    GitStoreEvent::ReviewResponse {
+                        comment_id,
+                        response,
+                    } => {
+                        // Only the editor that owns the commented hunk has a match;
+                        // others ignore the broadcast.
+                        this.add_agent_review_comment(*comment_id, response.clone(), cx);
+                    }
+                    _ => {}
                 }
             }));
         }

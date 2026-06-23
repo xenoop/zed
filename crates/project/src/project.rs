@@ -38,7 +38,7 @@ use itertools::{Either, Itertools};
 
 use crate::{
     bookmark_store::BookmarkStore,
-    git_store::GitStore,
+    git_store::{GitStore, GitStoreEvent},
     lsp_store::{SymbolLocation, log_store::LogKind},
     project_search::SearchResultsHandle,
     trusted_worktrees::{PathTrust, RemoteHostLocation, TrustedWorktrees},
@@ -6129,6 +6129,23 @@ impl Project {
 
     pub fn git_store(&self) -> &Entity<GitStore> {
         &self.git_store
+    }
+
+    /// Delivers an agent's answer to a diff-review comment. The response is
+    /// broadcast as a `GitStoreEvent::ReviewResponse`; the editor that owns the
+    /// commented hunk applies it (this avoids a `project -> editor` dependency).
+    pub fn deliver_review_response(
+        &self,
+        comment_id: usize,
+        response: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.git_store.update(cx, |_, cx| {
+            cx.emit(GitStoreEvent::ReviewResponse {
+                comment_id,
+                response,
+            });
+        });
     }
 
     pub fn agent_server_store(&self) -> &Entity<AgentServerStore> {

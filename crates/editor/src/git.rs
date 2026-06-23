@@ -76,6 +76,34 @@ pub(super) struct DiffHunkKey {
     pub(super) hunk_start_anchor: Anchor,
 }
 
+/// Identifies who authored a review comment: the local user or the agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReviewCommentAuthor {
+    /// Authored by the local user.
+    User,
+    /// Authored by the agent in response to a user comment.
+    Agent,
+}
+
+/// A user review comment, snapshotted for sending to the agent. Carries enough
+/// context (location + code + text) for the agent to answer, plus the `id` the
+/// agent echoes back via the `respond_to_review_comment` tool.
+#[derive(Clone, Debug)]
+pub struct ReviewCommentSnapshot {
+    /// The comment id the agent references when responding.
+    pub id: usize,
+    /// File path (relative to the worktree) the comment is anchored to.
+    pub file_path: String,
+    /// 1-based first line of the reviewed range.
+    pub start_line: u32,
+    /// 1-based last line of the reviewed range.
+    pub end_line: u32,
+    /// The reviewed source text.
+    pub code_snippet: String,
+    /// The user's comment text.
+    pub comment: String,
+}
+
 /// A review comment stored locally before being sent to the Agent panel.
 #[derive(Clone)]
 pub(super) struct StoredReviewComment {
@@ -87,6 +115,10 @@ pub(super) struct StoredReviewComment {
     pub(super) range: Range<Anchor>,
     /// Whether this comment is currently being edited inline.
     pub(super) is_editing: bool,
+    /// Who authored this comment.
+    pub(super) author: ReviewCommentAuthor,
+    /// When this is an agent answer, the id of the user comment it responds to.
+    pub(super) in_reply_to: Option<usize>,
 }
 
 /// Represents an active diff review overlay that appears when clicking the "Add Review" button.
@@ -131,6 +163,25 @@ impl StoredReviewComment {
             comment,
             range: anchor_range,
             is_editing: false,
+            author: ReviewCommentAuthor::User,
+            in_reply_to: None,
+        }
+    }
+
+    /// Creates a comment authored by the agent in reply to a user comment.
+    fn new_agent_reply(
+        id: usize,
+        comment: String,
+        anchor_range: Range<Anchor>,
+        in_reply_to: usize,
+    ) -> Self {
+        Self {
+            id,
+            comment,
+            range: anchor_range,
+            is_editing: false,
+            author: ReviewCommentAuthor::Agent,
+            in_reply_to: Some(in_reply_to),
         }
     }
 }
@@ -600,6 +651,88 @@ impl Editor {
         });
         cx.notify();
         id
+    }
+
+    /// Snapshots all stored review comments for sending to the agent, without
+    /// clearing them. The comments must stay in the editor so that the agent's
+    /// replies (keyed by `comment_id`) can be attached to the originating hunk.
+    pub fn snapshot_review_comments_for_agent(
+        &self,
+        cx: &App,
+    ) -> Vec<ReviewCommentSnapshot> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let mut result = Vec::new();
+        for (hunk_key, comments) in &self.stored_review_comments {
+            let file_path = hunk_key.file_path.as_unix_str().to_string();
+            for comment in comments {
+                // Only user comments are sent for the agent to answer; agent
+                // replies are already part of the conversation.
+                if comment.author != ReviewCommentAuthor::User {
+                    continue;
+                }
+                let start = comment.range.start.to_point(&snapshot);
+                let end = comment.range.end.to_point(&snapshot);
+                let code_snippet = snapshot
+                    .text_for_range(comment.range.clone())
+                    .collect::<String>();
+                result.push(ReviewCommentSnapshot {
+                    id: comment.id,
+                    file_path: file_path.clone(),
+                    start_line: start.row + 1,
+                    end_line: end.row + 1,
+                    code_snippet,
+                    comment: comment.comment.clone(),
+                });
+            }
+        }
+        result
+    }
+
+    /// Appends an agent-authored answer to the hunk that owns `target_comment_id`.
+    /// The new comment is stored next to the user comment it responds to and
+    /// nested under it via `in_reply_to`. Returns the new comment's id when the
+    /// target comment was found.
+    pub(super) fn add_agent_review_comment(
+        &mut self,
+        target_comment_id: usize,
+        response: String,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        // Locate the hunk entry that contains the target comment, and the
+        // anchor range of that comment so the agent answer points at the same code.
+        let target = self
+            .stored_review_comments
+            .iter()
+            .enumerate()
+            .find_map(|(entry_index, (_, comments))| {
+                comments
+                    .iter()
+                    .find(|comment| comment.id == target_comment_id)
+                    .map(|comment| (entry_index, comment.range.clone()))
+            });
+        let (entry_index, anchor_range) = target?;
+
+        let id = self.next_review_comment_id;
+        self.next_review_comment_id += 1;
+
+        let agent_comment =
+            StoredReviewComment::new_agent_reply(id, response, anchor_range, target_comment_id);
+
+        let (_, comments) = self.stored_review_comments.get_mut(entry_index)?;
+        // Insert the agent answer immediately after the comment it replies to so
+        // nested replies render together with their parent.
+        let insert_index = comments
+            .iter()
+            .position(|comment| comment.id == target_comment_id)
+            .map(|position| position + 1)
+            .unwrap_or(comments.len());
+        comments.insert(insert_index, agent_comment);
+
+        cx.emit(EditorEvent::ReviewCommentsChanged {
+            total_count: self.total_review_comment_count(),
+        });
+        cx.notify();
+        Some(id)
     }
 
     pub(super) fn blame_hover(
@@ -2353,6 +2486,9 @@ impl Editor {
     ) -> impl IntoElement {
         let comment_id = comment.id;
         let is_editing = inline_editor.is_some();
+        let is_agent = comment.author == ReviewCommentAuthor::Agent;
+        // Nest agent answers under the user comment they reply to.
+        let is_nested = comment.in_reply_to.is_some();
 
         h_flex()
             .w_full()
@@ -2360,15 +2496,25 @@ impl Editor {
             .gap_2()
             .px_2()
             .py_1p5()
+            .when(is_nested, |row| row.ml_4())
             .rounded_md()
-            .bg(colors.surface_background)
+            .bg(if is_agent {
+                colors.element_background
+            } else {
+                colors.surface_background
+            })
             .child(
                 div()
                     .size(avatar_size)
                     .flex_shrink_0()
                     .rounded_full()
                     .overflow_hidden()
-                    .child(if let Some(ref avatar_uri) = user_avatar_uri {
+                    .child(if is_agent {
+                        Icon::new(IconName::ZedAssistant)
+                            .size(IconSize::Small)
+                            .color(ui::Color::Accent)
+                            .into_any_element()
+                    } else if let Some(ref avatar_uri) = user_avatar_uri {
                         Avatar::new(avatar_uri.clone())
                             .size(avatar_size)
                             .into_any_element()

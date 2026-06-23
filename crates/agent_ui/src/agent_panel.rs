@@ -68,7 +68,7 @@ use chrono::{DateTime, Utc};
 use client::UserStore;
 use cloud_api_types::Plan;
 use collections::HashMap;
-use editor::{Editor, MultiBuffer};
+use editor::{Editor, MultiBuffer, ReviewCommentSnapshot, actions::SendReviewToAgent};
 use extension_host::ExtensionStore;
 use feature_flags::{
     AgentSettingsUiFeatureFlag, CreateThreadToolFeatureFlag, FeatureFlagAppExt as _,
@@ -575,6 +575,47 @@ pub fn init(cx: &mut App) {
                         );
                     });
                 })
+                .register_action(|workspace, _: &SendReviewToAgent, window, cx| {
+                    let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                        return;
+                    };
+
+                    // The diff view exposes its comment-holding editor via
+                    // `act_as::<Editor>`.
+                    let Some(editor) = workspace
+                        .active_item(cx)
+                        .and_then(|item| item.act_as::<Editor>(cx))
+                    else {
+                        return;
+                    };
+
+                    let comments =
+                        editor.read(cx).snapshot_review_comments_for_agent(cx);
+                    if comments.is_empty() {
+                        return;
+                    }
+
+                    let content_blocks = build_review_comments_prompt(&comments);
+
+                    workspace.focus_panel::<AgentPanel>(window, cx);
+
+                    panel.update(cx, |panel, cx| {
+                        panel.external_thread(
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(AgentInitialContent::ContentBlock {
+                                blocks: content_blocks,
+                                auto_submit: true,
+                            }),
+                            true,
+                            AgentThreadSource::GitPanel,
+                            window,
+                            cx,
+                        );
+                    });
+                })
                 .register_action(
                     |workspace, action: &ResolveConflictsWithAgent, window, cx| {
                         let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
@@ -810,6 +851,49 @@ fn conflict_resource_block(conflict: &ConflictContent) -> acp::ContentBlock {
             mention_uri.to_uri().to_string(),
         )),
     ))
+}
+
+fn build_review_comments_prompt(comments: &[ReviewCommentSnapshot]) -> Vec<acp::ContentBlock> {
+    let mut prompt = String::new();
+    prompt.push_str(indoc::indoc! {"
+        The user left the following review comments on a diff. For each comment \
+        you want to address, call the `respond_to_review_comment` tool with that \
+        comment's `comment_id` and your `response`. You may answer any subset of \
+        the comments — only respond where you have substantive feedback, and keep \
+        each response focused on that specific comment.
+
+    "});
+
+    for comment in comments {
+        let line_range = if comment.start_line == comment.end_line {
+            format!("line {}", comment.start_line)
+        } else {
+            format!("lines {}-{}", comment.start_line, comment.end_line)
+        };
+        prompt.push_str(&indoc::formatdoc!(
+            "
+            ---
+            comment_id: {id}
+            file: {file} ({line_range})
+
+            Code under review:
+            ```
+            {code}
+            ```
+
+            User comment:
+            {comment_text}
+
+            ",
+            id = comment.id,
+            file = comment.file_path,
+            line_range = line_range,
+            code = comment.code_snippet,
+            comment_text = comment.comment,
+        ));
+    }
+
+    vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))]
 }
 
 fn build_conflict_resolution_prompt(conflicts: &[ConflictContent]) -> Vec<acp::ContentBlock> {

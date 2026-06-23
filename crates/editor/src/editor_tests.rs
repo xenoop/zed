@@ -36114,6 +36114,73 @@ fn test_review_comment_take_all(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_add_agent_review_comment(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    _ = editor.update(cx, |editor: &mut Editor, _window, cx| {
+        let key1 = test_hunk_key("file1.rs");
+        let key2 = test_hunk_key("file2.rs");
+
+        let user_id1 = add_test_comment(editor, key1.clone(), "Question on hunk 1", cx);
+        let user_id2 = add_test_comment(editor, key2.clone(), "Question on hunk 2", cx);
+
+        // Agent answers only the first comment.
+        let agent_id = editor
+            .add_agent_review_comment(user_id1, "Answer to hunk 1".to_string(), cx)
+            .expect("target comment should be found");
+
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+
+        // The agent answer lands in the same hunk, nested under the user comment.
+        let hunk1_comments = editor.comments_for_hunk(&key1, &snapshot);
+        assert_eq!(hunk1_comments.len(), 2);
+        assert_eq!(hunk1_comments[0].id, user_id1);
+        assert_eq!(hunk1_comments[0].author, ReviewCommentAuthor::User);
+        assert_eq!(hunk1_comments[1].id, agent_id);
+        assert_eq!(hunk1_comments[1].author, ReviewCommentAuthor::Agent);
+        assert_eq!(hunk1_comments[1].in_reply_to, Some(user_id1));
+        assert_eq!(hunk1_comments[1].comment, "Answer to hunk 1");
+
+        // The untouched hunk keeps just the user's comment.
+        let hunk2_comments = editor.comments_for_hunk(&key2, &snapshot);
+        assert_eq!(hunk2_comments.len(), 1);
+        assert_eq!(hunk2_comments[0].id, user_id2);
+
+        // Responding to an unknown comment id is a no-op.
+        assert_eq!(
+            editor.add_agent_review_comment(9999, "Stray answer".to_string(), cx),
+            None
+        );
+        assert_eq!(editor.total_review_comment_count(), 3);
+    });
+}
+
+#[gpui::test]
+fn test_snapshot_review_comments_for_agent_excludes_agent_replies(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| Editor::single_line(window, cx));
+
+    _ = editor.update(cx, |editor: &mut Editor, _window, cx| {
+        let key = test_hunk_key("file1.rs");
+        let user_id = add_test_comment(editor, key, "User question", cx);
+        editor
+            .add_agent_review_comment(user_id, "Agent answer".to_string(), cx)
+            .expect("target comment should be found");
+
+        // Only the user's comment is offered to the agent; its own replies are
+        // excluded so it doesn't answer itself.
+        let snapshot = editor.snapshot_review_comments_for_agent(cx);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].id, user_id);
+        assert_eq!(snapshot[0].comment, "User question");
+        assert_eq!(snapshot[0].file_path, "file1.rs");
+    });
+}
+
+#[gpui::test]
 fn test_diff_review_overlay_show_and_dismiss(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

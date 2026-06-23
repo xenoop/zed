@@ -20,6 +20,7 @@ mod list_directory_tool;
 mod move_path_tool;
 mod read_file_tool;
 mod rename_tool;
+mod respond_to_review_comment_tool;
 mod skill_tool;
 mod spawn_agent_tool;
 mod symbol_locator;
@@ -30,7 +31,8 @@ mod write_file_tool;
 
 use crate::AgentTool;
 use feature_flags::{
-    CreateThreadToolFeatureFlag, FeatureFlagAppExt as _, LspToolFeatureFlag, RenameToolFeatureFlag,
+    CreateThreadToolFeatureFlag, DiffReviewFeatureFlag, FeatureFlagAppExt as _, LspToolFeatureFlag,
+    RenameToolFeatureFlag,
 };
 use gpui::App;
 use language_model::{LanguageModelRequestTool, LanguageModelToolSchemaFormat};
@@ -81,6 +83,7 @@ pub use list_directory_tool::*;
 pub use move_path_tool::*;
 pub use read_file_tool::*;
 pub use rename_tool::*;
+pub use respond_to_review_comment_tool::*;
 pub use skill_tool::*;
 pub use spawn_agent_tool::*;
 pub use symbol_locator::*;
@@ -191,6 +194,7 @@ tools! {
     MovePathTool,
     ReadFileTool,
     RenameTool,
+    RespondToReviewCommentTool,
     SkillTool,
     SpawnAgentTool,
     TerminalTool,
@@ -215,6 +219,7 @@ pub fn tool_feature_flag_enabled(tool_name: &str, cx: &App) -> bool {
         CreateThreadTool::NAME | ListAgentsAndModelsTool::NAME => {
             cx.has_flag::<CreateThreadToolFeatureFlag>()
         }
+        RespondToReviewCommentTool::NAME => cx.has_flag::<DiffReviewFeatureFlag>(),
         _ => true,
     }
 }
