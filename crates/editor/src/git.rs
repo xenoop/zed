@@ -2396,6 +2396,7 @@ impl Editor {
             )
             // Expandable comments section (only shown when there are comments)
             .when(comment_count > 0, |el| {
+                let prompt_focus_handle = prompt_editor.focus_handle(cx);
                 el.child(Self::render_comments_section(
                     comments,
                     comments_expanded,
@@ -2404,6 +2405,7 @@ impl Editor {
                     avatar_size,
                     action_icon_size,
                     colors,
+                    prompt_focus_handle,
                 ))
             })
             .into_any_element()
@@ -2417,6 +2419,7 @@ impl Editor {
         avatar_size: Pixels,
         action_icon_size: IconSize,
         colors: &theme::ThemeColors,
+        prompt_focus_handle: FocusHandle,
     ) -> impl IntoElement {
         let comment_count = comments.len();
 
@@ -2471,6 +2474,7 @@ impl Editor {
                         avatar_size,
                         action_icon_size,
                         colors,
+                        prompt_focus_handle.clone(),
                     )
                 }))
             })
@@ -2483,6 +2487,7 @@ impl Editor {
         avatar_size: Pixels,
         action_icon_size: IconSize,
         colors: &theme::ThemeColors,
+        prompt_focus_handle: FocusHandle,
     ) -> impl IntoElement {
         let comment_id = comment.id;
         let is_editing = inline_editor.is_some();
@@ -2585,8 +2590,20 @@ impl Editor {
                         }),
                     )
                     .into_any_element()
+            } else if is_agent {
+                // Agent comment in display mode: show a Reply button to focus the prompt editor
+                IconButton::new(
+                    format!("diff-review-reply-{comment_id}"),
+                    IconName::ReplyArrowRight,
+                )
+                .icon_color(ui::Color::Muted)
+                .icon_size(action_icon_size)
+                .tooltip(Tooltip::text("Reply"))
+                .on_click(move |_, window, cx| {
+                    window.focus(&prompt_focus_handle, cx);
+                })
+                .into_any_element()
             } else {
-                // Display mode: no action buttons for now (edit/delete not yet implemented)
                 gpui::Empty.into_any_element()
             })
     }
