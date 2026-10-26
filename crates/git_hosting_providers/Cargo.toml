@@ -20,15 +20,19 @@ git.workspace = true
 gpui.workspace = true
 http_client.workspace = true
 itertools.workspace = true
+log.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
+time.workspace = true
 url.workspace = true
 urlencoding.workspace = true
 util.workspace = true
 
 [dev-dependencies]
+http_client = { workspace = true, features = ["test-support"] }
+parking_lot.workspace = true
 indoc.workspace = true
 serde_json.workspace = true
 pretty_assertions.workspace = true

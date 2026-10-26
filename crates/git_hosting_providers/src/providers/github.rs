@@ -13,7 +13,7 @@ use urlencoding::encode;
 
 use git::{
     BuildCommitPermalinkParams, BuildPermalinkParams, GitHostingProvider, ParsedGitRemote,
-    PullRequest, RemoteUrl,
+    PullRequest, RemoteUrl, code_review::CodeReviewProvider,
 };
 
 use crate::get_host_from_git_remote_url;
@@ -169,6 +169,13 @@ impl Github {
 impl GitHostingProvider for Github {
     fn name(&self) -> String {
         self.name.clone()
+    }
+
+    fn code_review_provider(&self) -> Option<Arc<dyn CodeReviewProvider>> {
+        Some(crate::providers::github_review::github_reviews(
+            &self.name,
+            &self.base_url,
+        ))
     }
 
     fn base_url(&self) -> Url {

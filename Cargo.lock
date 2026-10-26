@@ -3193,6 +3193,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "code_review"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "credentials_provider",
+ "futures 0.3.34",
+ "git",
+ "git_hosting_providers",
+ "gpui",
+ "http_client",
+ "parking_lot",
+ "time",
+ "util",
+ "zed_credentials_provider",
+]
+
+[[package]]
 name = "codespan-reporting"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7040,11 +7058,14 @@ dependencies = [
  "http_client",
  "indoc",
  "itertools 0.14.0",
+ "log",
+ "parking_lot",
  "pretty_assertions",
  "regex",
  "serde",
  "serde_json",
  "settings",
+ "time",
  "url",
  "urlencoding",
  "util",

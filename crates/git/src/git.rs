@@ -1,4 +1,5 @@
 pub mod blame;
+pub mod code_review;
 pub mod commit;
 mod hosting_provider;
 mod remote;

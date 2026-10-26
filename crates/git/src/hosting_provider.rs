@@ -9,7 +9,7 @@ use itertools::Itertools;
 use parking_lot::RwLock;
 use url::Url;
 
-use crate::repository::RepoPath;
+use crate::{code_review::CodeReviewProvider, repository::RepoPath};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct PullRequest {
@@ -145,6 +145,10 @@ pub trait GitHostingProvider {
     ) -> Result<Option<Url>> {
         Ok(None)
     }
+    /// Returns the provider for reading this host's code reviews, if it has one.
+    fn code_review_provider(&self) -> Option<Arc<dyn CodeReviewProvider>> {
+        None
+    }
 }
 
 #[derive(Default, Deref, DerefMut)]
@@ -231,7 +235,7 @@ impl GitHostingProviderRegistry {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedGitRemote {
     pub owner: Arc<str>,
     pub repo: Arc<str>,
