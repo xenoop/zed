@@ -5,16 +5,18 @@ use crate::{
         self, CompareWithBranch, DeployBranchDiff, ProjectDiff, ReviewDiff,
         render_send_review_to_agent_button,
     },
+    review_threads::{ConnectReviewHostModal, ReviewThreads},
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
+use code_review::ReviewState;
 use editor::{
     Addon, Editor, EditorEvent, HiddenDiffHunkRenderer, SplittableEditor,
     actions::SendReviewToAgent,
 };
 use git::{repository::DiffType, status::FileStatus};
 use gpui::{
-    Action, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
+    Action, AnyElement, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
     SharedString, Subscription, Task, WeakEntity,
 };
 use language::{BufferId, Capability};
@@ -31,6 +33,7 @@ use std::{
     sync::Arc,
 };
 use ui::{DiffStat, Divider, PopoverMenu, Tooltip, prelude::*};
+use util::ResultExt as _;
 use workspace::{
     ItemHandle, ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation,
     ToolbarItemView, Workspace,
@@ -38,7 +41,7 @@ use workspace::{
     notifications::NotifyTaskExt,
     searchable::SearchableItemHandle,
 };
-use zed_actions::agent::ReviewBranchDiff;
+use zed_actions::{agent::ReviewBranchDiff, git::ToggleReviewThreads};
 
 /// The workspace item for a branch (merge-base) diff: "Changes since {branch}".
 /// It wraps a single [`DiffMultibuffer`] over [`DiffBase::Merge`] and delegates
@@ -49,7 +52,9 @@ pub struct BranchDiff {
     diff: Entity<DiffMultibuffer>,
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
+    review_threads: Entity<ReviewThreads>,
     _diff_event_subscription: Subscription,
+    _review_threads_subscription: Subscription,
 }
 
 struct BranchDiffAddon {
@@ -364,11 +369,15 @@ impl BranchDiff {
         let diff_event_subscription = cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| {
             cx.emit(event.clone())
         });
+        let review_threads = cx.new(|cx| ReviewThreads::new(diff.clone(), &project, cx));
+        let review_threads_subscription = cx.observe(&review_threads, |_, _, cx| cx.notify());
         Self {
             diff,
             project,
             workspace: workspace.downgrade(),
+            review_threads,
             _diff_event_subscription: diff_event_subscription,
+            _review_threads_subscription: review_threads_subscription,
         }
     }
 
@@ -386,6 +395,25 @@ impl BranchDiff {
                 branch_diff.set_diff_base(DiffBase::Merge { base_ref }, cx);
             });
         });
+    }
+
+    fn toggle_review_threads(
+        &mut self,
+        _: &ToggleReviewThreads,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.review_threads
+            .update(cx, |review_threads, cx| review_threads.toggle(cx));
+    }
+
+    fn connect_review_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.review_threads.read(cx).store().clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                ConnectReviewHostModal::toggle(workspace, store, window, cx)
+            })
+            .log_err();
     }
 
     fn review_diff(&mut self, _: &ReviewDiff, window: &mut Window, cx: &mut Context<Self>) {
@@ -636,6 +664,7 @@ impl Render for BranchDiff {
         div()
             .size_full()
             .on_action(cx.listener(Self::review_diff))
+            .on_action(cx.listener(Self::toggle_review_threads))
             .child(self.diff.clone())
     }
 }
@@ -703,11 +732,15 @@ impl SerializableItem for BranchDiff {
 
 pub struct BranchDiffToolbar {
     branch_diff: Option<WeakEntity<BranchDiff>>,
+    _branch_diff_subscription: Option<Subscription>,
 }
 
 impl BranchDiffToolbar {
     pub fn new(_cx: &mut Context<Self>) -> Self {
-        Self { branch_diff: None }
+        Self {
+            branch_diff: None,
+            _branch_diff_subscription: None,
+        }
     }
 
     fn branch_diff(&self, _: &App) -> Option<Entity<BranchDiff>> {
@@ -734,9 +767,11 @@ impl ToolbarItemView for BranchDiffToolbar {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> ToolbarItemLocation {
-        self.branch_diff = active_pane_item
-            .and_then(|item| item.act_as::<BranchDiff>(cx))
-            .map(|entity| entity.downgrade());
+        let branch_diff = active_pane_item.and_then(|item| item.act_as::<BranchDiff>(cx));
+        self._branch_diff_subscription = branch_diff
+            .as_ref()
+            .map(|branch_diff| cx.observe(branch_diff, |_, _, cx| cx.notify()));
+        self.branch_diff = branch_diff.map(|entity| entity.downgrade());
         if self.branch_diff.is_some() {
             ToolbarItemLocation::PrimaryRight
         } else {
@@ -872,6 +907,8 @@ impl Render for BranchDiffToolbar {
                         Tooltip::text("Select Base Branch"),
                     ),
             )
+            .child(Divider::vertical())
+            .child(render_review_threads_button(&branch_diff, cx))
             .when(show_review_button, |this| {
                 let focus_handle = focus_handle.clone();
                 this.child(Divider::vertical()).child(
@@ -904,6 +941,163 @@ impl Render for BranchDiffToolbar {
                     ),
                 )
             })
+    }
+}
+
+fn render_review_threads_button(
+    branch_diff: &Entity<BranchDiff>,
+    cx: &mut Context<BranchDiffToolbar>,
+) -> AnyElement {
+    let branch_diff_handle = branch_diff.downgrade();
+    let review_threads = branch_diff.read(cx).review_threads.read(cx);
+    let visible = review_threads.is_visible();
+    let threads_outside_diff = review_threads.threads_outside_diff();
+    let store = review_threads.store().read(cx);
+    let is_refreshing = store.is_refreshing();
+
+    let toggle = {
+        let branch_diff = branch_diff_handle.clone();
+        move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
+            branch_diff
+                .update(cx, |branch_diff, cx| {
+                    branch_diff.toggle_review_threads(&ToggleReviewThreads, window, cx)
+                })
+                .log_err();
+        }
+    };
+    let button = |label: SharedString, icon: IconName, color: Color| {
+        Button::new("review-threads", label)
+            .toggle_state(visible)
+            .start_icon(Icon::new(icon).size(IconSize::Small).color(color))
+    };
+
+    if !visible {
+        return button("Review Threads".into(), IconName::Chat, Color::Muted)
+            .tooltip(Tooltip::text("Show the pull request's review threads"))
+            .on_click(toggle)
+            .into_any_element();
+    }
+
+    match store.state() {
+        ReviewState::Idle | ReviewState::Loading => {
+            button("Loading Threads…".into(), IconName::Chat, Color::Muted)
+                .tooltip(Tooltip::text("Hide review threads"))
+                .on_click(toggle)
+                .into_any_element()
+        }
+        ReviewState::Loaded(loaded) => {
+            let open = loaded.open_thread_count();
+            let label: SharedString = if loaded.threads.is_empty() {
+                "No Threads".into()
+            } else if open == 0 {
+                "All Resolved".into()
+            } else {
+                format!("{open} Open").into()
+            };
+            let mut details = vec![format!("#{} {}", loaded.review.number, loaded.review.title)];
+            if !loaded.local_head_matches {
+                details.push(
+                    "Your checkout isn't at the pull request's latest commit, so thread positions may be off."
+                        .to_string(),
+                );
+            }
+            if threads_outside_diff > 0 {
+                details.push(format!(
+                    "{threads_outside_diff} thread(s) are on files outside this diff."
+                ));
+            }
+            if is_refreshing {
+                details.push("Refreshing…".to_string());
+            }
+            let details: SharedString = details.join("\n").into();
+            let icon_color = if loaded.local_head_matches {
+                Color::Accent
+            } else {
+                Color::Warning
+            };
+            let url = loaded.review.url.clone();
+            h_flex()
+                .gap_0p5()
+                .child(
+                    button(label, IconName::Chat, icon_color)
+                        .tooltip(Tooltip::text(details))
+                        .on_click(toggle),
+                )
+                .child(
+                    IconButton::new("review-threads-refresh", IconName::RotateCw)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .disabled(is_refreshing)
+                        .tooltip(Tooltip::text("Refresh review threads"))
+                        .on_click({
+                            let branch_diff = branch_diff_handle;
+                            move |_, _, cx| {
+                                branch_diff
+                                    .update(cx, |branch_diff, cx| {
+                                        branch_diff
+                                            .review_threads
+                                            .update(cx, |threads, cx| threads.refresh(cx))
+                                    })
+                                    .log_err();
+                            }
+                        }),
+                )
+                .child(
+                    IconButton::new("review-threads-open", IconName::ArrowUpRight)
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Open the pull request"))
+                        .on_click(move |_, _, cx| cx.open_url(url.as_str())),
+                )
+                .into_any_element()
+        }
+        ReviewState::SignedOut { provider_name, .. } => button(
+            format!("Connect {provider_name}").into(),
+            IconName::Github,
+            Color::Warning,
+        )
+        .tooltip(Tooltip::text("Sign in to see review threads"))
+        .on_click(move |_, window, cx| {
+            branch_diff_handle
+                .update(cx, |branch_diff, cx| {
+                    branch_diff.connect_review_host(window, cx)
+                })
+                .log_err();
+        })
+        .into_any_element(),
+        ReviewState::NoReview {
+            head_branch,
+            base_branch,
+        } => {
+            let target = base_branch
+                .as_ref()
+                .map(|base| format!("{head_branch} → {base}"))
+                .unwrap_or_else(|| head_branch.to_string());
+            button("No Pull Request".into(), IconName::Chat, Color::Muted)
+                .tooltip(Tooltip::text(format!("No open pull request for {target}")))
+                .on_click(toggle)
+                .into_any_element()
+        }
+        ReviewState::Unavailable(reason) => {
+            button("Review Threads".into(), IconName::Chat, Color::Muted)
+                .tooltip(Tooltip::text(reason.clone()))
+                .on_click(toggle)
+                .into_any_element()
+        }
+        ReviewState::Failed(message) => {
+            button("Retry Threads".into(), IconName::Warning, Color::Error)
+                .tooltip(Tooltip::text(message.clone()))
+                .on_click(move |_, _, cx| {
+                    branch_diff_handle
+                        .update(cx, |branch_diff, cx| {
+                            branch_diff
+                                .review_threads
+                                .update(cx, |threads, cx| threads.refresh(cx))
+                        })
+                        .log_err();
+                })
+                .into_any_element()
+        }
     }
 }
 
@@ -1096,6 +1290,180 @@ mod tests {
         });
 
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_review_threads_in_branch_diff(cx: &mut TestAppContext) {
+        use code_review::{
+            ReviewStore, ReviewTarget,
+            fake::{FakeCodeReviewProvider, FakeCredentialEnvironment},
+        };
+        use credentials_provider::test_support::FakeCredentialsProvider;
+        use git::{
+            ParsedGitRemote,
+            code_review::{
+                CommentAuthorRole, CommentId, CredentialSource, DiffSide, Review, ReviewComment,
+                ReviewQuery, ReviewThread, ThreadId,
+            },
+            repository::RepoPath,
+        };
+
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "one\ntwo changed\nthree\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let branch_diff = cx
+            .update(|window, cx| {
+                BranchDiff::new_with_default_branch(project.clone(), workspace, window, cx)
+            })
+            .await
+            .unwrap();
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "one\ntwo changed\nthree\n".into())],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "one\ntwo\nthree\n".into())],
+        );
+        cx.run_until_parked();
+
+        let thread = |id: &str, path: &str, line: u32, is_resolved: bool| ReviewThread {
+            id: ThreadId(id.to_string().into()),
+            path: RepoPath::new(path).unwrap(),
+            side: DiffSide::New,
+            lines: Some(line..=line),
+            original_lines: Some(line..=line),
+            is_resolved,
+            is_outdated: false,
+            can_resolve: true,
+            can_reply: true,
+            resolved_by: is_resolved.then(|| "author".into()),
+            comments: vec![ReviewComment {
+                id: CommentId(format!("{id}-comment").into()),
+                author: None,
+                role: CommentAuthorRole::Reviewer,
+                body: "Please **rename** this.".into(),
+                created_at: time::OffsetDateTime::UNIX_EPOCH,
+                in_reply_to: None,
+                url: None,
+            }],
+        };
+        let provider = Arc::new(FakeCodeReviewProvider {
+            credential_sources: vec![CredentialSource::Command {
+                program: "gh".into(),
+                args: Vec::new(),
+            }],
+            ..Default::default()
+        });
+        let base_repository = ParsedGitRemote {
+            owner: "owner".into(),
+            repo: "repo".into(),
+        };
+        {
+            let mut state = provider.state.lock();
+            state.reviews_by_branch.insert(
+                "feature".into(),
+                Review {
+                    id: "PR_1".into(),
+                    number: 1,
+                    title: "Change two".into(),
+                    url: "https://fake.example/pull/1".parse().unwrap(),
+                    base_repository: base_repository.clone(),
+                    head_sha: "sha".into(),
+                    base_ref: "main".into(),
+                    author_login: "author".into(),
+                },
+            );
+            state.threads = vec![
+                thread("open", "a.txt", 2, false),
+                thread("resolved", "a.txt", 2, true),
+                thread("elsewhere", "not-in-diff.txt", 1, false),
+            ];
+        }
+        let store = cx.new(|_| {
+            ReviewStore::with_dependencies(
+                http_client::FakeHttpClient::with_404_response(),
+                Arc::new(FakeCredentialsProvider::default()),
+                Arc::new(FakeCredentialEnvironment {
+                    variables: std::collections::HashMap::default(),
+                    command_output: Some("token".into()),
+                }),
+            )
+        });
+        let target = ReviewTarget {
+            provider,
+            query: ReviewQuery {
+                base_repository,
+                head_owner: "owner".into(),
+                head_branch: "feature".into(),
+                base_branch: Some("main".into()),
+            },
+            local_head_sha: Some("sha".into()),
+        };
+
+        let review_threads = branch_diff.read_with(cx, |diff, _| diff.review_threads.clone());
+        review_threads.update(cx, |review_threads, cx| {
+            review_threads.show_with_store(store, target, cx)
+        });
+        cx.run_until_parked();
+
+        let editor =
+            branch_diff.read_with(cx, |diff, cx| diff.editor(cx).read(cx).rhs_editor().clone());
+        let block_rows = |cx: &mut gpui::VisualTestContext| {
+            let block_ids = review_threads.read_with(cx, |threads, _| threads.block_ids().to_vec());
+            editor.update(cx, |editor, cx| {
+                block_ids
+                    .iter()
+                    .map(|block_id| editor.row_for_block(*block_id, cx))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let rows = block_rows(cx);
+        assert_eq!(rows.len(), 2, "both a.txt threads are shown");
+        assert!(rows.iter().all(|row| row.is_some()));
+        review_threads.read_with(cx, |threads, cx| {
+            assert_eq!(threads.threads_outside_diff(), 1);
+            assert!(threads.is_visible());
+            assert_eq!(
+                threads
+                    .store()
+                    .read(cx)
+                    .loaded()
+                    .unwrap()
+                    .open_thread_count(),
+                2
+            );
+        });
+
+        review_threads.update(cx, |threads, cx| {
+            threads.toggle_collapsed_for_test(&ThreadId("open".into()), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(block_rows(cx).len(), 2, "collapsing keeps the card");
+
+        cx.update(|window, cx| {
+            branch_diff.update(cx, |branch_diff, cx| {
+                branch_diff.toggle_review_threads(&ToggleReviewThreads, window, cx)
+            })
+        });
+        cx.run_until_parked();
+        assert!(
+            block_rows(cx).is_empty(),
+            "hiding threads removes the cards"
+        );
     }
 
     #[gpui::test]

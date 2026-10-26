@@ -42,7 +42,7 @@ use ztracing::instrument;
 const MAX_CONCURRENT_BUFFER_LOADS: usize = 16;
 
 struct BufferSubscriptions {
-    _diff: Entity<BufferDiff>,
+    diff: Entity<BufferDiff>,
     display_buffer: Entity<Buffer>,
     _diff_subscription: Subscription,
     _conflict_set: Option<Entity<ConflictSet>>,
@@ -203,6 +203,19 @@ impl DiffMultibuffer {
 
     pub(crate) fn has_conflict(&self, cx: &App) -> bool {
         self.multibuffer.read(cx).has_conflict(cx)
+    }
+
+    /// The buffer shown for `path` and its diff, if the file is in this diff.
+    pub(crate) fn buffer_and_diff_for_path(
+        &self,
+        path: &RepoPath,
+    ) -> Option<(Entity<Buffer>, Entity<BufferDiff>)> {
+        self.buffer_subscriptions.get(path).map(|subscriptions| {
+            (
+                subscriptions.display_buffer.clone(),
+                subscriptions.diff.clone(),
+            )
+        })
     }
 
     pub(crate) fn multibuffer(&self) -> &Entity<MultiBuffer> {
@@ -498,7 +511,7 @@ impl DiffMultibuffer {
         self.buffer_subscriptions.insert(
             repo_path,
             BufferSubscriptions {
-                _diff: diff.clone(),
+                diff: diff.clone(),
                 display_buffer: display_buffer.clone(),
                 _diff_subscription: diff_subscription,
                 _conflict_set: conflict_set.clone(),

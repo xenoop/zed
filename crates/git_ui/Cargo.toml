@@ -25,6 +25,7 @@ async-channel.workspace = true
 buffer_diff.workspace = true
 call = { workspace = true, optional = true }
 client.workspace = true
+code_review.workspace = true
 collections.workspace = true
 component.workspace = true
 db.workspace = true
@@ -75,12 +76,15 @@ zed_actions.workspace = true
 ztracing.workspace = true
 
 [dev-dependencies]
+code_review = { workspace = true, features = ["test-support"] }
+credentials_provider = { workspace = true, features = ["test-support"] }
 ctor.workspace = true
 db = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }
 fs = { workspace = true, features = ["test-support"] }
 git = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
+http_client = { workspace = true, features = ["test-support"] }
 indoc.workspace = true
 language = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true
