@@ -2662,7 +2662,9 @@ impl EditorElement {
         snapshot: &EditorSnapshot,
         cx: &App,
     ) -> Option<(DisplayRow, Option<u32>)> {
-        if !cx.has_flag::<DiffReviewFeatureFlag>() {
+        if !cx.has_flag::<DiffReviewFeatureFlag>()
+            && !self.editor.read(cx).diff_review_without_feature_flag()
+        {
             return None;
         }
 

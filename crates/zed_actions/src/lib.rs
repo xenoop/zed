@@ -377,7 +377,11 @@ pub mod git {
             /// Creates a pull request for the current branch.
             CreatePullRequest,
             /// Shows or hides the pull request's review threads in a branch diff.
-            ToggleReviewThreads
+            ToggleReviewThreads,
+            /// Posts the reply being written in a review thread.
+            SubmitReviewReply,
+            /// Submits your pending review comments with a verdict.
+            FinishReview
         ]
     );
 }

@@ -13,7 +13,7 @@ path = "src/code_review.rs"
 doctest = false
 
 [features]
-test-support = ["dep:async-trait", "dep:parking_lot"]
+test-support = ["dep:async-trait", "dep:parking_lot", "dep:time"]
 
 [dependencies]
 anyhow.workspace = true
@@ -24,6 +24,7 @@ git.workspace = true
 gpui.workspace = true
 http_client.workspace = true
 parking_lot = { workspace = true, optional = true }
+time = { workspace = true, optional = true }
 util.workspace = true
 zed_credentials_provider.workspace = true
 

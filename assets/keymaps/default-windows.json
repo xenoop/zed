@@ -1146,6 +1146,13 @@
     },
   },
   {
+    "context": "ReviewThreadReply > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-enter": "git::SubmitReviewReply",
+    },
+  },
+  {
     "context": "CommitEditor > Editor",
     "use_key_equivalents": true,
     "bindings": {

@@ -205,6 +205,16 @@ impl DiffMultibuffer {
         self.multibuffer.read(cx).has_conflict(cx)
     }
 
+    /// The repository path of a buffer shown in this diff.
+    pub(crate) fn repo_path_for_buffer(&self, buffer_id: BufferId, cx: &App) -> Option<RepoPath> {
+        self.buffer_subscriptions
+            .iter()
+            .find(|(_, subscriptions)| {
+                subscriptions.display_buffer.read(cx).remote_id() == buffer_id
+            })
+            .map(|(path, _)| path.clone())
+    }
+
     /// The buffer shown for `path` and its diff, if the file is in this diff.
     pub(crate) fn buffer_and_diff_for_path(
         &self,

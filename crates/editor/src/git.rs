@@ -166,6 +166,15 @@ pub(super) struct DiffHunkKey {
     pub(super) hunk_start_anchor: Anchor,
 }
 
+/// A stored review comment located in its buffer, for handing off elsewhere.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewCommentDraft {
+    pub buffer_id: BufferId,
+    /// 0-based buffer rows.
+    pub rows: std::ops::RangeInclusive<u32>,
+    pub text: String,
+}
+
 /// A review comment stored locally before being sent to the Agent panel.
 #[derive(Clone)]
 pub(super) struct StoredReviewComment {
@@ -1020,6 +1029,51 @@ impl Editor {
 
     pub(super) fn show_diff_review_button(&self) -> bool {
         self.show_diff_review_button
+    }
+
+    /// Shows the gutter's review comment button without the `diff-review`
+    /// feature flag or AI being enabled, for views where comments go to a
+    /// code review host rather than an agent.
+    pub fn set_diff_review_without_feature_flag(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.diff_review_without_feature_flag = enabled;
+        cx.notify();
+    }
+
+    pub(super) fn diff_review_without_feature_flag(&self) -> bool {
+        self.diff_review_without_feature_flag
+    }
+
+    /// The review comments written in this editor, located in their buffers.
+    pub fn review_comment_drafts(&self, cx: &App) -> Vec<ReviewCommentDraft> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        self.stored_review_comments
+            .iter()
+            .flat_map(|(_, comments)| comments)
+            .filter_map(|comment| {
+                let start = comment.range.start.to_point(&snapshot);
+                let end = comment.range.end.to_point(&snapshot);
+                let (buffer, start) = snapshot.point_to_buffer_point(start)?;
+                let buffer_id = buffer.remote_id();
+                let (end_buffer, end) = snapshot.point_to_buffer_point(end)?;
+                if end_buffer.remote_id() != buffer_id {
+                    return None;
+                }
+                Some(ReviewCommentDraft {
+                    buffer_id,
+                    rows: start.row.min(end.row)..=start.row.max(end.row),
+                    text: comment.comment.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Removes every stored review comment, e.g. after they were submitted.
+    pub fn clear_review_comments(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_all_diff_review_overlays(cx);
+        self.stored_review_comments.clear();
+        self.next_review_comment_id = 0;
+        cx.emit(EditorEvent::ReviewCommentsChanged { total_count: 0 });
+        cx.notify();
     }
 
     pub(super) fn render_diff_review_button(

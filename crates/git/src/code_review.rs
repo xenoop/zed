@@ -70,6 +70,30 @@ pub struct ReviewQuery {
     pub base_branch: Option<SharedString>,
 }
 
+/// A new comment written locally and posted with a review submission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DraftComment {
+    pub path: RepoPath,
+    pub side: DiffSide,
+    /// 1-based lines in the review's head version.
+    pub lines: RangeInclusive<u32>,
+    pub body: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewVerdict {
+    Comment,
+    Approve,
+    RequestChanges,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewSubmission {
+    pub verdict: ReviewVerdict,
+    pub body: String,
+    pub comments: Vec<DraftComment>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Review {
     /// The provider's own identifier, used for follow-up requests.
@@ -81,6 +105,16 @@ pub struct Review {
     pub head_sha: SharedString,
     pub base_ref: SharedString,
     pub author_login: SharedString,
+    /// The signed-in user, when the host reports it.
+    pub viewer_login: Option<SharedString>,
+}
+
+impl Review {
+    pub fn viewer_is_author(&self) -> bool {
+        self.viewer_login
+            .as_ref()
+            .is_some_and(|viewer| *viewer == self.author_login)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -201,6 +235,29 @@ pub trait CodeReviewProvider: Send + Sync {
         request: &ReviewRequestContext,
         review: &Review,
     ) -> Result<Vec<ReviewThread>>;
+
+    /// Adds a reply at the end of a thread.
+    async fn reply(
+        &self,
+        request: &ReviewRequestContext,
+        review: &Review,
+        thread: &ThreadId,
+        body: &str,
+    ) -> Result<ReviewComment>;
+
+    async fn set_resolved(
+        &self,
+        request: &ReviewRequestContext,
+        thread: &ThreadId,
+        resolved: bool,
+    ) -> Result<()>;
+
+    async fn submit_review(
+        &self,
+        request: &ReviewRequestContext,
+        review: &Review,
+        submission: ReviewSubmission,
+    ) -> Result<()>;
 }
 
 #[cfg(test)]

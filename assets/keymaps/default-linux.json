@@ -1149,6 +1149,12 @@
     },
   },
   {
+    "context": "ReviewThreadReply > Editor",
+    "bindings": {
+      "ctrl-enter": "git::SubmitReviewReply",
+    },
+  },
+  {
     "context": "CommitEditor > Editor",
     "bindings": {
       "escape": "git_panel::FocusChanges",

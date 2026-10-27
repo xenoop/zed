@@ -5,7 +5,7 @@ use crate::{
         self, CompareWithBranch, DeployBranchDiff, ProjectDiff, ReviewDiff,
         render_send_review_to_agent_button,
     },
-    review_threads::{ConnectReviewHostModal, ReviewThreads},
+    review_threads::{ConnectReviewHostModal, FinishReviewModal, ReviewThreads},
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
@@ -41,7 +41,10 @@ use workspace::{
     notifications::NotifyTaskExt,
     searchable::SearchableItemHandle,
 };
-use zed_actions::{agent::ReviewBranchDiff, git::ToggleReviewThreads};
+use zed_actions::{
+    agent::ReviewBranchDiff,
+    git::{FinishReview, ToggleReviewThreads},
+};
 
 /// The workspace item for a branch (merge-base) diff: "Changes since {branch}".
 /// It wraps a single [`DiffMultibuffer`] over [`DiffBase::Merge`] and delegates
@@ -357,19 +360,20 @@ impl BranchDiff {
                 cx,
             )
         });
-        Self::from_diff(diff, project, workspace, cx)
+        Self::from_diff(diff, project, workspace, window, cx)
     }
 
     fn from_diff(
         diff: Entity<DiffMultibuffer>,
         project: Entity<Project>,
         workspace: Entity<Workspace>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let diff_event_subscription = cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| {
             cx.emit(event.clone())
         });
-        let review_threads = cx.new(|cx| ReviewThreads::new(diff.clone(), &project, cx));
+        let review_threads = cx.new(|cx| ReviewThreads::new(diff.clone(), &project, window, cx));
         let review_threads_subscription = cx.observe(&review_threads, |_, _, cx| cx.notify());
         Self {
             diff,
@@ -400,11 +404,20 @@ impl BranchDiff {
     fn toggle_review_threads(
         &mut self,
         _: &ToggleReviewThreads,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.review_threads
-            .update(cx, |review_threads, cx| review_threads.toggle(cx));
+            .update(cx, |review_threads, cx| review_threads.toggle(window, cx));
+    }
+
+    fn finish_review(&mut self, _: &FinishReview, window: &mut Window, cx: &mut Context<Self>) {
+        let review_threads = self.review_threads.clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                FinishReviewModal::toggle(workspace, review_threads, window, cx)
+            })
+            .log_err();
     }
 
     fn connect_review_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -665,6 +678,7 @@ impl Render for BranchDiff {
             .size_full()
             .on_action(cx.listener(Self::review_diff))
             .on_action(cx.listener(Self::toggle_review_threads))
+            .on_action(cx.listener(Self::finish_review))
             .child(self.diff.clone())
     }
 }
@@ -832,6 +846,10 @@ impl Render for BranchDiffToolbar {
             .read(cx)
             .is_empty();
         let is_ai_enabled = AgentSettings::get_global(cx).enabled(cx);
+        let comments_go_to_review = {
+            let review_threads = branch_diff.read(cx).review_threads.read(cx);
+            review_threads.is_visible() && review_threads.store().read(cx).loaded().is_some()
+        };
 
         let show_review_button = !is_multibuffer_empty && is_ai_enabled;
 
@@ -932,13 +950,30 @@ impl Render for BranchDiffToolbar {
                         })),
                 )
             })
-            .when(review_count > 0, |this| {
+            .when(review_count > 0 && !comments_go_to_review, |this| {
                 this.child(Divider::vertical()).child(
                     render_send_review_to_agent_button(review_count, &focus_handle).on_click(
                         cx.listener(|this, _, window, cx| {
                             this.dispatch_action(&SendReviewToAgent, window, cx)
                         }),
                     ),
+                )
+            })
+            .when(comments_go_to_review, |this| {
+                let label: SharedString = if review_count > 0 {
+                    format!("Finish Review ({review_count})").into()
+                } else {
+                    "Finish Review".into()
+                };
+                this.child(Divider::vertical()).child(
+                    Button::new("finish-review", label)
+                        .style(ButtonStyle::Filled)
+                        .tooltip(Tooltip::text(
+                            "Submit your comments to the pull request with a verdict",
+                        ))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.dispatch_action(&FinishReview, window, cx)
+                        })),
                 )
             })
     }
@@ -1385,6 +1420,7 @@ mod tests {
                     head_sha: "sha".into(),
                     base_ref: "main".into(),
                     author_login: "author".into(),
+                    viewer_login: Some("reviewer".into()),
                 },
             );
             state.threads = vec![
@@ -1404,7 +1440,7 @@ mod tests {
             )
         });
         let target = ReviewTarget {
-            provider,
+            provider: provider.clone(),
             query: ReviewQuery {
                 base_repository,
                 head_owner: "owner".into(),
@@ -1415,8 +1451,8 @@ mod tests {
         };
 
         let review_threads = branch_diff.read_with(cx, |diff, _| diff.review_threads.clone());
-        review_threads.update(cx, |review_threads, cx| {
-            review_threads.show_with_store(store, target, cx)
+        review_threads.update_in(cx, |review_threads, window, cx| {
+            review_threads.show_with_store(store, target, window, cx)
         });
         cx.run_until_parked();
 
@@ -1448,11 +1484,43 @@ mod tests {
             );
         });
 
-        review_threads.update(cx, |threads, cx| {
-            threads.toggle_collapsed_for_test(&ThreadId("open".into()), cx)
+        let open_thread = ThreadId("open".into());
+        let reply_editor = review_threads
+            .read_with(cx, |threads, _| threads.reply_editor(&open_thread))
+            .expect("open threads get a reply box");
+        reply_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Renamed, thanks!", window, cx)
+        });
+        review_threads.update_in(cx, |threads, window, cx| {
+            threads.submit_reply_for_test(open_thread.clone(), window, cx)
         });
         cx.run_until_parked();
-        assert_eq!(block_rows(cx).len(), 2, "collapsing keeps the card");
+        assert_eq!(
+            provider.state.lock().replies,
+            vec![(open_thread.clone(), "Renamed, thanks!".to_string())]
+        );
+        assert_eq!(reply_editor.read_with(cx, |editor, cx| editor.text(cx)), "");
+        review_threads.read_with(cx, |threads, cx| {
+            let loaded = threads.store().read(cx).loaded().unwrap();
+            assert_eq!(loaded.threads[0].comments.len(), 2);
+            assert!(threads.can_comment(cx));
+        });
+
+        review_threads.update_in(cx, |threads, window, cx| {
+            threads.set_resolved_for_test(open_thread.clone(), true, window, cx)
+        });
+        cx.run_until_parked();
+        review_threads.read_with(cx, |threads, cx| {
+            let loaded = threads.store().read(cx).loaded().unwrap();
+            assert!(loaded.threads[0].is_resolved);
+            assert_eq!(loaded.open_thread_count(), 1);
+        });
+
+        review_threads.update_in(cx, |threads, window, cx| {
+            threads.toggle_collapsed_for_test(&ThreadId("resolved".into()), window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(block_rows(cx).len(), 2, "expanding keeps the card");
 
         cx.update(|window, cx| {
             branch_diff.update(cx, |branch_diff, cx| {

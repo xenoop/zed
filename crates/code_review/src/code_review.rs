@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, future::Future, sync::Arc};
 
 use anyhow::{Context as _, Result};
 use credentials_provider::CredentialsProvider;
@@ -6,12 +6,12 @@ use futures::future::BoxFuture;
 use git::{
     GitHostingProviderRegistry,
     code_review::{
-        CodeReviewProvider, CredentialSource, Review, ReviewCapabilities, ReviewQuery,
-        ReviewRequestContext, ReviewThread,
+        CodeReviewProvider, CredentialSource, Review, ReviewCapabilities, ReviewComment,
+        ReviewQuery, ReviewRequestContext, ReviewSubmission, ReviewThread, ThreadId,
     },
     parse_git_remote_url,
 };
-use gpui::{App, AsyncApp, Context, EventEmitter, SharedString, Task};
+use gpui::{App, AppContext as _, AsyncApp, Context, EventEmitter, SharedString, Task};
 use http_client::HttpClient;
 use util::ResultExt as _;
 
@@ -253,6 +253,11 @@ pub enum ReviewState {
     Failed(SharedString),
 }
 
+enum ThreadUpdate {
+    Replied(ReviewComment),
+    Resolved(bool),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReviewStoreEvent {
     Changed,
@@ -266,6 +271,10 @@ pub struct ReviewStore {
     http_client: Arc<dyn HttpClient>,
     credentials_provider: Arc<dyn CredentialsProvider>,
     environment: Arc<dyn CredentialEnvironment>,
+    /// The authenticated context from the last successful load, reused for
+    /// writes so they don't look the token up again.
+    request: Option<ReviewRequestContext>,
+    busy_threads: HashSet<ThreadId>,
     refresh_task: Option<Task<()>>,
 }
 
@@ -292,6 +301,8 @@ impl ReviewStore {
             http_client,
             credentials_provider,
             environment,
+            request: None,
+            busy_threads: HashSet::default(),
             refresh_task: None,
         }
     }
@@ -337,10 +348,11 @@ impl ReviewStore {
         let credentials_provider = self.credentials_provider.clone();
         let environment = self.environment.clone();
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
-            let state =
+            let (state, request) =
                 load_review_state(target, http_client, credentials_provider, environment, cx).await;
             this.update(cx, |this, cx| {
                 this.is_refreshing = false;
+                this.request = request;
                 this.set_state(state, cx);
             })
             .log_err();
@@ -370,6 +382,111 @@ impl ReviewStore {
         })
     }
 
+    /// Whether a write to this thread is in flight.
+    pub fn is_thread_busy(&self, thread: &ThreadId) -> bool {
+        self.busy_threads.contains(thread)
+    }
+
+    /// Posts a reply at the end of a thread.
+    pub fn reply(
+        &mut self,
+        thread: ThreadId,
+        body: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.write_thread(
+            thread.clone(),
+            cx,
+            move |provider, request, review| async move {
+                let comment = provider.reply(&request, &review, &thread, &body).await?;
+                Ok(ThreadUpdate::Replied(comment))
+            },
+        )
+    }
+
+    pub fn set_resolved(
+        &mut self,
+        thread: ThreadId,
+        resolved: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.write_thread(thread.clone(), cx, move |provider, request, _| async move {
+            provider.set_resolved(&request, &thread, resolved).await?;
+            Ok(ThreadUpdate::Resolved(resolved))
+        })
+    }
+
+    /// Submits a review with the given comments, then reloads the threads.
+    pub fn submit_review(
+        &mut self,
+        submission: ReviewSubmission,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some((provider, request, review)) = self.write_context() else {
+            return Task::ready(Err(anyhow::anyhow!("no review is loaded")));
+        };
+        let task = cx.background_spawn(async move {
+            provider.submit_review(&request, &review, submission).await
+        });
+        cx.spawn(async move |this, cx| {
+            task.await?;
+            this.update(cx, |this, cx| this.reload(cx))?;
+            Ok(())
+        })
+    }
+
+    fn write_context(&self) -> Option<(Arc<dyn CodeReviewProvider>, ReviewRequestContext, Review)> {
+        let provider = self.target.as_ref()?.provider.clone();
+        let request = self.request.clone()?;
+        let review = self.loaded()?.review.clone();
+        Some((provider, request, review))
+    }
+
+    fn write_thread<F, Fut>(
+        &mut self,
+        thread: ThreadId,
+        cx: &mut Context<Self>,
+        write: F,
+    ) -> Task<Result<()>>
+    where
+        F: FnOnce(Arc<dyn CodeReviewProvider>, ReviewRequestContext, Review) -> Fut,
+        Fut: Future<Output = Result<ThreadUpdate>> + Send + 'static,
+    {
+        let Some((provider, request, review)) = self.write_context() else {
+            return Task::ready(Err(anyhow::anyhow!("no review is loaded")));
+        };
+        if !self.busy_threads.insert(thread.clone()) {
+            return Task::ready(Ok(()));
+        }
+        cx.emit(ReviewStoreEvent::Changed);
+        cx.notify();
+
+        let task = cx.background_spawn(write(provider, request, review));
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.busy_threads.remove(&thread);
+                if let Ok(update) = &result
+                    && let ReviewState::Loaded(loaded) = &mut this.state
+                    && let Some(loaded_thread) = loaded
+                        .threads
+                        .iter_mut()
+                        .find(|candidate| candidate.id == thread)
+                {
+                    match update {
+                        ThreadUpdate::Replied(comment) => {
+                            loaded_thread.comments.push(comment.clone())
+                        }
+                        ThreadUpdate::Resolved(resolved) => loaded_thread.is_resolved = *resolved,
+                    }
+                }
+                cx.emit(ReviewStoreEvent::Changed);
+                cx.notify();
+            })?;
+            result.map(|_| ())
+        })
+    }
+
     fn set_state(&mut self, state: ReviewState, cx: &mut Context<Self>) {
         self.state = state;
         cx.emit(ReviewStoreEvent::Changed);
@@ -383,7 +500,7 @@ async fn load_review_state(
     credentials_provider: Arc<dyn CredentialsProvider>,
     environment: Arc<dyn CredentialEnvironment>,
     cx: &mut AsyncApp,
-) -> ReviewState {
+) -> (ReviewState, Option<ReviewRequestContext>) {
     let provider = target.provider.clone();
     let (token, attempts) = resolve_token(
         provider.as_ref(),
@@ -393,26 +510,32 @@ async fn load_review_state(
     )
     .await;
     let Some(token) = token else {
-        return ReviewState::SignedOut {
-            provider_name: provider.name(),
-            attempts,
-        };
+        return (
+            ReviewState::SignedOut {
+                provider_name: provider.name(),
+                attempts,
+            },
+            None,
+        );
     };
 
     let request = ReviewRequestContext { http_client, token };
     let query = target.query.clone();
     let result = cx
         .background_executor()
-        .spawn(async move {
-            let Some(review) = provider.find_review_for_branch(&request, &query).await? else {
-                return anyhow::Ok(None);
-            };
-            let threads = provider.load_threads(&request, &review).await?;
-            Ok(Some((review, threads, provider.capabilities())))
+        .spawn({
+            let request = request.clone();
+            async move {
+                let Some(review) = provider.find_review_for_branch(&request, &query).await? else {
+                    return anyhow::Ok(None);
+                };
+                let threads = provider.load_threads(&request, &review).await?;
+                Ok(Some((review, threads, provider.capabilities())))
+            }
         })
         .await;
 
-    match result {
+    let state = match result {
         Ok(Some((review, threads, capabilities))) => {
             let local_head_matches = target
                 .local_head_sha
@@ -430,7 +553,8 @@ async fn load_review_state(
             base_branch: target.query.base_branch,
         },
         Err(error) => ReviewState::Failed(format!("{error:#}").into()),
-    }
+    };
+    (state, Some(request))
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -454,6 +578,8 @@ pub mod fake {
         pub threads: Vec<ReviewThread>,
         pub fail_with: Option<String>,
         pub tokens_seen: Vec<String>,
+        pub replies: Vec<(ThreadId, String)>,
+        pub submissions: Vec<ReviewSubmission>,
     }
 
     #[async_trait]
@@ -494,6 +620,71 @@ pub mod fake {
         ) -> Result<Vec<ReviewThread>> {
             Ok(self.state.lock().threads.clone())
         }
+
+        async fn reply(
+            &self,
+            _request: &ReviewRequestContext,
+            _review: &Review,
+            thread: &ThreadId,
+            body: &str,
+        ) -> Result<ReviewComment> {
+            let mut state = self.state.lock();
+            if let Some(error) = &state.fail_with {
+                anyhow::bail!("{error}");
+            }
+            state.replies.push((thread.clone(), body.to_string()));
+            let comment = ReviewComment {
+                id: git::code_review::CommentId(format!("reply-{}", state.replies.len()).into()),
+                author: None,
+                role: git::code_review::CommentAuthorRole::Author,
+                body: body.to_string().into(),
+                created_at: time::OffsetDateTime::UNIX_EPOCH,
+                in_reply_to: None,
+                url: None,
+            };
+            if let Some(thread) = state
+                .threads
+                .iter_mut()
+                .find(|candidate| candidate.id == *thread)
+            {
+                thread.comments.push(comment.clone());
+            }
+            Ok(comment)
+        }
+
+        async fn set_resolved(
+            &self,
+            _request: &ReviewRequestContext,
+            thread: &ThreadId,
+            resolved: bool,
+        ) -> Result<()> {
+            let mut state = self.state.lock();
+            if let Some(error) = &state.fail_with {
+                anyhow::bail!("{error}");
+            }
+            if let Some(thread) = state
+                .threads
+                .iter_mut()
+                .find(|candidate| candidate.id == *thread)
+            {
+                thread.is_resolved = resolved;
+            }
+            Ok(())
+        }
+
+        async fn submit_review(
+            &self,
+            _request: &ReviewRequestContext,
+            _review: &Review,
+            submission: ReviewSubmission,
+        ) -> Result<()> {
+            let mut state = self.state.lock();
+            if let Some(error) = &state.fail_with {
+                anyhow::bail!("{error}");
+            }
+            state.submissions.push(submission);
+            Ok(())
+        }
     }
 
     pub struct FakeCredentialEnvironment {
@@ -529,7 +720,7 @@ mod tests {
         code_review::{CommentAuthorRole, CommentId, DiffSide, ReviewComment, ThreadId},
         repository::RepoPath,
     };
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::TestAppContext;
     use http_client::FakeHttpClient;
     use std::collections::HashMap;
 
@@ -557,6 +748,7 @@ mod tests {
             head_sha: head_sha.to_string().into(),
             base_ref: "main".into(),
             author_login: "author".into(),
+            viewer_login: Some("author".into()),
         }
     }
 
@@ -703,6 +895,86 @@ mod tests {
         cx.run_until_parked();
         store.read_with(cx, |store, _| {
             assert!(!store.loaded().unwrap().local_head_matches);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_store_writes(cx: &mut TestAppContext) {
+        let provider = Arc::new(FakeCodeReviewProvider {
+            credential_sources: sources(),
+            ..Default::default()
+        });
+        {
+            let mut state = provider.state.lock();
+            state
+                .reviews_by_branch
+                .insert("feature".into(), review("abc123"));
+            state.threads = vec![thread("open", false)];
+        }
+        let store = store(
+            cx,
+            FakeCredentialEnvironment {
+                variables: HashMap::default(),
+                command_output: Some("cli-token".into()),
+            },
+            Arc::new(FakeCredentialsProvider::default()),
+        );
+        store.update(cx, |store, cx| {
+            store.refresh(target(provider.clone(), "abc123"), cx)
+        });
+        cx.run_until_parked();
+
+        let thread_id = ThreadId("open".into());
+        let reply = store.update(cx, |store, cx| {
+            let task = store.reply(thread_id.clone(), "Fixed it".into(), cx);
+            assert!(store.is_thread_busy(&thread_id));
+            task
+        });
+        reply.await.unwrap();
+        store.read_with(cx, |store, _| {
+            let thread = &store.loaded().unwrap().threads[0];
+            assert_eq!(thread.comments.len(), 2);
+            assert_eq!(thread.comments[1].body.as_ref(), "Fixed it");
+            assert!(!store.is_thread_busy(&thread_id));
+        });
+
+        store
+            .update(cx, |store, cx| {
+                store.set_resolved(thread_id.clone(), true, cx)
+            })
+            .await
+            .unwrap();
+        store.read_with(cx, |store, _| {
+            assert!(store.loaded().unwrap().threads[0].is_resolved);
+        });
+
+        let submission = ReviewSubmission {
+            verdict: git::code_review::ReviewVerdict::Comment,
+            body: "Thanks".into(),
+            comments: Vec::new(),
+        };
+        store
+            .update(cx, |store, cx| store.submit_review(submission.clone(), cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(provider.state.lock().submissions, vec![submission]);
+        assert_eq!(
+            provider.state.lock().tokens_seen,
+            vec!["cli-token", "cli-token"],
+            "writes reuse the token, and submitting reloads once"
+        );
+
+        provider.state.lock().fail_with = Some("forbidden".into());
+        let error = store
+            .update(cx, |store, cx| {
+                store.reply(thread_id.clone(), "Again".into(), cx)
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "forbidden");
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.loaded().unwrap().threads[0].comments.len(), 2);
         });
     }
 

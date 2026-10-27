@@ -8,7 +8,7 @@ use git::{
     code_review::{
         CodeReviewProvider, CommentAuthor, CommentAuthorRole, CommentId, CredentialSource,
         DiffSide, Review, ReviewCapabilities, ReviewComment, ReviewQuery, ReviewRequestContext,
-        ReviewThread, ThreadId,
+        ReviewSubmission, ReviewThread, ReviewVerdict, ThreadId,
     },
     repository::RepoPath,
 };
@@ -91,6 +91,34 @@ impl GithubReviews {
             bail!("{} returned {}: {}", self.name, status.as_u16(), message);
         }
         Ok(text)
+    }
+}
+
+impl GithubReviews {
+    async fn graphql<T: serde::de::DeserializeOwned>(
+        &self,
+        request: &ReviewRequestContext,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<T> {
+        let body = json!({ "query": query, "variables": variables });
+        let text = self
+            .send(request, Method::POST, &self.graphql_url, Some(body))
+            .await?;
+        let response: GraphQlResponse<T> =
+            serde_json::from_str(&text).context("parsing GraphQL response")?;
+        if let Some(error) = response.errors.into_iter().next() {
+            bail!("{} returned an error: {}", self.name, error.message);
+        }
+        response.data.context("GraphQL response had no data")
+    }
+
+    async fn viewer_login(&self, request: &ReviewRequestContext) -> Option<SharedString> {
+        let url = format!("{}/user", self.rest_api_url);
+        let text = self.send(request, Method::GET, &url, None).await.ok()?;
+        serde_json::from_str::<PullRequestUser>(&text)
+            .ok()
+            .map(|user| user.login.into())
     }
 }
 
@@ -249,31 +277,33 @@ fn line_range(start: Option<u32>, end: Option<u32>) -> Option<std::ops::RangeInc
     Some(start.filter(|start| *start <= end).unwrap_or(end)..=end)
 }
 
+fn convert_comment(comment: CommentNode, review_author: &str) -> ReviewComment {
+    let role = match &comment.author {
+        Some(author) if author.login == review_author => CommentAuthorRole::Author,
+        _ => CommentAuthorRole::Reviewer,
+    };
+    ReviewComment {
+        id: CommentId(comment.id.into()),
+        author: comment.author.map(|author| CommentAuthor {
+            login: author.login.into(),
+            avatar_url: author.avatar_url,
+        }),
+        role,
+        body: comment.body.into(),
+        created_at: comment.created_at,
+        in_reply_to: comment
+            .reply_to
+            .map(|reply_to| CommentId(reply_to.id.into())),
+        url: comment.url,
+    }
+}
+
 fn convert_thread(node: ThreadNode, review_author: &str) -> Result<ReviewThread> {
     let comments = node
         .comments
         .nodes
         .into_iter()
-        .map(|comment| {
-            let role = match &comment.author {
-                Some(author) if author.login == review_author => CommentAuthorRole::Author,
-                _ => CommentAuthorRole::Reviewer,
-            };
-            ReviewComment {
-                id: CommentId(comment.id.into()),
-                author: comment.author.map(|author| CommentAuthor {
-                    login: author.login.into(),
-                    avatar_url: author.avatar_url,
-                }),
-                role,
-                body: comment.body.into(),
-                created_at: comment.created_at,
-                in_reply_to: comment
-                    .reply_to
-                    .map(|reply_to| CommentId(reply_to.id.into())),
-                url: comment.url,
-            }
-        })
+        .map(|comment| convert_comment(comment, review_author))
         .collect();
     Ok(ReviewThread {
         id: ThreadId(node.id.into()),
@@ -359,6 +389,7 @@ impl CodeReviewProvider for GithubReviews {
         else {
             return Ok(None);
         };
+        let viewer_login = self.viewer_login(request).await;
         Ok(Some(Review {
             id: pull_request.node_id.into(),
             number: pull_request.number,
@@ -372,6 +403,7 @@ impl CodeReviewProvider for GithubReviews {
                 .map(|user| user.login)
                 .unwrap_or_default()
                 .into(),
+            viewer_login,
         }))
     }
 
@@ -383,26 +415,20 @@ impl CodeReviewProvider for GithubReviews {
         let mut threads = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_THREAD_PAGES {
-            let body = json!({
-                "query": REVIEW_THREADS_QUERY,
-                "variables": {
-                    "owner": review.base_repository.owner.as_ref(),
-                    "repo": review.base_repository.repo.as_ref(),
-                    "number": review.number,
-                    "cursor": cursor,
-                },
-            });
-            let text = self
-                .send(request, Method::POST, &self.graphql_url, Some(body))
+            let data: ThreadsData = self
+                .graphql(
+                    request,
+                    REVIEW_THREADS_QUERY,
+                    json!({
+                        "owner": review.base_repository.owner.as_ref(),
+                        "repo": review.base_repository.repo.as_ref(),
+                        "number": review.number,
+                        "cursor": cursor,
+                    }),
+                )
                 .await?;
-            let response: GraphQlResponse<ThreadsData> =
-                serde_json::from_str(&text).context("parsing review threads")?;
-            if let Some(error) = response.errors.into_iter().next() {
-                bail!("{} returned an error: {}", self.name, error.message);
-            }
-            let pull_request = response
-                .data
-                .and_then(|data| data.repository)
+            let pull_request = data
+                .repository
                 .and_then(|repository| repository.pull_request)
                 .with_context(|| format!("pull request #{} not found", review.number))?;
             let connection = pull_request.review_threads;
@@ -423,6 +449,130 @@ impl CodeReviewProvider for GithubReviews {
         );
         Ok(threads)
     }
+
+    async fn reply(
+        &self,
+        request: &ReviewRequestContext,
+        review: &Review,
+        thread: &ThreadId,
+        body: &str,
+    ) -> Result<ReviewComment> {
+        let data: ReplyData = self
+            .graphql(
+                request,
+                REPLY_MUTATION,
+                json!({ "thread": thread.0.as_ref(), "body": body }),
+            )
+            .await?;
+        Ok(convert_comment(
+            data.add_pull_request_review_thread_reply.comment,
+            &review.author_login,
+        ))
+    }
+
+    async fn set_resolved(
+        &self,
+        request: &ReviewRequestContext,
+        thread: &ThreadId,
+        resolved: bool,
+    ) -> Result<()> {
+        let mutation = if resolved {
+            RESOLVE_MUTATION
+        } else {
+            UNRESOLVE_MUTATION
+        };
+        self.graphql::<serde_json::Value>(
+            request,
+            mutation,
+            json!({ "thread": thread.0.as_ref() }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn submit_review(
+        &self,
+        request: &ReviewRequestContext,
+        review: &Review,
+        submission: ReviewSubmission,
+    ) -> Result<()> {
+        let ParsedGitRemote { owner, repo } = &review.base_repository;
+        let url = format!(
+            "{}/repos/{owner}/{repo}/pulls/{}/reviews",
+            self.rest_api_url, review.number
+        );
+        let body = review_submission_body(review, submission);
+        self.send(request, Method::POST, &url, Some(body)).await?;
+        Ok(())
+    }
+}
+
+fn review_submission_body(review: &Review, submission: ReviewSubmission) -> serde_json::Value {
+    let event = match submission.verdict {
+        ReviewVerdict::Comment => "COMMENT",
+        ReviewVerdict::Approve => "APPROVE",
+        ReviewVerdict::RequestChanges => "REQUEST_CHANGES",
+    };
+    let comments = submission
+        .comments
+        .into_iter()
+        .map(|comment| {
+            let side = match comment.side {
+                DiffSide::Old => "LEFT",
+                DiffSide::New => "RIGHT",
+            };
+            let mut value = json!({
+                "path": comment.path.as_unix_str(),
+                "body": comment.body,
+                "line": comment.lines.end(),
+                "side": side,
+            });
+            if comment.lines.start() < comment.lines.end()
+                && let Some(object) = value.as_object_mut()
+            {
+                object.insert("start_line".into(), json!(comment.lines.start()));
+                object.insert("start_side".into(), json!(side));
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "commit_id": review.head_sha.as_ref(),
+        "body": submission.body,
+        "event": event,
+        "comments": comments,
+    })
+}
+
+const REPLY_MUTATION: &str = r#"
+mutation($thread: ID!, $body: String!) {
+  addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $thread, body: $body }) {
+    comment { id author { login avatarUrl } body createdAt url replyTo { id } }
+  }
+}
+"#;
+
+const RESOLVE_MUTATION: &str = r#"
+mutation($thread: ID!) {
+  resolveReviewThread(input: { threadId: $thread }) { thread { id isResolved } }
+}
+"#;
+
+const UNRESOLVE_MUTATION: &str = r#"
+mutation($thread: ID!) {
+  unresolveReviewThread(input: { threadId: $thread }) { thread { id isResolved } }
+}
+"#;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplyData {
+    add_pull_request_review_thread_reply: ReplyPayload,
+}
+
+#[derive(Deserialize)]
+struct ReplyPayload {
+    comment: CommentNode,
 }
 
 pub(crate) fn github_reviews(name: &str, base_url: &Url) -> Arc<dyn CodeReviewProvider> {
@@ -497,25 +647,30 @@ mod tests {
     #[test]
     fn test_find_review_prefers_matching_base_branch() {
         let reviews = GithubReviews::new("GitHub", &Url::parse("https://github.com").unwrap());
-        let (request, requests) = context(vec![(
-            200,
-            json!([
-                pull_request_json(1, "release"),
-                pull_request_json(2, "main")
-            ])
-            .to_string(),
-        )]);
+        let (request, requests) = context(vec![
+            (
+                200,
+                json!([
+                    pull_request_json(1, "release"),
+                    pull_request_json(2, "main")
+                ])
+                .to_string(),
+            ),
+            (200, json!({ "login": "xenoop" }).to_string()),
+        ]);
         let review = block_on(reviews.find_review_for_branch(&request, &query()))
             .unwrap()
             .unwrap();
         assert_eq!(review.number, 2);
         assert_eq!(review.head_sha.as_ref(), "abc123");
         assert_eq!(review.author_login.as_ref(), "xenoop");
+        assert!(review.viewer_is_author());
         assert_eq!(
             requests.lock().clone(),
             vec![
                 "GET https://api.github.com/repos/zed-industries/zed/pulls?head=xenoop%3Afeat%2Freview-threads&state=open&per_page=20 [Bearer secret]"
-                    .to_string()
+                    .to_string(),
+                "GET https://api.github.com/user [Bearer secret]".to_string(),
             ]
         );
     }
@@ -646,6 +801,7 @@ mod tests {
             head_sha: "abc123".into(),
             base_ref: "main".into(),
             author_login: "xenoop".into(),
+            viewer_login: None,
         };
         let threads = block_on(reviews.load_threads(&request, &review)).unwrap();
         assert_eq!(requests.lock().len(), 2);
@@ -692,11 +848,126 @@ mod tests {
             head_sha: "abc123".into(),
             base_ref: "main".into(),
             author_login: "xenoop".into(),
+            viewer_login: None,
         };
         let error = block_on(reviews.load_threads(&request, &review)).unwrap_err();
         assert_eq!(
             error.to_string(),
             "GitHub returned an error: Resource not accessible by integration"
+        );
+    }
+
+    fn review() -> Review {
+        Review {
+            id: "PR_2".into(),
+            number: 2,
+            title: "".into(),
+            url: Url::parse("https://github.com/zed-industries/zed/pull/2").unwrap(),
+            base_repository: query().base_repository,
+            head_sha: "abc123".into(),
+            base_ref: "main".into(),
+            author_login: "xenoop".into(),
+            viewer_login: Some("rhea-l".into()),
+        }
+    }
+
+    #[test]
+    fn test_reply_and_resolve() {
+        let reviews = GithubReviews::new("GitHub", &Url::parse("https://github.com").unwrap());
+        let reply = json!({ "data": { "addPullRequestReviewThreadReply": { "comment": {
+            "id": "C9",
+            "author": { "login": "xenoop", "avatarUrl": null },
+            "body": "Done",
+            "createdAt": "2026-10-27T09:00:00Z",
+            "url": null,
+            "replyTo": { "id": "C1" }
+        }}}});
+        let resolved = json!({ "data": { "resolveReviewThread": {
+            "thread": { "id": "T1", "isResolved": true }
+        }}});
+        let missing =
+            json!({ "data": null, "errors": [{ "message": "Could not resolve to a node" }] });
+        let (request, requests) = context(vec![
+            (200, reply.to_string()),
+            (200, resolved.to_string()),
+            (200, missing.to_string()),
+        ]);
+        let comment =
+            block_on(reviews.reply(&request, &review(), &ThreadId("T1".into()), "Done")).unwrap();
+        assert_eq!(comment.id, CommentId("C9".into()));
+        assert_eq!(comment.role, CommentAuthorRole::Author);
+
+        block_on(reviews.set_resolved(&request, &ThreadId("T1".into()), true)).unwrap();
+        let error = block_on(reviews.set_resolved(&request, &ThreadId("missing".into()), false))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "GitHub returned an error: Could not resolve to a node"
+        );
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.starts_with("POST https://api.github.com/graphql"))
+        );
+    }
+
+    #[test]
+    fn test_submit_review_body() {
+        let submission = ReviewSubmission {
+            verdict: ReviewVerdict::RequestChanges,
+            body: "One bug inline.".into(),
+            comments: vec![
+                git::code_review::DraftComment {
+                    path: RepoPath::new("src/cache.rs").unwrap(),
+                    side: DiffSide::New,
+                    lines: 58..=58,
+                    body: "Evicted too early.".into(),
+                },
+                git::code_review::DraftComment {
+                    path: RepoPath::new("src/cache.rs").unwrap(),
+                    side: DiffSide::Old,
+                    lines: 71..=74,
+                    body: "Use or_insert_with.".into(),
+                },
+            ],
+        };
+        assert_eq!(
+            review_submission_body(&review(), submission),
+            json!({
+                "commit_id": "abc123",
+                "body": "One bug inline.",
+                "event": "REQUEST_CHANGES",
+                "comments": [
+                    { "path": "src/cache.rs", "body": "Evicted too early.", "line": 58, "side": "RIGHT" },
+                    {
+                        "path": "src/cache.rs",
+                        "body": "Use or_insert_with.",
+                        "line": 74,
+                        "side": "LEFT",
+                        "start_line": 71,
+                        "start_side": "LEFT"
+                    }
+                ]
+            })
+        );
+
+        let reviews = GithubReviews::new("GitHub", &Url::parse("https://github.com").unwrap());
+        let (request, requests) = context(vec![(200, "{}".into())]);
+        block_on(reviews.submit_review(
+            &request,
+            &review(),
+            ReviewSubmission {
+                verdict: ReviewVerdict::Approve,
+                body: String::new(),
+                comments: Vec::new(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            requests.lock()[0],
+            "POST https://api.github.com/repos/zed-industries/zed/pulls/2/reviews [Bearer secret]"
         );
     }
 }

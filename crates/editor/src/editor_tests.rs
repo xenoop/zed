@@ -46990,6 +46990,45 @@ fn test_review_comment_add_to_hunk(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_review_comment_drafts_locate_rows_and_clear(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("zero\none\ntwo\nthree\n", cx);
+        Editor::new(EditorMode::full(), buffer, None, window, cx)
+    });
+
+    _ = editor.update(cx, |editor: &mut Editor, _window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let start = snapshot.anchor_before(Point::new(1, 0));
+        let end = snapshot.anchor_before(Point::new(2, 3));
+        let key = test_hunk_key_with_anchor("file.rs", start);
+        editor.add_review_comment(key, "Rename this".to_string(), start..end, cx);
+
+        let drafts = editor.review_comment_drafts(cx);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].rows, 1..=2);
+        assert_eq!(drafts[0].text, "Rename this");
+        assert_eq!(
+            Some(drafts[0].buffer_id),
+            editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .map(|buffer| buffer.read(cx).remote_id())
+        );
+
+        editor.clear_review_comments(cx);
+        assert!(editor.review_comment_drafts(cx).is_empty());
+        assert_eq!(editor.total_review_comment_count(), 0);
+
+        assert!(!editor.diff_review_without_feature_flag());
+        editor.set_diff_review_without_feature_flag(true, cx);
+        assert!(editor.diff_review_without_feature_flag());
+    });
+}
+
+#[gpui::test]
 fn test_review_comments_are_per_hunk(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
