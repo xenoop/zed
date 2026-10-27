@@ -1,8 +1,8 @@
-use std::sync::Arc;
+use std::{ops::RangeInclusive, sync::Arc};
 
 use code_review::{
-    CredentialAttempt, CredentialOutcome, RepositoryReviewInfo, ReviewState, ReviewStore,
-    ReviewStoreEvent, review_target,
+    AgentFinding, AgentReplyDraft, CredentialAttempt, CredentialOutcome, FindingSeverity,
+    RepositoryReviewInfo, ReviewState, ReviewStore, ReviewStoreEvent, review_target,
 };
 use collections::{HashMap, HashSet};
 use editor::{
@@ -15,6 +15,7 @@ use git::{
         CommentAuthorRole, CommentId, DiffSide, DraftComment, ReviewComment, ReviewSubmission,
         ReviewThread, ReviewVerdict, ThreadId,
     },
+    repository::RepoPath,
 };
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
@@ -32,7 +33,7 @@ use time::{OffsetDateTime, UtcOffset};
 use ui::{Avatar, Chip, Disclosure, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{ModalView, Workspace, notifications::NotifyTaskExt as _};
-use zed_actions::git::SubmitReviewReply;
+use zed_actions::{agent::AddressReviewThreads, git::SubmitReviewReply};
 
 use crate::diff_multibuffer::DiffMultibuffer;
 
@@ -64,6 +65,7 @@ impl ReviewThreads {
         cx: &mut Context<Self>,
     ) -> Self {
         let store = cx.new(|cx| ReviewStore::new(cx));
+        code_review::register_store_for_project(project.entity_id(), &store, cx);
         let editor = diff.read(cx).editor().read(cx).rhs_editor().clone();
         let multibuffer = diff.read(cx).multibuffer().clone();
         let diff_buffer_list = diff.read(cx).branch_diff().clone();
@@ -161,12 +163,55 @@ impl ReviewThreads {
         }
     }
 
+    /// Hands review threads to the agent: the given ones, or every open
+    /// thread. The agent drafts replies; nothing is posted.
+    pub(crate) fn fix_with_agent(
+        &mut self,
+        thread_ids: Option<Vec<ThreadId>>,
+        instructions: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(loaded) = self.store.read(cx).loaded() else {
+            return;
+        };
+        let thread_ids = thread_ids.unwrap_or_else(|| {
+            loaded
+                .threads
+                .iter()
+                .filter(|thread| !thread.is_resolved)
+                .map(|thread| thread.id.clone())
+                .collect()
+        });
+        if thread_ids.is_empty() {
+            return;
+        }
+        let threads_text = loaded.describe_threads(|thread| thread_ids.contains(&thread.id));
+        self.store
+            .update(cx, |store, cx| store.set_agent_working(thread_ids, cx));
+        window.dispatch_action(
+            Box::new(AddressReviewThreads {
+                threads_text: threads_text.into(),
+                instructions: instructions
+                    .filter(|instructions| !instructions.trim().is_empty())
+                    .map(Into::into),
+            }),
+            cx,
+        );
+    }
+
     fn submit_reply(&mut self, thread_id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.reply_editors.get(&thread_id).cloned() else {
             return;
         };
         let body = editor.read(cx).text(cx);
         if body.trim().is_empty() {
+            return;
+        }
+        if let Some(instructions) = body.trim_start().strip_prefix("@agent") {
+            let instructions = instructions.trim().to_string();
+            editor.update(cx, |editor, cx| editor.clear(window, cx));
+            self.fix_with_agent(Some(vec![thread_id]), Some(instructions), window, cx);
             return;
         }
         self.thread_errors.remove(&thread_id);
@@ -187,6 +232,50 @@ impl ReviewThreads {
             })
         })
         .detach_and_log_err(cx);
+    }
+
+    fn post_agent_reply(
+        &mut self,
+        thread_id: ThreadId,
+        resolve: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.thread_errors.remove(&thread_id);
+        let task = self.store.update(cx, |store, cx| {
+            store.post_agent_reply(thread_id.clone(), resolve, cx)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| {
+                if let Err(error) = result {
+                    this.thread_errors
+                        .insert(thread_id, format!("Couldn't post: {error:#}").into());
+                }
+                this.update_blocks(window, cx);
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// Moves the agent's draft into the reply box so the user can edit it.
+    fn edit_agent_reply(
+        &mut self,
+        thread_id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(draft) = self.store.read(cx).agent_reply(&thread_id).cloned() else {
+            return;
+        };
+        if let Some(editor) = self.reply_editors.get(&thread_id).cloned() {
+            editor.update(cx, |editor, cx| {
+                editor.set_text(draft.body, window, cx);
+                window.focus(&editor.focus_handle(cx), cx);
+            });
+        }
+        self.store
+            .update(cx, |store, cx| store.discard_agent_reply(&thread_id, cx));
     }
 
     fn set_resolved(
@@ -314,6 +403,17 @@ impl ReviewThreads {
     }
 
     #[cfg(test)]
+    pub(crate) fn post_agent_reply_for_test(
+        &mut self,
+        thread_id: ThreadId,
+        resolve: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.post_agent_reply(thread_id, resolve, window, cx);
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_resolved_for_test(
         &mut self,
         thread_id: ThreadId,
@@ -365,7 +465,7 @@ impl ReviewThreads {
         markdown
     }
 
-    fn update_blocks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn update_blocks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.notify();
         let Some(editor) = self.editor.upgrade() else {
             return;
@@ -406,7 +506,11 @@ impl ReviewThreads {
             if thread.can_reply && !self.reply_editors.contains_key(&thread.id) {
                 let editor = cx.new(|cx| {
                     let mut editor = Editor::auto_height(1, 10, window, cx);
-                    editor.set_placeholder_text("Reply…", window, cx);
+                    editor.set_placeholder_text(
+                        "Reply, or start with @agent to hand this thread to the agent…",
+                        window,
+                        cx,
+                    );
                     editor
                 });
                 self.reply_editors.insert(thread.id.clone(), editor);
@@ -428,8 +532,13 @@ impl ReviewThreads {
                         (comment.clone(), depth, self.markdown_for(comment, cx))
                     })
                     .collect::<Vec<_>>();
+                let store = self.store.read(cx);
+                let agent_draft = store.agent_reply(&thread.id).cloned();
+                let agent_working = store.is_agent_working(&thread.id);
                 let card = ThreadCard {
-                    expanded: self.is_expanded(&thread),
+                    expanded: self.is_expanded(&thread) || agent_draft.is_some(),
+                    agent_draft,
+                    agent_working,
                     reply_editor: self.reply_editors.get(&thread.id).cloned(),
                     busy: busy_thread_ids.contains(&thread.id),
                     error: self.thread_errors.get(&thread.id).cloned(),
@@ -453,12 +562,187 @@ impl ReviewThreads {
             })
             .collect::<Vec<_>>();
 
+        let mut blocks = blocks;
+        if self.visible
+            && let Some(diff) = self.diff.upgrade()
+        {
+            let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
+            let findings = self.store.read(cx).findings().to_vec();
+            for finding in findings {
+                let Some(placement) = place_lines(
+                    &finding.comment.path,
+                    finding.comment.side,
+                    Some(finding.comment.lines.clone()),
+                    &diff,
+                    &snapshot,
+                    cx,
+                ) else {
+                    continue;
+                };
+                let card = FindingCard {
+                    finding,
+                    view: view.clone(),
+                };
+                blocks.push(BlockProperties {
+                    placement: if placement.above {
+                        BlockPlacement::Above(placement.anchor)
+                    } else {
+                        BlockPlacement::Below(placement.anchor)
+                    },
+                    height: Some(3),
+                    style: BlockStyle::Sticky,
+                    render: Arc::new(move |cx| card.render(cx)),
+                    priority: 0,
+                });
+            }
+        }
+
         self.markdown
             .retain(|comment_id, _| used_comment_ids.contains(comment_id));
         editor.update(cx, |editor, cx| {
             editor.remove_blocks(old_block_ids.into_iter().collect(), None, cx);
             self.block_ids = editor.insert_blocks(blocks, None, cx);
         });
+    }
+}
+
+struct FindingCard {
+    finding: AgentFinding,
+    view: WeakEntity<ReviewThreads>,
+}
+
+impl FindingCard {
+    fn render(&self, cx: &mut BlockContext) -> AnyElement {
+        let left_padding = cx.margins.gutter.full_width() + cx.em_width * 2.;
+        let cx = &*cx.app;
+        let colors = cx.theme().colors();
+        let agent_color = cx.theme().players().agent().cursor;
+        let finding = &self.finding;
+        let id = finding.id;
+        let lines = &finding.comment.lines;
+        let location = if lines.start() == lines.end() {
+            format!("{}:{}", finding.comment.path.as_unix_str(), lines.end())
+        } else {
+            format!(
+                "{}:{}–{}",
+                finding.comment.path.as_unix_str(),
+                lines.start(),
+                lines.end()
+            )
+        };
+        let severity_color = match finding.severity {
+            FindingSeverity::Bug => Color::Error,
+            FindingSeverity::Question => Color::Accent,
+            FindingSeverity::Suggestion | FindingSeverity::Nit => Color::Muted,
+        };
+        let kept = finding.kept;
+        let toggle = {
+            let view = self.view.clone();
+            move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+                view.update(cx, |view, cx| {
+                    view.store
+                        .update(cx, |store, cx| store.set_finding_kept(id, !kept, cx))
+                })
+                .log_err();
+            }
+        };
+        let dismiss = {
+            let view = self.view.clone();
+            move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+                view.update(cx, |view, cx| {
+                    view.store
+                        .update(cx, |store, cx| store.dismiss_finding(id, cx))
+                })
+                .log_err();
+            }
+        };
+
+        h_flex()
+            .w_full()
+            .pl(left_padding)
+            .pr_4()
+            .py_1()
+            .child(
+                h_flex()
+                    .id(SharedString::from(format!("review-finding-{id}")))
+                    .w_full()
+                    .max_w(rems(52.))
+                    .items_start()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .border_1()
+                    .when(kept, |this| this.border_dashed())
+                    .border_color(if kept {
+                        colors.border_focused
+                    } else {
+                        agent_color.opacity(0.5)
+                    })
+                    .bg(colors.editor_background)
+                    .child(
+                        Icon::new(IconName::ZedAgent)
+                            .size(IconSize::Small)
+                            .color(Color::Custom(agent_color)),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .child(
+                                        Label::new("Agent")
+                                            .size(LabelSize::Small)
+                                            .weight(gpui::FontWeight::SEMIBOLD),
+                                    )
+                                    .child(
+                                        Chip::new(finding.severity.label())
+                                            .label_color(severity_color),
+                                    )
+                                    .when(kept, |this| {
+                                        this.child(
+                                            Chip::new("In your review").label_color(Color::Accent),
+                                        )
+                                    })
+                                    .child(
+                                        Label::new(location)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .buffer_font(cx),
+                                    ),
+                            )
+                            .child(Label::new(finding.comment.body.clone()).size(LabelSize::Small))
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Button::new(
+                                            SharedString::from(format!(
+                                                "review-finding-dismiss-{id}"
+                                            )),
+                                            "Dismiss",
+                                        )
+                                        .on_click(dismiss),
+                                    )
+                                    .child(
+                                        Button::new(
+                                            SharedString::from(format!("review-finding-keep-{id}")),
+                                            if kept {
+                                                "Remove from Review"
+                                            } else {
+                                                "Add to My Review"
+                                            },
+                                        )
+                                        .when(!kept, |this| this.style(ButtonStyle::Filled))
+                                        .on_click(toggle),
+                                    ),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 }
 
@@ -476,16 +760,27 @@ fn place_thread(
     snapshot: &MultiBufferSnapshot,
     cx: &App,
 ) -> Option<ThreadPlacement> {
-    let (buffer, buffer_diff) = diff.read(cx).buffer_and_diff_for_path(&thread.path)?;
-    let buffer = buffer.read(cx).snapshot();
     let lines = thread
         .lines
         .clone()
         .or_else(|| thread.original_lines.clone());
+    place_lines(&thread.path, thread.side, lines, diff, snapshot, cx)
+}
+
+fn place_lines(
+    path: &RepoPath,
+    side: DiffSide,
+    lines: Option<RangeInclusive<u32>>,
+    diff: &Entity<DiffMultibuffer>,
+    snapshot: &MultiBufferSnapshot,
+    cx: &App,
+) -> Option<ThreadPlacement> {
+    let (buffer, buffer_diff) = diff.read(cx).buffer_and_diff_for_path(path)?;
+    let buffer = buffer.read(cx).snapshot();
 
     if let Some(lines) = lines {
         let last_row = lines.end().saturating_sub(1);
-        match thread.side {
+        match side {
             DiffSide::New => {
                 let row = last_row.min(buffer.max_point().row);
                 let anchor = buffer.anchor_after(Point::new(row, buffer.line_len(row)));
@@ -540,6 +835,8 @@ struct ThreadCard {
     reply_editor: Option<Entity<Editor>>,
     busy: bool,
     error: Option<SharedString>,
+    agent_draft: Option<AgentReplyDraft>,
+    agent_working: bool,
     view: WeakEntity<ReviewThreads>,
 }
 
@@ -629,6 +926,9 @@ impl ThreadCard {
                     .border_color(divider)
                     .children(comments),
             );
+            if let Some(draft) = self.agent_draft.clone() {
+                card = card.child(self.render_agent_draft(draft, cx.app));
+            }
             card = card.child(self.render_footer(cx.app));
         }
 
@@ -639,6 +939,102 @@ impl ThreadCard {
             .py_1()
             .child(card)
             .into_any_element()
+    }
+
+    fn render_agent_draft(&self, draft: AgentReplyDraft, cx: &App) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let agent_color = cx.theme().players().agent().cursor;
+        let thread_id = self.thread.id.clone();
+        let id_suffix = thread_id.0.clone();
+        let can_resolve = self.thread.can_resolve && !self.thread.is_resolved;
+        let busy = self.busy;
+        let button = |name: &str, label: &'static str| {
+            Button::new(SharedString::from(format!("{name}-{id_suffix}")), label).disabled(busy)
+        };
+        let on_click =
+            |action: fn(&mut ReviewThreads, ThreadId, &mut Window, &mut Context<ReviewThreads>)| {
+                let view = self.view.clone();
+                let thread_id = thread_id.clone();
+                move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
+                    view.update(cx, |view, cx| action(view, thread_id.clone(), window, cx))
+                        .log_err();
+                }
+            };
+
+        v_flex()
+            .mx_3()
+            .mb_2()
+            .rounded_md()
+            .border_1()
+            .border_dashed()
+            .border_color(agent_color.opacity(0.5))
+            .bg(agent_color.opacity(0.06))
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .px_2()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(colors.border_variant)
+                    .child(
+                        Icon::new(IconName::ZedAgent)
+                            .size(IconSize::Small)
+                            .color(Color::Custom(agent_color)),
+                    )
+                    .child(
+                        Label::new("Draft reply")
+                            .size(LabelSize::Small)
+                            .weight(gpui::FontWeight::SEMIBOLD),
+                    )
+                    .child(
+                        Label::new("by agent · not posted")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .when(draft.suggest_resolve && can_resolve, |this| {
+                        this.child(div().flex_1()).child(
+                            Label::new("suggests resolving")
+                                .size(LabelSize::Small)
+                                .color(Color::Success),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py_1p5()
+                    .child(Label::new(draft.body).size(LabelSize::Small)),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .px_2()
+                    .pb_1p5()
+                    .child(button("agent-draft-discard", "Discard").on_click(on_click(
+                        |view, thread_id, _, cx| {
+                            view.store
+                                .update(cx, |store, cx| store.discard_agent_reply(&thread_id, cx))
+                        },
+                    )))
+                    .child(button("agent-draft-edit", "Edit").on_click(on_click(
+                        |view, thread_id, window, cx| view.edit_agent_reply(thread_id, window, cx),
+                    )))
+                    .child(div().flex_1())
+                    .child(button("agent-draft-post", "Post Reply").on_click(on_click(
+                        |view, thread_id, window, cx| {
+                            view.post_agent_reply(thread_id, false, window, cx)
+                        },
+                    )))
+                    .when(can_resolve, |this| {
+                        this.child(
+                            button("agent-draft-post-resolve", "Post & Resolve")
+                                .style(ButtonStyle::Filled)
+                                .on_click(on_click(|view, thread_id, window, cx| {
+                                    view.post_agent_reply(thread_id, true, window, cx)
+                                })),
+                        )
+                    }),
+            )
     }
 
     fn render_footer(&self, cx: &App) -> impl IntoElement {
@@ -825,6 +1221,34 @@ impl ThreadCard {
                         .color(Color::Muted)
                         .truncate(),
                 ),
+            )
+            .when(self.agent_working, |this| {
+                this.child(
+                    Chip::new("Agent working")
+                        .label_color(Color::Custom(cx.theme().players().agent().cursor)),
+                )
+            })
+            .when(
+                is_open && !self.agent_working && self.agent_draft.is_none(),
+                |this| {
+                    let view = view.clone();
+                    let thread_id = thread.id.clone();
+                    this.child(
+                        IconButton::new(
+                            SharedString::from(format!("review-thread-agent-{}", thread.id.0)),
+                            IconName::ZedAgent,
+                        )
+                        .icon_size(IconSize::Small)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Fix with agent"))
+                        .on_click(move |_, window, cx| {
+                            view.update(cx, |view, cx| {
+                                view.fix_with_agent(Some(vec![thread_id.clone()]), None, window, cx)
+                            })
+                            .log_err();
+                        }),
+                    )
+                },
             )
             .when_some(url, |this, url| {
                 this.child(
@@ -1079,7 +1503,8 @@ impl FinishReviewModal {
         let Some(loaded) = store.read(cx).loaded().cloned() else {
             return;
         };
-        let drafts = review_threads.read(cx).drafts(cx);
+        let mut drafts = review_threads.read(cx).drafts(cx);
+        drafts.extend(store.read(cx).kept_findings());
         workspace.toggle_modal(window, cx, |window, cx| {
             let summary = cx.new(|cx| {
                 let mut editor = Editor::auto_height(2, 8, window, cx);
@@ -1150,6 +1575,8 @@ impl FinishReviewModal {
                     review_threads
                         .update(cx, |review_threads, cx| review_threads.clear_drafts(cx))
                         .log_err();
+                    this.store
+                        .update(cx, |store, cx| store.clear_kept_findings(cx));
                     cx.emit(DismissEvent);
                 }
                 Err(error) => {

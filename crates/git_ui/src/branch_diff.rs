@@ -846,9 +846,17 @@ impl Render for BranchDiffToolbar {
             .read(cx)
             .is_empty();
         let is_ai_enabled = AgentSettings::get_global(cx).enabled(cx);
-        let comments_go_to_review = {
+        let (comments_go_to_review, kept_findings, open_threads) = {
             let review_threads = branch_diff.read(cx).review_threads.read(cx);
-            review_threads.is_visible() && review_threads.store().read(cx).loaded().is_some()
+            let store = review_threads.store().read(cx);
+            (
+                review_threads.is_visible() && store.loaded().is_some(),
+                store.kept_findings().len(),
+                store
+                    .loaded()
+                    .filter(|_| review_threads.is_visible())
+                    .map_or(0, |loaded| loaded.open_thread_count()),
+            )
         };
 
         let show_review_button = !is_multibuffer_empty && is_ai_enabled;
@@ -959,9 +967,36 @@ impl Render for BranchDiffToolbar {
                     ),
                 )
             })
+            .when(open_threads > 0 && is_ai_enabled, |this| {
+                let branch_diff = branch_diff.downgrade();
+                this.child(Divider::vertical()).child(
+                    Button::new(
+                        "fix-review-threads",
+                        format!("Fix {open_threads} Open with Agent"),
+                    )
+                    .start_icon(
+                        Icon::new(IconName::ZedAgent)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .tooltip(Tooltip::text(
+                        "The agent addresses the open threads and drafts a reply for each. Nothing is posted until you post it.",
+                    ))
+                    .on_click(move |_, window, cx| {
+                        branch_diff
+                            .update(cx, |branch_diff, cx| {
+                                branch_diff.review_threads.update(cx, |threads, cx| {
+                                    threads.fix_with_agent(None, None, window, cx)
+                                })
+                            })
+                            .log_err();
+                    }),
+                )
+            })
             .when(comments_go_to_review, |this| {
-                let label: SharedString = if review_count > 0 {
-                    format!("Finish Review ({review_count})").into()
+                let pending = review_count + kept_findings;
+                let label: SharedString = if pending > 0 {
+                    format!("Finish Review ({pending})").into()
                 } else {
                     "Finish Review".into()
                 };
@@ -1521,6 +1556,57 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(block_rows(cx).len(), 2, "expanding keeps the card");
+
+        let resolved_thread = ThreadId("resolved".into());
+        review_threads.update_in(cx, |threads, window, cx| {
+            threads.set_resolved_for_test(resolved_thread.clone(), false, window, cx)
+        });
+        cx.run_until_parked();
+        review_threads.update(cx, |threads, cx| {
+            threads.store().update(cx, |store, cx| {
+                store.set_agent_working([resolved_thread.clone()], cx);
+                assert!(store.is_agent_working(&resolved_thread));
+                store
+                    .draft_agent_reply(
+                        resolved_thread.clone(),
+                        code_review::AgentReplyDraft {
+                            body: "Renamed in this branch.".into(),
+                            suggest_resolve: true,
+                        },
+                        cx,
+                    )
+                    .unwrap();
+                store.add_finding(
+                    git::code_review::DraftComment {
+                        path: RepoPath::new("a.txt").unwrap(),
+                        side: DiffSide::New,
+                        lines: 2..=2,
+                        body: "Consider a clearer name.".into(),
+                    },
+                    code_review::FindingSeverity::Nit,
+                    cx,
+                );
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(block_rows(cx).len(), 3, "the finding gets its own card");
+
+        review_threads.update_in(cx, |threads, window, cx| {
+            threads.post_agent_reply_for_test(resolved_thread.clone(), true, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            provider.state.lock().replies.last(),
+            Some(&(
+                resolved_thread.clone(),
+                "Renamed in this branch.".to_string()
+            ))
+        );
+        review_threads.read_with(cx, |threads, cx| {
+            let store = threads.store().read(cx);
+            assert!(store.agent_reply(&resolved_thread).is_none());
+            assert!(store.loaded().unwrap().threads[1].is_resolved);
+        });
 
         cx.update(|window, cx| {
             branch_diff.update(cx, |branch_diff, cx| {

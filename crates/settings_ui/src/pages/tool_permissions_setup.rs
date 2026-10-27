@@ -1408,6 +1408,9 @@ mod tests {
             // so it has no settings-driven permission rules.
             "ask_user",
             "diagnostics",
+            // Only write drafts into Zed; nothing reaches the review host.
+            "draft_review_comment",
+            "draft_review_reply",
             "find_path",
             "find_references",
             "get_code_actions",
@@ -1418,6 +1421,7 @@ mod tests {
             "open",
             "read_file",
             "rename_symbol",
+            "review_threads",
             "thinking",
             // streaming_edit_file uses "edit_file" for permission lookups,
             // so its rules are configured under the edit_file entry.

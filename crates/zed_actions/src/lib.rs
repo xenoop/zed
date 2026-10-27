@@ -633,6 +633,18 @@ pub mod agent {
         pub base_ref: SharedString,
     }
 
+    /// Opens a new agent thread asking it to address pull request review
+    /// threads. The agent drafts replies; it never posts them.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = agent)]
+    #[serde(deny_unknown_fields)]
+    pub struct AddressReviewThreads {
+        /// The review threads to address, as text.
+        pub threads_text: SharedString,
+        /// Extra instructions from the user, if any.
+        pub instructions: Option<SharedString>,
+    }
+
     /// A single merge conflict region extracted from a file.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema)]
     pub struct ConflictContent {

@@ -1,4 +1,9 @@
-use std::{collections::HashSet, future::Future, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Write as _,
+    future::Future,
+    sync::Arc,
+};
 
 use anyhow::{Context as _, Result};
 use credentials_provider::CredentialsProvider;
@@ -6,12 +11,16 @@ use futures::future::BoxFuture;
 use git::{
     GitHostingProviderRegistry,
     code_review::{
-        CodeReviewProvider, CredentialSource, Review, ReviewCapabilities, ReviewComment,
-        ReviewQuery, ReviewRequestContext, ReviewSubmission, ReviewThread, ThreadId,
+        CodeReviewProvider, CommentAuthorRole, CredentialSource, DiffSide, DraftComment, Review,
+        ReviewCapabilities, ReviewComment, ReviewQuery, ReviewRequestContext, ReviewSubmission,
+        ReviewThread, ThreadId,
     },
     parse_git_remote_url,
 };
-use gpui::{App, AppContext as _, AsyncApp, Context, EventEmitter, SharedString, Task};
+use gpui::{
+    App, AppContext as _, AsyncApp, Context, Entity, EntityId, EventEmitter, Global, SharedString,
+    Task, WeakEntity,
+};
 use http_client::HttpClient;
 use util::ResultExt as _;
 
@@ -226,6 +235,78 @@ pub struct LoadedReview {
 }
 
 impl LoadedReview {
+    /// Describes the matching threads and their comments as Markdown, for an
+    /// agent to read.
+    pub fn describe_threads(&self, include: impl Fn(&ReviewThread) -> bool) -> String {
+        let mut output = format!(
+            "Pull request #{}: {}\n",
+            self.review.number, self.review.title
+        );
+        if !self.local_head_matches {
+            output.push_str(
+                "Note: the local checkout is not at the pull request's latest commit, so line numbers may be off.\n",
+            );
+        }
+        let threads = self
+            .threads
+            .iter()
+            .filter(|thread| include(thread))
+            .collect::<Vec<_>>();
+        if threads.is_empty() {
+            output.push_str("\nNo matching threads.\n");
+            return output;
+        }
+        for thread in threads {
+            let lines = thread
+                .lines
+                .clone()
+                .or_else(|| thread.original_lines.clone())
+                .map(|lines| {
+                    if lines.start() == lines.end() {
+                        format!(":{}", lines.end())
+                    } else {
+                        format!(":{}-{}", lines.start(), lines.end())
+                    }
+                })
+                .unwrap_or_default();
+            let mut status = Vec::new();
+            if thread.is_resolved {
+                status.push("resolved");
+            }
+            if thread.is_outdated {
+                status.push("outdated");
+            }
+            if thread.side == DiffSide::Old {
+                status.push("on removed lines");
+            }
+            let status = if status.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", status.join(", "))
+            };
+            writeln!(
+                output,
+                "\n## Thread `{}` at {}{lines}{status}",
+                thread.id.0,
+                thread.path.as_unix_str()
+            )
+            .ok();
+            for comment in &thread.comments {
+                let author = comment
+                    .author
+                    .as_ref()
+                    .map(|author| author.login.to_string())
+                    .unwrap_or_else(|| "ghost".to_string());
+                let role = match comment.role {
+                    CommentAuthorRole::Author => " (pull request author)",
+                    CommentAuthorRole::Reviewer => "",
+                };
+                writeln!(output, "- **{author}**{role}: {}", comment.body.trim()).ok();
+            }
+        }
+        output
+    }
+
     pub fn open_thread_count(&self) -> usize {
         self.threads
             .iter()
@@ -263,6 +344,63 @@ pub enum ReviewStoreEvent {
     Changed,
 }
 
+/// A reply the agent wrote for a thread. Nothing is posted until the user
+/// posts it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentReplyDraft {
+    pub body: String,
+    pub suggest_resolve: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FindingSeverity {
+    Bug,
+    Suggestion,
+    Nit,
+    Question,
+}
+
+impl FindingSeverity {
+    pub fn label(&self) -> &'static str {
+        match self {
+            FindingSeverity::Bug => "Bug",
+            FindingSeverity::Suggestion => "Suggestion",
+            FindingSeverity::Nit => "Nit",
+            FindingSeverity::Question => "Question",
+        }
+    }
+}
+
+/// A comment the agent proposes for the review. The user keeps or dismisses
+/// it; kept findings are posted with the review.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentFinding {
+    pub id: usize,
+    pub comment: DraftComment,
+    pub severity: FindingSeverity,
+    pub kept: bool,
+}
+
+#[derive(Default)]
+struct GlobalReviewStores(HashMap<EntityId, WeakEntity<ReviewStore>>);
+
+impl Global for GlobalReviewStores {}
+
+/// Makes `store` the review store for a project, so other parts of Zed (like
+/// agent tools) work on the same review the diff shows.
+pub fn register_store_for_project(project_id: EntityId, store: &Entity<ReviewStore>, cx: &mut App) {
+    let stores = &mut cx.default_global::<GlobalReviewStores>().0;
+    stores.retain(|_, store| store.upgrade().is_some());
+    stores.insert(project_id, store.downgrade());
+}
+
+pub fn store_for_project(project_id: EntityId, cx: &App) -> Option<Entity<ReviewStore>> {
+    cx.try_global::<GlobalReviewStores>()?
+        .0
+        .get(&project_id)?
+        .upgrade()
+}
+
 /// Holds the review threads for one repository's current branch.
 pub struct ReviewStore {
     state: ReviewState,
@@ -275,6 +413,10 @@ pub struct ReviewStore {
     /// writes so they don't look the token up again.
     request: Option<ReviewRequestContext>,
     busy_threads: HashSet<ThreadId>,
+    agent_replies: HashMap<ThreadId, AgentReplyDraft>,
+    agent_working: HashSet<ThreadId>,
+    findings: Vec<AgentFinding>,
+    next_finding_id: usize,
     refresh_task: Option<Task<()>>,
 }
 
@@ -303,6 +445,10 @@ impl ReviewStore {
             environment,
             request: None,
             busy_threads: HashSet::default(),
+            agent_replies: HashMap::default(),
+            agent_working: HashSet::default(),
+            findings: Vec::new(),
+            next_finding_id: 0,
             refresh_task: None,
         }
     }
@@ -322,6 +468,131 @@ impl ReviewStore {
         self.is_refreshing
     }
 
+    pub fn agent_reply(&self, thread: &ThreadId) -> Option<&AgentReplyDraft> {
+        self.agent_replies.get(thread)
+    }
+
+    pub fn is_agent_working(&self, thread: &ThreadId) -> bool {
+        self.agent_working.contains(thread)
+    }
+
+    pub fn findings(&self) -> &[AgentFinding] {
+        &self.findings
+    }
+
+    /// Marks threads as handed to the agent, until it drafts a reply for them.
+    pub fn set_agent_working(
+        &mut self,
+        threads: impl IntoIterator<Item = ThreadId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.agent_working.extend(threads);
+        self.changed(cx);
+    }
+
+    pub fn clear_agent_working(&mut self, cx: &mut Context<Self>) {
+        self.agent_working.clear();
+        self.changed(cx);
+    }
+
+    /// Stores the agent's draft reply for a thread. Fails if the thread isn't
+    /// part of the loaded review.
+    pub fn draft_agent_reply(
+        &mut self,
+        thread: ThreadId,
+        draft: AgentReplyDraft,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let known = self.loaded().is_some_and(|loaded| {
+            loaded
+                .threads
+                .iter()
+                .any(|candidate| candidate.id == thread)
+        });
+        anyhow::ensure!(known, "no review thread with id {:?}", thread.0);
+        self.agent_working.remove(&thread);
+        self.agent_replies.insert(thread, draft);
+        self.changed(cx);
+        Ok(())
+    }
+
+    pub fn discard_agent_reply(&mut self, thread: &ThreadId, cx: &mut Context<Self>) {
+        if self.agent_replies.remove(thread).is_some() {
+            self.changed(cx);
+        }
+    }
+
+    /// Posts the agent's draft reply, resolving the thread afterwards when asked.
+    pub fn post_agent_reply(
+        &mut self,
+        thread: ThreadId,
+        resolve: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(draft) = self.agent_replies.get(&thread).cloned() else {
+            return Task::ready(Err(anyhow::anyhow!("no draft reply for this thread")));
+        };
+        let reply = self.reply(thread.clone(), draft.body, cx);
+        cx.spawn(async move |this, cx| {
+            reply.await?;
+            this.update(cx, |this, cx| this.discard_agent_reply(&thread, cx))?;
+            if resolve {
+                this.update(cx, |this, cx| this.set_resolved(thread, true, cx))?
+                    .await?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn add_finding(
+        &mut self,
+        comment: DraftComment,
+        severity: FindingSeverity,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let id = self.next_finding_id;
+        self.next_finding_id += 1;
+        self.findings.push(AgentFinding {
+            id,
+            comment,
+            severity,
+            kept: false,
+        });
+        self.changed(cx);
+        id
+    }
+
+    pub fn set_finding_kept(&mut self, id: usize, kept: bool, cx: &mut Context<Self>) {
+        if let Some(finding) = self.findings.iter_mut().find(|finding| finding.id == id) {
+            finding.kept = kept;
+            self.changed(cx);
+        }
+    }
+
+    pub fn dismiss_finding(&mut self, id: usize, cx: &mut Context<Self>) {
+        self.findings.retain(|finding| finding.id != id);
+        self.changed(cx);
+    }
+
+    /// The findings the user kept, to post with the review.
+    pub fn kept_findings(&self) -> Vec<DraftComment> {
+        self.findings
+            .iter()
+            .filter(|finding| finding.kept)
+            .map(|finding| finding.comment.clone())
+            .collect()
+    }
+
+    pub fn clear_kept_findings(&mut self, cx: &mut Context<Self>) {
+        self.findings.retain(|finding| !finding.kept);
+        self.changed(cx);
+    }
+
+    fn changed(&mut self, cx: &mut Context<Self>) {
+        cx.emit(ReviewStoreEvent::Changed);
+        cx.notify();
+    }
+
     pub fn set_unavailable(&mut self, reason: SharedString, cx: &mut Context<Self>) {
         self.target = None;
         self.refresh_task = None;
@@ -336,6 +607,11 @@ impl ReviewStore {
             .target
             .as_ref()
             .is_some_and(|current| current.query == target.query);
+        if !same_target {
+            self.agent_replies.clear();
+            self.agent_working.clear();
+            self.findings.clear();
+        }
         if !same_target || self.loaded().is_none() {
             self.state = ReviewState::Loading;
         }
@@ -359,8 +635,10 @@ impl ReviewStore {
         }));
     }
 
-    /// Reloads the last requested review, if any.
+    /// Reloads the last requested review, if any. Threads still marked as
+    /// handed to the agent are released, since the agent may have skipped them.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.agent_working.clear();
         if let Some(target) = self.target.clone() {
             self.refresh(target, cx);
         }
@@ -466,6 +744,9 @@ impl ReviewStore {
             let result = task.await;
             this.update(cx, |this, cx| {
                 this.busy_threads.remove(&thread);
+                if result.is_ok() {
+                    this.agent_working.remove(&thread);
+                }
                 if let Ok(update) = &result
                     && let ReviewState::Loaded(loaded) = &mut this.state
                     && let Some(loaded_thread) = loaded
@@ -976,6 +1257,155 @@ mod tests {
         store.read_with(cx, |store, _| {
             assert_eq!(store.loaded().unwrap().threads[0].comments.len(), 2);
         });
+    }
+
+    #[gpui::test]
+    async fn test_agent_drafts_and_findings(cx: &mut TestAppContext) {
+        let provider = Arc::new(FakeCodeReviewProvider {
+            credential_sources: sources(),
+            ..Default::default()
+        });
+        {
+            let mut state = provider.state.lock();
+            state
+                .reviews_by_branch
+                .insert("feature".into(), review("abc123"));
+            state.threads = vec![thread("open", false)];
+        }
+        let store = store(
+            cx,
+            FakeCredentialEnvironment {
+                variables: HashMap::default(),
+                command_output: Some("token".into()),
+            },
+            Arc::new(FakeCredentialsProvider::default()),
+        );
+        store.update(cx, |store, cx| {
+            store.refresh(target(provider.clone(), "abc123"), cx)
+        });
+        cx.run_until_parked();
+
+        let thread_id = ThreadId("open".into());
+        store.update(cx, |store, cx| {
+            store.set_agent_working([thread_id.clone()], cx);
+            assert!(store.is_agent_working(&thread_id));
+            assert!(
+                store
+                    .draft_agent_reply(
+                        ThreadId("unknown".into()),
+                        AgentReplyDraft {
+                            body: "x".into(),
+                            suggest_resolve: false
+                        },
+                        cx
+                    )
+                    .is_err()
+            );
+            store
+                .draft_agent_reply(
+                    thread_id.clone(),
+                    AgentReplyDraft {
+                        body: "Fixed in the latest commit.".into(),
+                        suggest_resolve: true,
+                    },
+                    cx,
+                )
+                .unwrap();
+            assert!(!store.is_agent_working(&thread_id));
+        });
+
+        store
+            .update(cx, |store, cx| {
+                store.post_agent_reply(thread_id.clone(), true, cx)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.state.lock().replies,
+            vec![(thread_id.clone(), "Fixed in the latest commit.".to_string())]
+        );
+        store.read_with(cx, |store, _| {
+            assert!(store.agent_reply(&thread_id).is_none());
+            assert!(store.loaded().unwrap().threads[0].is_resolved);
+        });
+
+        store.update(cx, |store, cx| {
+            let comment = |line| git::code_review::DraftComment {
+                path: RepoPath::new("src/lib.rs").unwrap(),
+                side: DiffSide::New,
+                lines: line..=line,
+                body: format!("finding at {line}"),
+            };
+            let kept = store.add_finding(comment(3), FindingSeverity::Bug, cx);
+            let dismissed = store.add_finding(comment(9), FindingSeverity::Nit, cx);
+            store.set_finding_kept(kept, true, cx);
+            store.dismiss_finding(dismissed, cx);
+            assert_eq!(store.findings().len(), 1);
+            assert_eq!(store.kept_findings(), vec![comment(3)]);
+            store.clear_kept_findings(cx);
+            assert!(store.findings().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_describe_threads() {
+        let mut open = thread("open", false);
+        open.comments.push(ReviewComment {
+            id: CommentId("reply".into()),
+            author: Some(git::code_review::CommentAuthor {
+                login: "author".into(),
+                avatar_url: None,
+            }),
+            role: CommentAuthorRole::Author,
+            body: "Will do.".into(),
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            in_reply_to: None,
+            url: None,
+        });
+        let loaded = LoadedReview {
+            review: review("abc"),
+            threads: vec![open, thread("done", true)],
+            capabilities: ReviewCapabilities::default(),
+            local_head_matches: false,
+        };
+        let text = loaded.describe_threads(|thread| !thread.is_resolved);
+        assert_eq!(
+            text,
+            "Pull request #7: Add review threads\n\
+             Note: the local checkout is not at the pull request's latest commit, so line numbers may be off.\n\
+             \n## Thread `open` at src/lib.rs:3-4\n\
+             - **ghost**: Looks off\n\
+             - **author** (pull request author): Will do.\n"
+        );
+        assert!(
+            loaded
+                .describe_threads(|_| true)
+                .contains("Thread `done` at src/lib.rs:3-4 (resolved)")
+        );
+    }
+
+    #[gpui::test]
+    fn test_store_registry(cx: &mut TestAppContext) {
+        let project = cx.new(|_| ());
+        let store = store(
+            cx,
+            FakeCredentialEnvironment {
+                variables: HashMap::default(),
+                command_output: None,
+            },
+            Arc::new(FakeCredentialsProvider::default()),
+        );
+        cx.update(|cx| {
+            assert!(store_for_project(project.entity_id(), cx).is_none());
+            register_store_for_project(project.entity_id(), &store, cx);
+            assert_eq!(
+                store_for_project(project.entity_id(), cx).map(|store| store.entity_id()),
+                Some(store.entity_id())
+            );
+        });
+        drop(store);
+        cx.run_until_parked();
+        cx.update(|cx| assert!(store_for_project(project.entity_id(), cx).is_none()));
     }
 
     #[gpui::test]

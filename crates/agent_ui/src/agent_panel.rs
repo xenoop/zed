@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
     agent::{
-        AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
-        ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
+        AddSelectionToThread, AddressReviewThreads, ConflictContent, LogoutAgent, OpenSettings,
+        ReauthenticateAgent, ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
         ResolveConflictsWithAgent, ReviewBranchDiff, SelectAgent,
     },
     assistant::{
@@ -538,12 +538,23 @@ pub fn init(cx: &mut App) {
                     };
                     let diff_uri = mention_uri.to_uri().to_string();
 
+                    let has_review =
+                        code_review::store_for_project(workspace.project().entity_id(), cx)
+                            .is_some_and(|store| store.read(cx).loaded().is_some());
+                    let mut instructions = String::from(
+                        "Please review this branch diff carefully. Point out any issues, \
+                         potential bugs, or improvement opportunities you find.\n\n",
+                    );
+                    if has_review {
+                        instructions.push_str(
+                            "This branch has an open pull request. Read its existing threads \
+                             with `review_threads` so you don't repeat them, and record each \
+                             finding with `draft_review_comment` on the lines it is about, so \
+                             the user can add it to their review.\n\n",
+                        );
+                    }
                     let content_blocks = vec![
-                        acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
-                            "Please review this branch diff carefully. Point out any issues, \
-                             potential bugs, or improvement opportunities you find.\n\n"
-                                .to_string(),
-                        )),
+                        acp_v2::ContentBlock::Text(acp_v2::TextContent::new(instructions)),
                         acp_v2::ContentBlock::Resource(acp_v2::EmbeddedResource::new(
                             acp_v2::EmbeddedResourceResource::TextResourceContents(
                                 acp_v2::TextResourceContents::new(
@@ -556,6 +567,45 @@ pub fn init(cx: &mut App) {
 
                     workspace.focus_panel::<AgentPanel>(window, cx);
 
+                    panel.update(cx, |panel, cx| {
+                        panel.external_thread(
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(AgentInitialContent::ContentBlock {
+                                blocks: content_blocks,
+                                auto_submit: true,
+                            }),
+                            true,
+                            AgentThreadSource::GitPanel,
+                            window,
+                            cx,
+                        );
+                    });
+                })
+                .register_action(|workspace, action: &AddressReviewThreads, window, cx| {
+                    let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                        return;
+                    };
+                    let mut prompt = String::from(
+                        "Address these pull request review threads. For each one, change the \
+                         code if the feedback calls for it, then use `draft_review_reply` to draft \
+                         a short reply saying what changed (set `suggest_resolve` when the \
+                         feedback is fully addressed). Skip threads that need a decision only \
+                         the user can make, and say so. Never post anything yourself: the user \
+                         reviews and posts the drafts.\n\n",
+                    );
+                    if let Some(instructions) = &action.instructions {
+                        prompt.push_str("The user's instructions: ");
+                        prompt.push_str(instructions);
+                        prompt.push_str("\n\n");
+                    }
+                    prompt.push_str(&action.threads_text);
+                    let content_blocks =
+                        vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(prompt))];
+
+                    workspace.focus_panel::<AgentPanel>(window, cx);
                     panel.update(cx, |panel, cx| {
                         panel.external_thread(
                             None,
