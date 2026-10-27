@@ -458,14 +458,18 @@ impl InlineAssistant {
         for range in codegen_ranges {
             let assist_id = self.next_assist_id.post_inc();
             let codegen = cx.new(|cx| {
-                BufferCodegen::new(
+                let mut codegen = BufferCodegen::new(
                     editor.read(cx).buffer().clone(),
                     range.clone(),
                     initial_transaction_id,
                     session_id,
                     self.prompt_builder.clone(),
                     cx,
-                )
+                );
+                if let Some(project) = editor.read(cx).project() {
+                    codegen.set_project(project.downgrade(), cx);
+                }
+                codegen
             });
 
             let editor_margins = Arc::new(Mutex::new(EditorMargins::default()));

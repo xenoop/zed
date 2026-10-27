@@ -10,9 +10,12 @@ use futures::{
     future::{LocalBoxFuture, Shared},
     join,
 };
-use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Subscription, Task};
+use gpui::{
+    App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Subscription, Task, WeakEntity,
+};
 use language::{
-    Buffer, BufferEditSource, IndentKind, LanguageName, Point, TransactionId, line_diff,
+    Buffer, BufferEditSource, BufferSnapshot, IndentKind, LanguageName, Point, TransactionId,
+    line_diff,
 };
 use language_model::{
     CompletionIntent, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
@@ -26,7 +29,8 @@ use language_models::provider::anthropic::telemetry::{
 };
 use multi_buffer::MultiBufferRow;
 use parking_lot::Mutex;
-use prompt_store::PromptBuilder;
+use project::{Project, ProjectPath};
+use prompt_store::{InlineTransformationContext, PromptBuilder};
 use rope::Rope;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -75,6 +79,7 @@ pub struct BufferCodegen {
     builder: Arc<PromptBuilder>,
     pub is_insertion: bool,
     session_id: Uuid,
+    project: Option<WeakEntity<Project>>,
 }
 
 pub const REWRITE_SECTION_TOOL_NAME: &str = "rewrite_section";
@@ -110,9 +115,21 @@ impl BufferCodegen {
             initial_transaction_id,
             builder,
             session_id,
+            project: None,
         };
         this.activate(0, cx);
         this
+    }
+
+    /// Lets requests include the project's code review threads on the
+    /// section being transformed.
+    pub fn set_project(&mut self, project: WeakEntity<Project>, cx: &mut Context<Self>) {
+        self.project = Some(project.clone());
+        for alternative in &self.alternatives {
+            alternative.update(cx, |alternative, _| {
+                alternative.project = Some(project.clone())
+            });
+        }
     }
 
     fn subscribe_to_alternative(&mut self, cx: &mut Context<Self>) {
@@ -190,14 +207,16 @@ impl BufferCodegen {
 
         for _ in 0..alternative_models.len() {
             self.alternatives.push(cx.new(|cx| {
-                CodegenAlternative::new(
+                let mut alternative = CodegenAlternative::new(
                     self.buffer.clone(),
                     self.range.clone(),
                     false,
                     self.builder.clone(),
                     self.session_id,
                     cx,
-                )
+                );
+                alternative.project = self.project.clone();
+                alternative
             }));
         }
 
@@ -266,6 +285,67 @@ impl BufferCodegen {
 
 impl EventEmitter<CodegenEvent> for BufferCodegen {}
 
+/// How many rows around the section to look at for diff hunks and review
+/// threads.
+const CONTEXT_ROWS: u32 = 20;
+/// Keeps a huge diff from crowding out the rest of the prompt.
+const MAX_CHANGES_LEN: usize = 20_000;
+
+/// Formats the diff hunks overlapping `rows` as a unified diff.
+fn format_changes(
+    diff: &buffer_diff::BufferDiffSnapshot,
+    buffer: &BufferSnapshot,
+    rows: RangeInclusive<u32>,
+) -> Option<String> {
+    let base_text = diff.base_text();
+    let mut output = String::new();
+    for hunk in diff.hunks_intersecting_range(
+        language::Anchor::min_max_range_for_buffer(buffer.remote_id()),
+        buffer,
+    ) {
+        let new_start = hunk.range.start.row;
+        let new_end = if hunk.range.end.column == 0 && hunk.range.end.row > new_start {
+            hunk.range.end.row
+        } else {
+            hunk.range.end.row + 1
+        };
+        if new_end.saturating_sub(1) < *rows.start() || new_start > *rows.end() {
+            continue;
+        }
+        let old_text: String = base_text
+            .text_for_range(hunk.diff_base_byte_range.clone())
+            .collect();
+        let new_text: String = buffer.text_for_range(hunk.range.clone()).collect();
+        let old_start = base_text
+            .offset_to_point(hunk.diff_base_byte_range.start)
+            .row;
+        let old_lines = old_text.lines().count();
+        let new_lines = new_text.lines().count();
+        output.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            old_start + 1,
+            old_lines,
+            new_start + 1,
+            new_lines
+        ));
+        for line in old_text.lines() {
+            output.push('-');
+            output.push_str(line);
+            output.push('\n');
+        }
+        for line in new_text.lines() {
+            output.push('+');
+            output.push_str(line);
+            output.push('\n');
+        }
+        if output.len() > MAX_CHANGES_LEN {
+            output.push_str("[remaining changes omitted]\n");
+            break;
+        }
+    }
+    (!output.is_empty()).then_some(output)
+}
+
 pub struct CodegenAlternative {
     buffer: Entity<MultiBuffer>,
     old_buffer: Entity<Buffer>,
@@ -289,6 +369,7 @@ pub struct CodegenAlternative {
     session_id: Uuid,
     pub description: Option<String>,
     pub failure: Option<String>,
+    project: Option<WeakEntity<Project>>,
 }
 
 impl EventEmitter<CodegenEvent> for CodegenAlternative {}
@@ -349,6 +430,7 @@ impl CodegenAlternative {
             session_id,
             description: None,
             failure: None,
+            project: None,
             _subscription: cx.subscribe(&buffer, Self::handle_buffer_event),
         }
     }
@@ -490,12 +572,14 @@ impl CodegenAlternative {
             anyhow::bail!("invalid transformation range");
         };
 
+        let extra_context = self.extra_context(&buffer, range.start.0..range.end.0, cx);
         let system_prompt = self
             .builder
             .generate_inline_transformation_prompt_tools(
                 language_name,
                 buffer,
                 range.start.0..range.end.0,
+                extra_context,
             )
             .context("generating content prompt")?;
 
@@ -567,6 +651,63 @@ impl CodegenAlternative {
         }))
     }
 
+    /// The diff and review threads around `range`, when the editor shows them.
+    fn extra_context(
+        &self,
+        buffer: &BufferSnapshot,
+        range: Range<usize>,
+        cx: &App,
+    ) -> InlineTransformationContext {
+        let start_row = buffer.offset_to_point(range.start).row;
+        let end_row = buffer.offset_to_point(range.end).row;
+        let rows = start_row.saturating_sub(CONTEXT_ROWS)..=end_row + CONTEXT_ROWS;
+
+        let changes = self
+            .buffer
+            .read(cx)
+            .diff_for(buffer.remote_id())
+            .and_then(|diff| format_changes(&diff.read(cx).snapshot(cx), buffer, rows.clone()));
+
+        let review_threads = self.project.as_ref().and_then(|project| {
+            let project = project.upgrade()?;
+            let store = code_review::store_for_project(project.entity_id(), cx)?;
+            let file = buffer.file()?;
+            let project_path = ProjectPath {
+                worktree_id: file.worktree_id(cx),
+                path: file.path().clone(),
+            };
+            let (_, repo_path) = project
+                .read(cx)
+                .git_store()
+                .read(cx)
+                .repository_and_path_for_project_path(&project_path, cx)?;
+            let store = store.read(cx);
+            let loaded = store.loaded()?;
+            let one_based_rows = rows.start() + 1..=rows.end() + 1;
+            let matches = |thread: &git::code_review::ReviewThread| {
+                thread.path == repo_path
+                    && thread
+                        .lines
+                        .clone()
+                        .or_else(|| thread.original_lines.clone())
+                        .is_some_and(|lines| {
+                            *lines.start() <= *one_based_rows.end()
+                                && *lines.end() >= *one_based_rows.start()
+                        })
+            };
+            loaded
+                .threads
+                .iter()
+                .any(|thread| matches(thread))
+                .then(|| loaded.describe_threads(matches))
+        });
+
+        InlineTransformationContext {
+            changes,
+            review_threads,
+        }
+    }
+
     fn build_request(
         &self,
         model: &LanguageModel,
@@ -605,6 +746,7 @@ impl CodegenAlternative {
             anyhow::bail!("invalid transformation range");
         };
 
+        let extra_context = self.extra_context(&buffer, range.start.0..range.end.0, cx);
         let prompt = self
             .builder
             .generate_inline_transformation_prompt(
@@ -612,6 +754,7 @@ impl CodegenAlternative {
                 language_name,
                 buffer,
                 range.start.0..range.end.0,
+                extra_context,
             )
             .context("generating content prompt")?;
 
@@ -1653,6 +1796,30 @@ mod tests {
     use rand::prelude::*;
     use settings::SettingsStore;
     use std::{future, sync::Arc};
+
+    #[gpui::test]
+    fn test_format_changes_around_section(cx: &mut TestAppContext) {
+        let base = "one\ntwo\nthree\nfour\nfive\n";
+        let current = "one\nTWO\nthree\nfour\nfive\nsix\n";
+        let buffer = cx.new(|cx| Buffer::local(current, cx));
+        let text_snapshot = buffer.read_with(cx, |buffer, _| buffer.text_snapshot());
+        let diff =
+            cx.new(|cx| buffer_diff::BufferDiff::new_with_base_text(base, &text_snapshot, cx));
+        cx.run_until_parked();
+        let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+        let diff_snapshot = diff.read_with(cx, |diff, cx| diff.snapshot(cx));
+
+        assert_eq!(
+            format_changes(&diff_snapshot, &snapshot, 0..=10).as_deref(),
+            Some("@@ -2,1 +2,1 @@\n-two\n+TWO\n@@ -6,0 +6,1 @@\n+six\n")
+        );
+        assert_eq!(
+            format_changes(&diff_snapshot, &snapshot, 4..=10).as_deref(),
+            Some("@@ -6,0 +6,1 @@\n+six\n"),
+            "only hunks near the section are included"
+        );
+        assert_eq!(format_changes(&diff_snapshot, &snapshot, 2..=3), None);
+    }
 
     #[gpui::test(iterations = 10)]
     async fn test_transform_autoindent(cx: &mut TestAppContext, mut rng: StdRng) {

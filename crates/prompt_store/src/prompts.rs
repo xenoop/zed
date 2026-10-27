@@ -118,6 +118,19 @@ pub struct ContentPromptContext {
     pub user_prompt: String,
     pub rewrite_section: Option<String>,
     pub diagnostic_errors: Vec<ContentPromptDiagnosticContext>,
+    pub changes: Option<String>,
+    pub review_threads: Option<String>,
+}
+
+/// Context for an inline transformation beyond the buffer itself, used when
+/// the editor shows more than the file's current text.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InlineTransformationContext {
+    /// A unified diff of the changes around the section, when the editor
+    /// shows the file as a diff.
+    pub changes: Option<String>,
+    /// Code review comments on the section, as Markdown.
+    pub review_threads: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -128,6 +141,8 @@ pub struct ContentPromptContextV2 {
     pub document_content: String,
     pub rewrite_section: String,
     pub diagnostic_errors: Vec<ContentPromptDiagnosticContext>,
+    pub changes: Option<String>,
+    pub review_threads: Option<String>,
 }
 
 #[cfg(test)]
@@ -135,6 +150,52 @@ mod tests {
     use super::*;
     use agent_skills::{Skill, SkillSource};
     use std::path::PathBuf;
+
+    #[gpui::test]
+    fn test_inline_prompt_includes_changes_and_review_threads(cx: &mut gpui::TestAppContext) {
+        let builder = PromptBuilder::new(None).unwrap();
+        let buffer = cx.new(|cx| language::Buffer::local("let a = 2;\n", cx));
+        let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+        let extra_context = InlineTransformationContext {
+            changes: Some("@@ -1,1 +1,1 @@\n-let a = 1;\n+let a = 2;\n".into()),
+            review_threads: Some("- **rhea-l**: Why 2?".into()),
+        };
+
+        let tools_prompt = builder
+            .generate_inline_transformation_prompt_tools(
+                None,
+                snapshot.clone(),
+                0..10,
+                extra_context.clone(),
+            )
+            .unwrap();
+        assert!(tools_prompt.contains("<changes>\n@@ -1,1 +1,1 @@\n-let a = 1;"));
+        assert!(tools_prompt.contains("<review_threads>\n- **rhea-l**: Why 2?"));
+        assert!(tools_prompt.contains("If the user asks a question"));
+
+        let prompt = builder
+            .generate_inline_transformation_prompt(
+                "explain".into(),
+                None,
+                snapshot.clone(),
+                0..10,
+                extra_context,
+            )
+            .unwrap();
+        assert!(prompt.contains("<changes>"));
+        assert!(prompt.contains("<review_threads>"));
+
+        let plain = builder
+            .generate_inline_transformation_prompt_tools(
+                None,
+                snapshot,
+                0..10,
+                InlineTransformationContext::default(),
+            )
+            .unwrap();
+        assert!(!plain.contains("<changes>"));
+        assert!(!plain.contains("<review_threads>"));
+    }
 
     #[test]
     fn test_project_context_does_not_filter_by_budget() {
@@ -360,6 +421,7 @@ impl PromptBuilder {
         language_name: Option<&LanguageName>,
         buffer: BufferSnapshot,
         range: Range<usize>,
+        extra_context: InlineTransformationContext,
     ) -> Result<String, RenderError> {
         let content_type = match language_name.as_ref().map(|l| l.as_ref()) {
             None | Some("Markdown" | "Plain Text") => "text",
@@ -423,6 +485,8 @@ impl PromptBuilder {
             document_content,
             rewrite_section,
             diagnostic_errors,
+            changes: extra_context.changes,
+            review_threads: extra_context.review_threads,
         };
         self.handlebars.lock().render("content_prompt_v2", &context)
     }
@@ -433,6 +497,7 @@ impl PromptBuilder {
         language_name: Option<&LanguageName>,
         buffer: BufferSnapshot,
         range: Range<usize>,
+        extra_context: InlineTransformationContext,
     ) -> Result<String, RenderError> {
         let content_type = match language_name.as_ref().map(|l| l.as_ref()) {
             None | Some("Markdown" | "Plain Text") => "text",
@@ -508,6 +573,8 @@ impl PromptBuilder {
             user_prompt,
             rewrite_section,
             diagnostic_errors,
+            changes: extra_context.changes,
+            review_threads: extra_context.review_threads,
         };
         self.handlebars.lock().render("content_prompt", &context)
     }
