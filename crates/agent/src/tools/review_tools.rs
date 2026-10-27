@@ -294,7 +294,10 @@ mod tests {
     use util::path;
 
     async fn setup(cx: &mut TestAppContext) -> (Entity<Project>, Entity<ReviewStore>) {
-        cx.update(|cx| cx.set_global(SettingsStore::test(cx)));
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
             path!("/root"),
@@ -380,7 +383,10 @@ mod tests {
 
     #[gpui::test]
     async fn test_review_tools_without_review(cx: &mut TestAppContext) {
-        cx.update(|cx| cx.set_global(SettingsStore::test(cx)));
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
         let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
         let tool = Arc::new(ReviewThreadsTool::new(project));
         let (event_stream, _) = ToolCallEventStream::test();
