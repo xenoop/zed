@@ -472,6 +472,10 @@ impl ReviewStore {
         self.agent_replies.get(thread)
     }
 
+    pub fn agent_replies(&self) -> impl Iterator<Item = (&ThreadId, &AgentReplyDraft)> {
+        self.agent_replies.iter()
+    }
+
     pub fn is_agent_working(&self, thread: &ThreadId) -> bool {
         self.agent_working.contains(thread)
     }

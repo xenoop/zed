@@ -381,7 +381,9 @@ pub mod git {
             /// Posts the reply being written in a review thread.
             SubmitReviewReply,
             /// Submits your pending review comments with a verdict.
-            FinishReview
+            FinishReview,
+            /// Commits the agent's review fixes, pushes them and updates your checkout.
+            LandReviewFixes
         ]
     );
 }

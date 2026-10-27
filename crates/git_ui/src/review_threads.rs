@@ -1,5 +1,6 @@
 use std::{ops::RangeInclusive, sync::Arc};
 
+use anyhow::Context as _;
 use code_review::{
     AgentFinding, AgentReplyDraft, CredentialAttempt, CredentialOutcome, FindingSeverity,
     RepositoryReviewInfo, ReviewState, ReviewStore, ReviewStoreEvent, review_target,
@@ -27,6 +28,7 @@ use menu::{Cancel, Confirm};
 use multi_buffer::{Anchor, MultiBufferSnapshot};
 use project::{
     Project,
+    git_store::Repository,
     git_store::diff_buffer_list::{BranchDiffEvent, DiffBase},
 };
 use time::{OffsetDateTime, UtcOffset};
@@ -41,8 +43,18 @@ use crate::diff_multibuffer::DiffMultibuffer;
 const MAX_REPLY_INDENT: usize = 2;
 
 /// Shows a review's threads as cards between the lines of a branch diff.
+/// The linked worktree the agent fixes review threads in, so your own
+/// checkout is never touched.
+#[derive(Clone)]
+pub(crate) struct AgentWorktree {
+    pub(crate) workspace: WeakEntity<Workspace>,
+    pub(crate) repository: Entity<Repository>,
+}
+
 pub(crate) struct ReviewThreads {
     store: Entity<ReviewStore>,
+    workspace: WeakEntity<Workspace>,
+    agent_worktree: Option<AgentWorktree>,
     diff: WeakEntity<DiffMultibuffer>,
     editor: WeakEntity<Editor>,
     languages: Arc<LanguageRegistry>,
@@ -61,6 +73,7 @@ impl ReviewThreads {
     pub(crate) fn new(
         diff: Entity<DiffMultibuffer>,
         project: &Entity<Project>,
+        workspace: WeakEntity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -90,6 +103,8 @@ impl ReviewThreads {
         ];
         Self {
             store,
+            workspace,
+            agent_worktree: None,
             diff: diff.downgrade(),
             editor: editor.downgrade(),
             languages: project.read(cx).languages().clone(),
@@ -165,6 +180,83 @@ impl ReviewThreads {
 
     /// Hands review threads to the agent: the given ones, or every open
     /// thread. The agent drafts replies; nothing is posted.
+    pub(crate) fn agent_worktree(&self) -> Option<&AgentWorktree> {
+        self.agent_worktree
+            .as_ref()
+            .filter(|worktree| worktree.workspace.upgrade().is_some())
+    }
+
+    /// Like [`Self::fix_with_agent`], but the agent works in a linked
+    /// worktree of the branch, created on first use and reused afterwards.
+    pub(crate) fn fix_with_agent_in_worktree(
+        &mut self,
+        thread_ids: Option<Vec<ThreadId>>,
+        instructions: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(worktree) = self.agent_worktree().cloned() {
+            self.dispatch_in_worktree(worktree, thread_ids, instructions, window, cx);
+            return;
+        }
+        let Some(number) = self
+            .store
+            .read(cx)
+            .loaded()
+            .map(|loaded| loaded.review.number)
+        else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let action = zed_actions::CreateWorktree {
+            worktree_name: Some(format!("review-{number}")),
+            branch_target: zed_actions::NewWorktreeBranchTarget::CurrentBranch,
+        };
+        let creation = workspace.update(cx, |workspace, cx| {
+            git_ui_core::worktree_service::create_worktree_workspace(
+                workspace, &action, window, None, cx,
+            )
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let created = creation.await?;
+            this.update_in(cx, |this, window, cx| {
+                let project = created.workspace.read(cx).project().clone();
+                let repository = project
+                    .read(cx)
+                    .active_repository(cx)
+                    .context("the new worktree has no repository")?;
+                code_review::register_store_for_project(project.entity_id(), &this.store, cx);
+                let worktree = AgentWorktree {
+                    workspace: created.workspace.downgrade(),
+                    repository,
+                };
+                this.agent_worktree = Some(worktree.clone());
+                this.dispatch_in_worktree(worktree, thread_ids, instructions, window, cx);
+                anyhow::Ok(())
+            })?
+        })
+        .detach_and_notify_err(self.workspace.clone(), window, cx);
+    }
+
+    fn dispatch_in_worktree(
+        &mut self,
+        worktree: AgentWorktree,
+        thread_ids: Option<Vec<ThreadId>>,
+        instructions: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Actions go to the focused workspace, so focus the worktree's
+        // workspace first to open the agent thread there.
+        if let Some(workspace) = worktree.workspace.upgrade() {
+            let focus_handle = workspace.read(cx).active_pane().focus_handle(cx);
+            window.focus(&focus_handle, cx);
+        }
+        self.fix_with_agent(thread_ids, instructions, window, cx);
+    }
+
     pub(crate) fn fix_with_agent(
         &mut self,
         thread_ids: Option<Vec<ThreadId>>,
@@ -211,7 +303,7 @@ impl ReviewThreads {
         if let Some(instructions) = body.trim_start().strip_prefix("@agent") {
             let instructions = instructions.trim().to_string();
             editor.update(cx, |editor, cx| editor.clear(window, cx));
-            self.fix_with_agent(Some(vec![thread_id]), Some(instructions), window, cx);
+            self.fix_with_agent_in_worktree(Some(vec![thread_id]), Some(instructions), window, cx);
             return;
         }
         self.thread_errors.remove(&thread_id);
@@ -1243,7 +1335,12 @@ impl ThreadCard {
                         .tooltip(Tooltip::text("Fix with agent"))
                         .on_click(move |_, window, cx| {
                             view.update(cx, |view, cx| {
-                                view.fix_with_agent(Some(vec![thread_id.clone()]), None, window, cx)
+                                view.fix_with_agent_in_worktree(
+                                    Some(vec![thread_id.clone()]),
+                                    None,
+                                    window,
+                                    cx,
+                                )
                             })
                             .log_err();
                         }),
@@ -1784,5 +1881,513 @@ impl Render for FinishReviewModal {
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
             )
+    }
+}
+
+fn askpass_delegate(
+    workspace: WeakEntity<Workspace>,
+    operation: SharedString,
+    window: &Window,
+    cx: &mut App,
+) -> askpass::AskPassDelegate {
+    let window = window.window_handle();
+    askpass::AskPassDelegate::new_with_cancellation(
+        &mut cx.to_async(),
+        move |prompt, tx, cancellation, cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.toggle_modal(window, cx, |window, cx| {
+                            git_ui_core::askpass_modal::AskPassModal::new(
+                                operation.clone(),
+                                prompt.into(),
+                                tx,
+                                cancellation,
+                                window,
+                                cx,
+                            )
+                        });
+                    })
+                })
+                .ok();
+        },
+    )
+}
+
+/// Where the agent's fixes are pushed and what the landing commit says.
+#[derive(Debug, PartialEq, Eq)]
+struct LandPlan {
+    remote: SharedString,
+    remote_branch: SharedString,
+    /// The branch to pull, when the local branch doesn't track one.
+    pull_branch: Option<SharedString>,
+    message: String,
+    reply_count: usize,
+}
+
+impl LandPlan {
+    fn new(
+        branch: &git::repository::Branch,
+        loaded: &code_review::LoadedReview,
+        drafts: &[(ThreadId, AgentReplyDraft)],
+    ) -> Self {
+        let upstream = branch
+            .upstream
+            .as_ref()
+            .filter(|upstream| upstream.is_remote());
+        let remote = upstream
+            .and_then(|upstream| upstream.remote_name())
+            .unwrap_or("origin")
+            .to_string()
+            .into();
+        let remote_branch = upstream
+            .and_then(|upstream| upstream.branch_name())
+            .unwrap_or(branch.name())
+            .to_string()
+            .into();
+        let pull_branch = upstream
+            .is_none()
+            .then(|| SharedString::from(branch.name().to_string()));
+
+        let mut message = format!("Address review feedback on #{}\n", loaded.review.number);
+        let mut sorted_drafts = drafts.iter().collect::<Vec<_>>();
+        sorted_drafts.sort_by(|a, b| a.0.cmp(&b.0));
+        for (thread_id, draft) in &sorted_drafts {
+            if let Some(thread) = loaded.threads.iter().find(|thread| thread.id == *thread_id) {
+                let summary = draft.body.lines().next().unwrap_or_default();
+                message.push_str(&format!("\n- {}: {summary}", thread.path.as_unix_str()));
+            }
+        }
+        Self {
+            remote,
+            remote_branch,
+            pull_branch,
+            message,
+            reply_count: drafts.len(),
+        }
+    }
+}
+
+/// Commits the agent's fixes in its worktree, pushes them to the pull
+/// request's branch, brings them into your checkout and posts the drafted
+/// replies.
+pub(crate) struct LandFixesModal {
+    workspace: WeakEntity<Workspace>,
+    store: Entity<ReviewStore>,
+    worktree: AgentWorktree,
+    source_repository: Entity<Repository>,
+    message: Entity<Editor>,
+    post_replies: bool,
+    reply_count: usize,
+    remote: SharedString,
+    remote_branch: SharedString,
+    pull_branch: Option<SharedString>,
+    status: Option<SharedString>,
+    error: Option<SharedString>,
+    landing: bool,
+}
+
+impl LandFixesModal {
+    pub(crate) fn toggle(
+        workspace: &mut Workspace,
+        review_threads: Entity<ReviewThreads>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let review_threads = review_threads.read(cx);
+        let Some(worktree) = review_threads.agent_worktree().cloned() else {
+            return;
+        };
+        let Some(source_repository) = review_threads
+            .diff
+            .upgrade()
+            .and_then(|diff| diff.read(cx).repo(cx))
+        else {
+            return;
+        };
+        let store = review_threads.store.clone();
+        let Some(loaded) = store.read(cx).loaded().cloned() else {
+            return;
+        };
+        let Some(branch) = source_repository.read(cx).snapshot().branch else {
+            return;
+        };
+        let drafts = store
+            .read(cx)
+            .agent_replies()
+            .map(|(thread_id, draft)| (thread_id.clone(), draft.clone()))
+            .collect::<Vec<_>>();
+        let LandPlan {
+            remote,
+            remote_branch,
+            pull_branch,
+            message,
+            reply_count,
+        } = LandPlan::new(&branch, &loaded, &drafts);
+
+        let workspace_handle = cx.weak_entity();
+        workspace.toggle_modal(window, cx, |window, cx| {
+            let message_editor = cx.new(|cx| {
+                let mut editor = Editor::auto_height(3, 10, window, cx);
+                editor.set_text(message, window, cx);
+                editor
+            });
+            Self {
+                workspace: workspace_handle,
+                store,
+                worktree,
+                source_repository,
+                message: message_editor,
+                post_replies: reply_count > 0,
+                reply_count,
+                remote,
+                remote_branch,
+                pull_branch,
+                status: None,
+                error: None,
+                landing: false,
+            }
+        });
+    }
+
+    fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.landing {
+            cx.emit(DismissEvent);
+        }
+    }
+
+    fn set_status(&mut self, status: &str, cx: &mut Context<Self>) {
+        self.status = Some(SharedString::from(status.to_string()));
+        cx.notify();
+    }
+
+    fn land(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.landing {
+            return;
+        }
+        let message = self.message.read(cx).text(cx);
+        if message.trim().is_empty() {
+            self.error = Some("Write a commit message.".into());
+            cx.notify();
+            return;
+        }
+        self.landing = true;
+        self.error = None;
+        cx.notify();
+
+        let commit_askpass =
+            askpass_delegate(self.workspace.clone(), "git commit".into(), window, cx);
+        let push_askpass = askpass_delegate(
+            self.workspace.clone(),
+            format!("git push {}", self.remote).into(),
+            window,
+            cx,
+        );
+        let pull_askpass = askpass_delegate(
+            self.workspace.clone(),
+            format!("git pull {}", self.remote).into(),
+            window,
+            cx,
+        );
+        let worktree_repository = self.worktree.repository.clone();
+        let source_repository = self.source_repository.clone();
+        let store = self.store.clone();
+        let remote = self.remote.clone();
+        let remote_branch = self.remote_branch.clone();
+        let pull_branch = self.pull_branch.clone();
+        let post_replies = self.post_replies;
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = async {
+                let has_changes = worktree_repository.read_with(cx, |repository, _| {
+                    repository.cached_status().next().is_some()
+                });
+                if has_changes {
+                    this.update(cx, |this, cx| this.set_status("Committing…", cx))?;
+                    worktree_repository
+                        .update(cx, |repository, cx| repository.stage_all(cx))
+                        .await?;
+                    worktree_repository
+                        .update(cx, |repository, cx| {
+                            repository.commit(
+                                message.into(),
+                                None,
+                                git::repository::CommitOptions::default(),
+                                commit_askpass,
+                                cx,
+                            )
+                        })
+                        .await??;
+                }
+                let sha = worktree_repository
+                    .update(cx, |repository, _| repository.head_sha())
+                    .await??
+                    .context("the worktree has no commit to push")?;
+
+                this.update(cx, |this, cx| this.set_status("Pushing…", cx))?;
+                worktree_repository
+                    .update(cx, |repository, cx| {
+                        repository.push(
+                            "HEAD".into(),
+                            remote_branch.clone(),
+                            remote.clone(),
+                            None,
+                            push_askpass,
+                            cx,
+                        )
+                    })
+                    .await??;
+
+                this.update(cx, |this, cx| {
+                    this.set_status("Updating your checkout…", cx)
+                })?;
+                source_repository
+                    .update(cx, |repository, cx| {
+                        repository.pull(
+                            pull_branch.clone(),
+                            remote.clone(),
+                            false,
+                            pull_askpass,
+                            cx,
+                        )
+                    })
+                    .await??;
+
+                if post_replies {
+                    this.update(cx, |this, cx| this.set_status("Posting replies…", cx))?;
+                    let short_sha = sha.get(..7).unwrap_or(&sha).to_string();
+                    let drafts = store.read_with(cx, |store, _| {
+                        store
+                            .agent_replies()
+                            .map(|(thread_id, draft)| (thread_id.clone(), draft.clone()))
+                            .collect::<Vec<_>>()
+                    });
+                    for (thread_id, mut draft) in drafts {
+                        draft.body = format!("{}\n\nFixed in {short_sha}.", draft.body.trim_end());
+                        let resolve = draft.suggest_resolve;
+                        let post = store.update(cx, |store, cx| {
+                            store.draft_agent_reply(thread_id.clone(), draft, cx)?;
+                            anyhow::Ok(store.post_agent_reply(thread_id, resolve, cx))
+                        })?;
+                        post.await?;
+                    }
+                }
+                store.update(cx, |store, cx| store.reload(cx));
+                anyhow::Ok(())
+            }
+            .await;
+
+            this.update(cx, |this, cx| match result {
+                Ok(()) => cx.emit(DismissEvent),
+                Err(error) => {
+                    this.landing = false;
+                    this.status = None;
+                    this.error = Some(format!("{error:#}").into());
+                    cx.notify();
+                }
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+}
+
+impl EventEmitter<DismissEvent> for LandFixesModal {}
+impl ModalView for LandFixesModal {}
+
+impl Focusable for LandFixesModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.message.focus_handle(cx)
+    }
+}
+
+impl Render for LandFixesModal {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let post_label = match self.reply_count {
+            0 => "No drafted replies to post".to_string(),
+            1 => "Then post 1 drafted reply (resolving it if the agent suggests so)".to_string(),
+            count => {
+                format!("Then post {count} drafted replies (resolving those the agent suggests)")
+            }
+        };
+        v_flex()
+            .key_context("LandFixesModal")
+            .on_action(cx.listener(Self::cancel))
+            .elevation_2(cx)
+            .w(rems(36.))
+            .p_3()
+            .gap_3()
+            .child(
+                v_flex()
+                    .child(Headline::new("Land Agent Fixes").size(HeadlineSize::Small))
+                    .child(
+                        Label::new(format!(
+                            "Commits the worktree's changes, pushes them to {}/{}, and updates your checkout.",
+                            self.remote, self.remote_branch
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    ),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border)
+                    .child(self.message.clone()),
+            )
+            .child(
+                h_flex()
+                    .id("land-fixes-post-replies")
+                    .gap_2()
+                    .when(self.reply_count > 0 && !self.landing, |this| {
+                        this.cursor_pointer().on_click(cx.listener(|this, _, _, cx| {
+                            this.post_replies = !this.post_replies;
+                            cx.notify();
+                        }))
+                    })
+                    .child(
+                        Icon::new(if self.post_replies {
+                            IconName::Check
+                        } else {
+                            IconName::Circle
+                        })
+                        .size(IconSize::Small)
+                        .color(if self.post_replies {
+                            Color::Accent
+                        } else {
+                            Color::Muted
+                        }),
+                    )
+                    .child(Label::new(post_label).size(LabelSize::Small)),
+            )
+            .when_some(self.status.clone(), |this, status| {
+                this.child(Label::new(status).size(LabelSize::Small).color(Color::Muted))
+            })
+            .when_some(self.error.clone(), |this, error| {
+                this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+            })
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("land-fixes-cancel", "Cancel")
+                            .disabled(self.landing)
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    )
+                    .child(
+                        Button::new(
+                            "land-fixes-submit",
+                            if self.landing { "Landing…" } else { "Commit, Push & Land" },
+                        )
+                        .style(ButtonStyle::Filled)
+                        .disabled(self.landing)
+                        .on_click(cx.listener(|this, _, window, cx| this.land(window, cx))),
+                    ),
+            )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use code_review::LoadedReview;
+    use git::{
+        ParsedGitRemote,
+        code_review::{Review, ReviewCapabilities},
+        repository::{Branch, Upstream, UpstreamTracking},
+    };
+
+    fn loaded() -> LoadedReview {
+        let thread = |id: &str, path: &str| ReviewThread {
+            id: ThreadId(id.to_string().into()),
+            path: RepoPath::new(path).unwrap(),
+            side: DiffSide::New,
+            lines: Some(1..=1),
+            original_lines: Some(1..=1),
+            is_resolved: false,
+            is_outdated: false,
+            can_resolve: true,
+            can_reply: true,
+            resolved_by: None,
+            comments: Vec::new(),
+        };
+        LoadedReview {
+            review: Review {
+                id: "PR".into(),
+                number: 42,
+                title: "".into(),
+                url: "https://fake.example/pull/42".parse().unwrap(),
+                base_repository: ParsedGitRemote {
+                    owner: "owner".into(),
+                    repo: "repo".into(),
+                },
+                head_sha: "sha".into(),
+                base_ref: "main".into(),
+                author_login: "author".into(),
+                viewer_login: None,
+            },
+            threads: vec![thread("A", "src/a.rs"), thread("B", "src/b.rs")],
+            capabilities: ReviewCapabilities::default(),
+            local_head_matches: true,
+        }
+    }
+
+    fn draft(body: &str) -> AgentReplyDraft {
+        AgentReplyDraft {
+            body: body.into(),
+            suggest_resolve: true,
+        }
+    }
+
+    #[test]
+    fn test_land_plan_with_tracked_branch() {
+        let branch = Branch {
+            is_head: true,
+            ref_name: "refs/heads/local-name".into(),
+            upstream: Some(Upstream {
+                ref_name: "refs/remotes/fork/feat/review".into(),
+                tracking: UpstreamTracking::Gone,
+            }),
+            most_recent_commit: None,
+        };
+        let plan = LandPlan::new(
+            &branch,
+            &loaded(),
+            &[
+                (ThreadId("B".into()), draft("Renamed it.\nMore detail.")),
+                (ThreadId("A".into()), draft("Added a test.")),
+            ],
+        );
+        assert_eq!(
+            plan,
+            LandPlan {
+                remote: "fork".into(),
+                remote_branch: "feat/review".into(),
+                pull_branch: None,
+                message: "Address review feedback on #42\n\n- src/a.rs: Added a test.\n- src/b.rs: Renamed it."
+                    .into(),
+                reply_count: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn test_land_plan_without_upstream() {
+        let branch = Branch {
+            is_head: true,
+            ref_name: "refs/heads/feature".into(),
+            upstream: None,
+            most_recent_commit: None,
+        };
+        let plan = LandPlan::new(&branch, &loaded(), &[]);
+        assert_eq!(plan.remote.as_ref(), "origin");
+        assert_eq!(plan.remote_branch.as_ref(), "feature");
+        assert_eq!(plan.pull_branch.as_deref(), Some("feature"));
+        assert_eq!(plan.message, "Address review feedback on #42\n");
+        assert_eq!(plan.reply_count, 0);
     }
 }

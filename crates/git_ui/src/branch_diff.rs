@@ -5,7 +5,7 @@ use crate::{
         self, CompareWithBranch, DeployBranchDiff, ProjectDiff, ReviewDiff,
         render_send_review_to_agent_button,
     },
-    review_threads::{ConnectReviewHostModal, FinishReviewModal, ReviewThreads},
+    review_threads::{ConnectReviewHostModal, FinishReviewModal, LandFixesModal, ReviewThreads},
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
@@ -43,7 +43,7 @@ use workspace::{
 };
 use zed_actions::{
     agent::ReviewBranchDiff,
-    git::{FinishReview, ToggleReviewThreads},
+    git::{FinishReview, LandReviewFixes, ToggleReviewThreads},
 };
 
 /// The workspace item for a branch (merge-base) diff: "Changes since {branch}".
@@ -373,7 +373,9 @@ impl BranchDiff {
         let diff_event_subscription = cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| {
             cx.emit(event.clone())
         });
-        let review_threads = cx.new(|cx| ReviewThreads::new(diff.clone(), &project, window, cx));
+        let review_threads = cx.new(|cx| {
+            ReviewThreads::new(diff.clone(), &project, workspace.downgrade(), window, cx)
+        });
         let review_threads_subscription = cx.observe(&review_threads, |_, _, cx| cx.notify());
         Self {
             diff,
@@ -409,6 +411,20 @@ impl BranchDiff {
     ) {
         self.review_threads
             .update(cx, |review_threads, cx| review_threads.toggle(window, cx));
+    }
+
+    fn land_review_fixes(
+        &mut self,
+        _: &LandReviewFixes,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let review_threads = self.review_threads.clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                LandFixesModal::toggle(workspace, review_threads, window, cx)
+            })
+            .log_err();
     }
 
     fn finish_review(&mut self, _: &FinishReview, window: &mut Window, cx: &mut Context<Self>) {
@@ -679,6 +695,7 @@ impl Render for BranchDiff {
             .on_action(cx.listener(Self::review_diff))
             .on_action(cx.listener(Self::toggle_review_threads))
             .on_action(cx.listener(Self::finish_review))
+            .on_action(cx.listener(Self::land_review_fixes))
             .child(self.diff.clone())
     }
 }
@@ -846,7 +863,7 @@ impl Render for BranchDiffToolbar {
             .read(cx)
             .is_empty();
         let is_ai_enabled = AgentSettings::get_global(cx).enabled(cx);
-        let (comments_go_to_review, kept_findings, open_threads) = {
+        let (comments_go_to_review, kept_findings, open_threads, has_agent_worktree) = {
             let review_threads = branch_diff.read(cx).review_threads.read(cx);
             let store = review_threads.store().read(cx);
             (
@@ -856,6 +873,7 @@ impl Render for BranchDiffToolbar {
                     .loaded()
                     .filter(|_| review_threads.is_visible())
                     .map_or(0, |loaded| loaded.open_thread_count()),
+                review_threads.agent_worktree().is_some(),
             )
         };
 
@@ -986,11 +1004,27 @@ impl Render for BranchDiffToolbar {
                         branch_diff
                             .update(cx, |branch_diff, cx| {
                                 branch_diff.review_threads.update(cx, |threads, cx| {
-                                    threads.fix_with_agent(None, None, window, cx)
+                                    threads.fix_with_agent_in_worktree(None, None, window, cx)
                                 })
                             })
                             .log_err();
                     }),
+                )
+            })
+            .when(has_agent_worktree, |this| {
+                this.child(Divider::vertical()).child(
+                    Button::new("land-review-fixes", "Land Fixes")
+                        .start_icon(
+                            Icon::new(IconName::GitBranch)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .tooltip(Tooltip::text(
+                            "Commit the agent's fixes in its worktree, push them, update your checkout and post the drafted replies",
+                        ))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.dispatch_action(&LandReviewFixes, window, cx)
+                        })),
                 )
             })
             .when(comments_go_to_review, |this| {
