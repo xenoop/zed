@@ -21,8 +21,7 @@ use client::zed_urls;
 use collections::{HashMap, HashSet, IndexMap};
 use editor::scroll::Autoscroll;
 use editor::{
-    AgentReply,
-    Editor, EditorEvent, EditorMode, MultiBuffer, PathKey, ReviewCommentCode,
+    AgentReply, Editor, EditorEvent, EditorMode, MultiBuffer, PathKey, ReviewCommentCode,
     ReviewCommentForAgent, SelectionEffects, SizingBehavior,
 };
 use file_icons::FileIcons;
@@ -59,7 +58,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::{rc::Rc, time::Duration};
 use terminal_view::terminal_panel::TerminalPanel;
-use text::Anchor;
+use text::{Anchor, ToPoint as _};
 use theme_settings::{AgentBufferFontSize, AgentUiFontSize};
 use ui::{
     Callout, CircularProgress, CommonAnimationExt, ContextMenu, ContextMenuEntry, CopyButton,
@@ -3786,6 +3785,64 @@ impl ConversationView {
     /// Inserts diff review comments into the active thread's message editor as
     /// a mention of each commented range followed by its comment, without
     /// sending. Returns false when there is no active thread to insert into.
+    /// Sends `prompt` to the active agent thread (whichever ACP agent it runs:
+    /// Codex, Claude Code, ...) through the usual send path, so it shows in the
+    /// thread like a typed message. The task resolves with the agent's final
+    /// answer text once its turn ends. The message box draft is not touched.
+    pub(crate) fn ask_active_thread(
+        &mut self,
+        prompt: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Task<Result<String>>> {
+        let thread_view = self
+            .active_thread()
+            .cloned()
+            .context("The agent thread isn't ready yet. Ask again once it is.")?;
+        let thread = thread_view.read(cx).thread.clone();
+        // A turn in progress would end first and be taken for the answer.
+        if thread.read(cx).status() != ThreadStatus::Idle {
+            return Err(anyhow!(
+                "The agent is still working on something else. Ask again when it is done."
+            ));
+        }
+        let first_new_entry = thread.read(cx).entries().len();
+
+        let (answer_tx, answer_rx) = futures::channel::oneshot::channel();
+        let mut answer_tx = Some(answer_tx);
+        let subscription = cx.subscribe(&thread, move |_, thread, event, cx| {
+            let result = match event {
+                AcpThreadEvent::Stopped { .. } => {
+                    Ok(final_answer(thread.read(cx), first_new_entry, cx))
+                }
+                AcpThreadEvent::Error => Err(anyhow!("The agent stopped with an error.")),
+                AcpThreadEvent::Refusal => Err(anyhow!("The agent refused to answer.")),
+                AcpThreadEvent::ConnectionLost => Err(anyhow!("The agent's connection was lost.")),
+                _ => return,
+            };
+            if let Some(answer_tx) = answer_tx.take() {
+                // The receiver is gone when the inline assist was stopped.
+                answer_tx.send(result).ok();
+            }
+        });
+
+        thread_view.update(cx, |thread_view, cx| {
+            thread_view.send_content(
+                Task::ready(Ok(Some((vec![prompt.into()], Vec::new())))),
+                false,
+                window,
+                cx,
+            );
+        });
+
+        Ok(cx.spawn(async move |_, _| {
+            let _subscription = subscription;
+            answer_rx
+                .await
+                .map_err(|_| anyhow!("The agent thread was closed before it answered."))?
+        }))
+    }
+
     fn current_model_name(&self, cx: &App) -> SharedString {
         // For native agent (Zed Agent), use the specific model name (e.g., "Claude 3.5 Sonnet")
         // For ACP agents, use the agent name (e.g., "Claude Agent", "Gemini CLI")
@@ -4320,16 +4377,25 @@ pub(crate) fn review_question(comments: &[ReviewCommentForAgent], cx: &App) -> S
                 let start = range.start.to_point(buffer).row + 1;
                 let end = range.end.to_point(buffer).row + 1;
                 let code: String = buffer.text_for_range(range.clone()).collect();
-                (format!("`{path}` lines {start}-{end}"), format!("```\n{code}\n```"))
+                (
+                    format!("`{path}` lines {start}-{end}"),
+                    format!("```\n{code}\n```"),
+                )
             }
             ReviewCommentCode::Diff {
                 text,
                 row,
                 starts_on_removed_line,
             } => {
-                let file = if *starts_on_removed_line { "old" } else { "current" };
+                let file = if *starts_on_removed_line {
+                    "old"
+                } else {
+                    "current"
+                };
                 (
-                    format!("`{path}`, diff from line {row} of the {file} file (removed lines start with -)"),
+                    format!(
+                        "`{path}`, diff from line {row} of the {file} file (removed lines start with -)"
+                    ),
                     format!("```diff\n{text}```"),
                 )
             }
@@ -4350,17 +4416,27 @@ fn review_comment_label(id: usize) -> String {
 /// The comment ID a line of the answer starts a section for: `R3:`, and
 /// variants agents produce such as `**R3:**`, `### R3` or `- R3 -`.
 fn review_answer_section(line: &str) -> Option<(usize, &str)> {
-    let line = line.trim_start_matches(|c: char| c == '#' || c == '*' || c == '-' || c.is_whitespace());
+    let line =
+        line.trim_start_matches(|c: char| c == '#' || c == '*' || c == '-' || c.is_whitespace());
     let rest = line.strip_prefix('R')?;
     let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
     let number: usize = rest[..digits].parse().ok()?;
     let rest = &rest[digits..];
     let next = rest.chars().next();
-    if !matches!(next, None | Some(':' | '*' | ' ' | ')' | '.' | '-' | '\u{2014}')) {
+    if !matches!(
+        next,
+        None | Some(':' | '*' | ' ' | ')' | '.' | '-' | '\u{2014}')
+    ) {
         return None;
     }
     let text = rest.trim_start_matches(|c: char| {
-        c == ':' || c == '*' || c == ')' || c == '.' || c == '-' || c == '\u{2014}' || c.is_whitespace()
+        c == ':'
+            || c == '*'
+            || c == ')'
+            || c == '.'
+            || c == '-'
+            || c == '\u{2014}'
+            || c.is_whitespace()
     });
     Some((number.checked_sub(1)?, text))
 }
@@ -4369,7 +4445,10 @@ fn review_answer_section(line: &str) -> Option<(usize, &str)> {
 /// asked for in [`review_question`]. Without any sections, the whole answer
 /// goes under the first comment; comments the answer skips are marked not
 /// answered, so the next review sends them again.
-pub(crate) fn split_review_answer(ids: &[usize], answer: Result<String>) -> Vec<(usize, AgentReply)> {
+pub(crate) fn split_review_answer(
+    ids: &[usize],
+    answer: Result<String>,
+) -> Vec<(usize, AgentReply)> {
     let answer = match answer {
         Ok(answer) => answer,
         Err(error) => {
@@ -4421,7 +4500,9 @@ pub(crate) fn split_review_answer(ids: &[usize], answer: Result<String>) -> Vec<
     ids.iter()
         .map(|id| {
             let reply = match sections.remove(id) {
-                Some(text) if !text.trim().is_empty() => AgentReply::Answered(text.trim().to_string()),
+                Some(text) if !text.trim().is_empty() => {
+                    AgentReply::Answered(text.trim().to_string())
+                }
                 _ => AgentReply::Failed("The agent didn't answer this comment.".to_string()),
             };
             (*id, reply)
@@ -15828,27 +15909,21 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    async fn test_insert_review_comments(cx: &mut TestAppContext) {
+    async fn test_review_question_labels_each_comment(cx: &mut TestAppContext) {
         init_test(cx);
-
-        let (conversation_view, cx) =
-            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
-        add_to_workspace(conversation_view.clone(), cx);
-
-        let project = conversation_view.read_with(cx, |view, _| view.project.clone());
-        let buffer = project.update(cx, |project, cx| {
-            project.create_local_buffer("let a = 10 + 10;", None, false, cx)
-        });
+        let buffer = cx.new(|cx| Buffer::local("fn a() {}\nlet x = 10 + 10;\n", cx));
         let range = buffer.read_with(cx, |buffer, _| {
-            buffer.anchor_before(8)..buffer.anchor_after(15)
+            buffer.anchor_before(Point::new(1, 0))..buffer.anchor_after(Point::new(1, 16))
         });
         let comments = vec![
             ReviewCommentForAgent {
+                id: 0,
                 file_path: util::rel_path::rel_path("src/a.rs").into_arc(),
                 code: ReviewCommentCode::Buffer { buffer, range },
                 comment: "Use a constant".to_string(),
             },
             ReviewCommentForAgent {
+                id: 4,
                 file_path: util::rel_path::rel_path("src/b.rs").into_arc(),
                 code: ReviewCommentCode::Diff {
                     text: "-old\n".to_string(),
@@ -15858,28 +15933,69 @@ pub(crate) mod tests {
                 comment: "Why was this removed?".to_string(),
             },
         ];
+        let question = cx.update(|cx| review_question(&comments, cx));
+        assert!(question.starts_with("Review comments on the diff."));
+        assert!(
+            question
+                .contains("R1: `src/a.rs` lines 2-2\n```\nlet x = 10 + 10;\n```\nUse a constant\n")
+        );
+        assert!(question.contains(
+            "R5: `src/b.rs`, diff from line 3 of the old file (removed lines start with -)\n\
+             ```diff\n-old\n```\nWhy was this removed?\n"
+        ));
+    }
 
-        let blocker = conversation_view.read_with(cx, |view, cx| view.review_comments_blocker(cx));
-        assert_eq!(blocker, None);
-        conversation_view.update_in(cx, |view, window, cx| {
-            view.insert_review_comments(comments, window, cx)
-        });
+    #[test]
+    fn test_split_review_answer() {
+        let answered = |text: &str| AgentReply::Answered(text.to_string());
 
-        let message_editor = message_editor(&conversation_view, cx);
-        message_editor.read_with(cx, |editor, cx| {
-            assert_eq!(
-                editor.text(cx),
-                "Review comments on the diff:\n\n\
-                 `src/a.rs`: selection \nUse a constant\n\n\
-                 `src/b.rs` (diff from line 3 of the old file, removed lines start with -):\n\
-                 ```diff\n-old\n```\nWhy was this removed?\n\n"
-            );
-        });
+        // Plain, bold and heading section markers.
+        let answer =
+            "Sure.\nR1: It was slow.\nMore detail.\n**R2:** Fixed it.\n### R3\nNo change needed.";
+        assert_eq!(
+            split_review_answer(&[0, 1, 2], Ok(answer.to_string())),
+            vec![
+                (0, answered("It was slow.\nMore detail.")),
+                (1, answered("Fixed it.")),
+                (2, answered("No change needed.")),
+            ]
+        );
 
-        // A read-only message box (a restored draft) must not take the comments.
-        message_editor.update(cx, |editor, cx| editor.set_read_only(true, cx));
-        let blocker = conversation_view.read_with(cx, |view, cx| view.review_comments_blocker(cx));
-        assert!(blocker.is_some());
+        // A skipped comment is not answered, so it is sent again.
+        assert_eq!(
+            split_review_answer(&[0, 1], Ok("R1: Done.".to_string())),
+            vec![
+                (0, answered("Done.")),
+                (
+                    1,
+                    AgentReply::Failed("The agent didn't answer this comment.".to_string())
+                ),
+            ]
+        );
+
+        // Words starting with R are not section markers.
+        assert_eq!(
+            split_review_answer(&[0], Ok("Refactored it.\nRR2 nothing".to_string())),
+            vec![(0, answered("Refactored it.\nRR2 nothing"))]
+        );
+
+        // No sections: the whole answer goes under the first comment.
+        assert_eq!(
+            split_review_answer(&[3, 7], Ok("All good.".to_string())),
+            vec![
+                (3, answered("All good.")),
+                (7, answered("Answered together with R4.")),
+            ]
+        );
+
+        // A failed send marks every comment.
+        assert_eq!(
+            split_review_answer(&[0, 1], Err(anyhow!("The agent is busy."))),
+            vec![
+                (0, AgentReply::Failed("The agent is busy.".to_string())),
+                (1, AgentReply::Failed("The agent is busy.".to_string())),
+            ]
+        );
     }
 
     #[gpui::test]

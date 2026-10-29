@@ -47074,7 +47074,7 @@ fn test_review_comments_for_agent_are_sorted_and_located(cx: &mut TestAppContext
         build_editor(buffer, window, cx)
     });
 
-    _ = editor.update(cx, |editor: &mut Editor, _window, cx| {
+    _ = editor.update(cx, |editor: &mut Editor, window, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let line_three =
             snapshot.anchor_before(Point::new(2, 0))..snapshot.anchor_after(Point::new(2, 5));
@@ -47084,8 +47084,10 @@ fn test_review_comments_for_agent_are_sorted_and_located(cx: &mut TestAppContext
         editor.add_review_comment(key.clone(), "Second".to_string(), line_three, cx);
         editor.add_review_comment(key, "First".to_string(), line_one, cx);
 
-        let comments = editor.take_review_comments_for_agent(cx);
-        assert_eq!(editor.total_review_comment_count(), 0);
+        let comments = editor.send_review_comments_to_agent(window, cx);
+        // Sent comments stay in the diff, waiting for the agent's answers.
+        assert_eq!(editor.total_review_comment_count(), 2);
+        assert_eq!(editor.unsent_review_comment_count(), 0);
 
         let summary = comments
             .iter()
@@ -47136,7 +47138,7 @@ async fn test_review_comments_for_agent_keep_removed_lines(cx: &mut TestAppConte
     cx.run_until_parked();
 
     // Multi-buffer rows: 0 "aaa", 1 "XXX" (removed), 2 "bbb", 3 "ccc"
-    cx.update_editor(|editor, _window, cx| {
+    cx.update_editor(|editor, window, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let anchors =
             |start: Point, end: Point| snapshot.anchor_before(start)..snapshot.anchor_after(end);
@@ -47163,7 +47165,7 @@ async fn test_review_comments_for_agent_keep_removed_lines(cx: &mut TestAppConte
             cx,
         );
 
-        let comments = editor.take_review_comments_for_agent(cx);
+        let comments = editor.send_review_comments_to_agent(window, cx);
         let summary = comments
             .iter()
             .map(|comment| match &comment.code {
@@ -47192,6 +47194,82 @@ async fn test_review_comments_for_agent_keep_removed_lines(cx: &mut TestAppConte
                 "Why remove this?: diff 2 true\n-XXX\n".to_string(),
                 "Current: buffer ccc".to_string(),
             ]
+        );
+    });
+}
+
+#[gpui::test]
+fn test_review_comment_agent_replies(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("one\ntwo\nthree\n", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    _ = editor.update(cx, |editor: &mut Editor, window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let line = |row| {
+            snapshot.anchor_before(Point::new(row, 0))..snapshot.anchor_after(Point::new(row, 3))
+        };
+        let key = test_hunk_key_with_anchor("file.rs", line(0).start);
+        let first = editor.add_review_comment(key.clone(), "Why?".to_string(), line(0), cx);
+        let second = editor.add_review_comment(key.clone(), "And this?".to_string(), line(1), cx);
+        let reply_of = |editor: &Editor, id: usize| {
+            editor
+                .stored_review_comments
+                .iter()
+                .flat_map(|(_, comments)| comments)
+                .find(|comment| comment.id == id)
+                .map(|comment| comment.agent_reply.clone())
+        };
+
+        let sent = editor.send_review_comments_to_agent(window, cx);
+        assert_eq!(
+            sent.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(reply_of(editor, first), Some(AgentReply::Waiting));
+        // Nothing is sent twice while waiting.
+        assert!(editor.send_review_comments_to_agent(window, cx).is_empty());
+
+        editor.set_review_comment_replies(
+            vec![
+                (first, AgentReply::Answered("Because.".to_string())),
+                (second, AgentReply::Failed("skipped".to_string())),
+            ],
+            window,
+            cx,
+        );
+        assert_eq!(
+            reply_of(editor, first),
+            Some(AgentReply::Answered("Because.".to_string()))
+        );
+        // Unanswered comments are sent again; answered ones are not.
+        assert_eq!(editor.unsent_review_comment_count(), 1);
+        let resent = editor.send_review_comments_to_agent(window, cx);
+        assert_eq!(
+            resent.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![second]
+        );
+
+        // Editing an answered comment makes it a new question.
+        editor.update_review_comment(first, "Why exactly?".to_string(), cx);
+        assert_eq!(reply_of(editor, first), Some(AgentReply::NotSent));
+        assert_eq!(editor.unsent_review_comment_count(), 1);
+
+        // The review box grows with the answer it shows.
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let before = editor.calculate_overlay_height(&key, true, &snapshot);
+        editor.set_review_comment_replies(
+            vec![(first, AgentReply::Answered("a\nb\nc\nd".to_string()))],
+            window,
+            cx,
+        );
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        assert_eq!(
+            editor.calculate_overlay_height(&key, true, &snapshot),
+            before + 5
         );
     });
 }

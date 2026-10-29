@@ -10,7 +10,9 @@ use crate::context::load_context;
 use crate::mention_set::MentionSet;
 use crate::{
     AgentPanel,
-    buffer_codegen::{BufferCodegen, CodegenAlternative, CodegenEvent},
+    buffer_codegen::{
+        BufferCodegen, CodegenAlternative, CodegenEvent, InlineAssistAsksAgentThread,
+    },
     inline_prompt_editor::{CodegenStatus, InlineAssistId, PromptEditor, PromptEditorEvent},
     terminal_inline_assistant::TerminalInlineAssistant,
 };
@@ -227,8 +229,10 @@ impl InlineAssistant {
             return;
         };
         let agent_panel = agent_panel.read(cx);
+        let has_agent_thread = agent_panel.active_conversation_view().is_some();
 
         let thread_store = agent_panel.thread_store().clone();
+        let is_editor_target = matches!(inline_assist_target, InlineAssistTarget::Editor(_));
 
         let handle_assist =
             |window: &mut Window, cx: &mut Context<Workspace>| match inline_assist_target {
@@ -260,7 +264,19 @@ impl InlineAssistant {
                 }
             };
 
-        if let Some(error) = configuration_error(cx) {
+        // Asking the agent thread needs no inline model, so a missing model
+        // provider only matters for the inline model mode. Without a provider
+        // but with an agent thread open, open the box asking the agent.
+        let asks_agent_thread = cx
+            .try_global::<InlineAssistAsksAgentThread>()
+            .is_some_and(|asks| asks.0);
+        if is_editor_target
+            && configuration_error(cx).is_some()
+            && (asks_agent_thread || has_agent_thread)
+        {
+            cx.set_global(InlineAssistAsksAgentThread(true));
+            handle_assist(window, cx);
+        } else if let Some(error) = configuration_error(cx) {
             if let ConfigurationError::ProviderNotAuthenticated(provider) = error {
                 cx.spawn(async move |_, cx| {
                     cx.update(|cx| provider.authenticate(cx)).await?;
@@ -1255,6 +1271,13 @@ impl InlineAssistant {
         }
 
         let Some(model) = LanguageModelRegistry::read_global(cx).inline_assistant_model() else {
+            let reason = Task::ready(Err(anyhow!(
+                "No inline model is configured. Ask the agent thread instead (chat icon), \
+                 or configure an LLM provider in the agent settings."
+            )));
+            assist
+                .codegen
+                .update(cx, |codegen, cx| codegen.start_with_answer(reason, cx));
             return;
         };
 
