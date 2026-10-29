@@ -3800,6 +3800,64 @@ impl ConversationView {
         None
     }
 
+    /// Sends `prompt` to the active agent thread (whichever ACP agent it runs:
+    /// Codex, Claude Code, ...) through the usual send path, so it shows in the
+    /// thread like a typed message. The task resolves with the agent's final
+    /// answer text once its turn ends. The message box draft is not touched.
+    pub(crate) fn ask_active_thread(
+        &mut self,
+        prompt: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Task<Result<String>>> {
+        let thread_view = self
+            .active_thread()
+            .cloned()
+            .context("The agent thread isn't ready yet. Ask again once it is.")?;
+        let thread = thread_view.read(cx).thread.clone();
+        // A turn in progress would end first and be taken for the answer.
+        if thread.read(cx).status() != ThreadStatus::Idle {
+            return Err(anyhow!(
+                "The agent is still working on something else. Ask again when it is done."
+            ));
+        }
+        let first_new_entry = thread.read(cx).entries().len();
+
+        let (answer_tx, answer_rx) = futures::channel::oneshot::channel();
+        let mut answer_tx = Some(answer_tx);
+        let subscription = cx.subscribe(&thread, move |_, thread, event, cx| {
+            let result = match event {
+                AcpThreadEvent::Stopped { .. } => {
+                    Ok(final_answer(thread.read(cx), first_new_entry, cx))
+                }
+                AcpThreadEvent::Error => Err(anyhow!("The agent stopped with an error.")),
+                AcpThreadEvent::Refusal => Err(anyhow!("The agent refused to answer.")),
+                AcpThreadEvent::ConnectionLost => Err(anyhow!("The agent's connection was lost.")),
+                _ => return,
+            };
+            if let Some(answer_tx) = answer_tx.take() {
+                // The receiver is gone when the inline assist was stopped.
+                answer_tx.send(result).ok();
+            }
+        });
+
+        thread_view.update(cx, |thread_view, cx| {
+            thread_view.send_content(
+                Task::ready(Ok(Some((vec![prompt.into()], Vec::new())))),
+                false,
+                window,
+                cx,
+            );
+        });
+
+        Ok(cx.spawn(async move |_, _| {
+            let _subscription = subscription;
+            answer_rx
+                .await
+                .map_err(|_| anyhow!("The agent thread was closed before it answered."))?
+        }))
+    }
+
     /// Inserts review comments into the active thread's message box without
     /// sending it. Check `review_comments_blocker` first.
     pub(crate) fn insert_review_comments(
@@ -4360,6 +4418,38 @@ fn plan_label_markdown_style(
             ..default_md_style.base_text_style
         },
         ..default_md_style
+    }
+}
+
+/// The text of the last assistant message from `first_entry` on: the agent's
+/// final answer for the turn, without its reasoning.
+fn final_answer(thread: &AcpThread, first_entry: usize, cx: &App) -> String {
+    let answer = thread
+        .entries()
+        .get(first_entry..)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            AgentThreadEntry::AssistantMessage(message) => Some(
+                message
+                    .chunks
+                    .iter()
+                    .filter_map(|chunk| match chunk {
+                        AssistantMessageChunk::Message { block, .. } => Some(block.to_markdown(cx)),
+                        AssistantMessageChunk::Thought { .. } => None,
+                    })
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if answer.trim().is_empty() {
+        "The agent finished without a text answer; see the agent thread.".to_string()
+    } else {
+        answer
     }
 }
 
@@ -15782,6 +15872,53 @@ pub(crate) mod tests {
         message_editor.update(cx, |editor, cx| editor.set_read_only(true, cx));
         let blocker = conversation_view.read_with(cx, |view, cx| view.review_comments_blocker(cx));
         assert!(blocker.is_some());
+    }
+
+    #[gpui::test]
+    async fn test_ask_active_thread_returns_the_final_answer(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk::new(
+                "thinking about it".into(),
+            )),
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                "Because it was slow.".into(),
+            )),
+        ]);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("my unsent draft", window, cx)
+        });
+
+        let answer = conversation_view
+            .update_in(cx, |view, window, cx| {
+                view.ask_active_thread("Why did you change this?".to_string(), window, cx)
+            })
+            .expect("the thread is idle");
+        cx.run_until_parked();
+        assert_eq!(answer.await.unwrap(), "Because it was slow.");
+
+        // The question is in the thread like a typed message, and the draft in
+        // the message box is untouched.
+        let thread =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        thread.read_with(cx, |thread, _| {
+            assert!(
+                thread
+                    .entries()
+                    .iter()
+                    .any(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+            );
+        });
+        message_editor.read_with(cx, |editor, cx| {
+            assert_eq!(editor.text(cx), "my unsent draft");
+        });
     }
 
     #[gpui::test]

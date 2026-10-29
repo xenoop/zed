@@ -42,6 +42,7 @@ use std::{
     time::Instant,
 };
 use streaming_diff::{CharOperation, LineDiff, LineOperation, StreamingDiff};
+use util::ResultExt as _;
 use uuid::Uuid;
 
 /// Use this tool when you cannot or should not make a rewrite. This includes:
@@ -64,6 +65,13 @@ pub struct RewriteSectionInput {
     pub replacement_text: String,
 }
 
+/// Whether new inline assists ask the agent thread instead of the inline
+/// model; the last choice is kept for the rest of the session.
+#[derive(Default)]
+pub struct InlineAssistAsksAgentThread(pub bool);
+
+impl gpui::Global for InlineAssistAsksAgentThread {}
+
 pub struct BufferCodegen {
     alternatives: Vec<Entity<CodegenAlternative>>,
     pub active_alternative: usize,
@@ -74,6 +82,9 @@ pub struct BufferCodegen {
     initial_transaction_id: Option<TransactionId>,
     builder: Arc<PromptBuilder>,
     pub is_insertion: bool,
+    /// Send the prompt to the active agent thread (such as Codex) and show its
+    /// answer, instead of asking the inline assistant model for a rewrite.
+    pub ask_agent_thread: bool,
     session_id: Uuid,
 }
 
@@ -109,6 +120,9 @@ impl BufferCodegen {
             range,
             initial_transaction_id,
             builder,
+            ask_agent_thread: cx
+                .try_global::<InlineAssistAsksAgentThread>()
+                .is_some_and(|asks| asks.0),
             session_id,
         };
         this.activate(0, cx);
@@ -141,6 +155,9 @@ impl BufferCodegen {
     }
 
     pub fn alternative_count(&self, cx: &App) -> usize {
+        if self.ask_agent_thread {
+            return 1;
+        }
         LanguageModelRegistry::read_global(cx)
             .inline_alternative_models()
             .len()
@@ -211,6 +228,18 @@ impl BufferCodegen {
         }
 
         Ok(())
+    }
+
+    /// Shows the answer the agent thread gives once `answer` resolves. The
+    /// agent edits files itself, so nothing is written to the buffer here.
+    pub fn start_with_answer(&mut self, answer: Task<Result<String>>, cx: &mut Context<Self>) {
+        self.active_alternative()
+            .update(cx, |alternative, cx| alternative.undo(cx));
+        self.activate(0, cx);
+        self.alternatives.truncate(1);
+        self.active_alternative().update(cx, |alternative, cx| {
+            alternative.start_with_answer(answer, cx)
+        });
     }
 
     pub fn stop(&mut self, cx: &mut Context<Self>) {
@@ -965,6 +994,36 @@ impl CodegenAlternative {
         self.selected_text.as_deref()
     }
 
+    fn start_with_answer(&mut self, answer: Task<Result<String>>, cx: &mut Context<Self>) {
+        self.description = None;
+        self.failure = None;
+        if let Some(transformation_transaction_id) = self.transformation_transaction_id.take() {
+            self.buffer.update(cx, |buffer, cx| {
+                buffer.undo_transaction(transformation_transaction_id, cx);
+            });
+        }
+        self.status = CodegenStatus::Pending;
+        cx.notify();
+        self.generation = cx.spawn(async move |this, cx| {
+            let answer = answer.await;
+            this.update(cx, |this, cx| {
+                match answer {
+                    Ok(text) => {
+                        this.description = Some(text);
+                        this.status = CodegenStatus::Done;
+                    }
+                    Err(error) => {
+                        this.failure = Some(error.to_string());
+                        this.status = CodegenStatus::Error(error);
+                    }
+                }
+                cx.emit(CodegenEvent::Finished);
+                cx.notify();
+            })
+            .log_err();
+        });
+    }
+
     pub fn stop(&mut self, cx: &mut Context<Self>) {
         self.last_equal_ranges.clear();
         if self.diff.is_empty() {
@@ -1653,6 +1712,65 @@ mod tests {
     use rand::prelude::*;
     use settings::SettingsStore;
     use std::{future, sync::Arc};
+
+    #[gpui::test]
+    async fn test_answer_from_agent_thread(cx: &mut TestAppContext) {
+        init_test(cx);
+        let text = "fn main() {}\n";
+        let buffer = cx.new(|cx| Buffer::local(text, cx).with_language(rust_lang(), cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let range = buffer.read_with(cx, |buffer, cx| {
+            let snapshot = buffer.snapshot(cx);
+            snapshot.anchor_before(Point::new(0, 0))..snapshot.anchor_after(Point::new(0, 12))
+        });
+        let prompt_builder = Arc::new(PromptBuilder::new(None).unwrap());
+        let codegen = cx.new(|cx| {
+            CodegenAlternative::new(
+                buffer.clone(),
+                range.clone(),
+                true,
+                prompt_builder,
+                Uuid::new_v4(),
+                cx,
+            )
+        });
+
+        let (answer_tx, answer_rx) = futures::channel::oneshot::channel::<Result<String>>();
+        codegen.update(cx, |codegen, cx| {
+            codegen.start_with_answer(cx.background_spawn(async move { answer_rx.await? }), cx)
+        });
+        codegen.read_with(cx, |codegen, _| {
+            assert!(matches!(codegen.status, CodegenStatus::Pending));
+            assert_eq!(codegen.description, None);
+        });
+
+        answer_tx
+            .send(Ok("Because `main` is the entry point.".to_string()))
+            .unwrap();
+        cx.run_until_parked();
+        codegen.read_with(cx, |codegen, _| {
+            assert!(matches!(codegen.status, CodegenStatus::Done));
+            assert_eq!(
+                codegen.description.as_deref(),
+                Some("Because `main` is the entry point.")
+            );
+        });
+        // The agent edits files itself; the inline assist never writes.
+        buffer.read_with(cx, |buffer, cx| assert_eq!(buffer.read(cx).text(), text));
+
+        codegen.update(cx, |codegen, cx| {
+            codegen.start_with_answer(Task::ready(Err(anyhow!("Open an agent thread first."))), cx)
+        });
+        cx.run_until_parked();
+        codegen.read_with(cx, |codegen, _| {
+            assert!(matches!(codegen.status, CodegenStatus::Error(_)));
+            assert_eq!(codegen.description, None);
+            assert_eq!(
+                codegen.failure.as_deref(),
+                Some("Open an agent thread first.")
+            );
+        });
+    }
 
     #[gpui::test(iterations = 10)]
     async fn test_transform_autoindent(cx: &mut TestAppContext, mut rng: StdRng) {
