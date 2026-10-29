@@ -57,6 +57,10 @@ actions!(
         LeaderAndFollower,
         /// Compare with a specific branch
         CompareWithBranch,
+        /// Shows the changes since the current branch was last marked as reviewed
+        /// (`refs/xen/reviewed/<branch>`), or since the default branch when it
+        /// has no marker.
+        DiffSinceReviewed,
     ]
 );
 

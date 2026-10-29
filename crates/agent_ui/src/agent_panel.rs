@@ -631,6 +631,53 @@ pub fn init(cx: &mut App) {
                     },
                 )
                 .register_action(
+                    |workspace: &mut Workspace,
+                     _: &editor::actions::SendReviewToAgent,
+                     window,
+                     cx| {
+                        let Some(agent_panel) = workspace.panel::<AgentPanel>(cx) else {
+                            return;
+                        };
+                        let Some(editor) = workspace
+                            .active_item(cx)
+                            .and_then(|item| item.act_as::<Editor>(cx))
+                        else {
+                            return;
+                        };
+                        // Check for a thread before taking the comments, so they
+                        // are kept when there is nowhere to send them.
+                        let conversation_view = agent_panel
+                            .read(cx)
+                            .active_conversation_view()
+                            .filter(|view| view.read(cx).active_thread().is_some())
+                            .cloned();
+                        let Some(conversation_view) = conversation_view else {
+                            struct NoAgentThreadForReview;
+                            workspace.show_toast(
+                                workspace::Toast::new(
+                                    workspace::notifications::NotificationId::unique::<
+                                        NoAgentThreadForReview,
+                                    >(),
+                                    "Open an agent thread to send the review to, then send it again.",
+                                ),
+                                cx,
+                            );
+                            workspace.focus_panel::<AgentPanel>(window, cx);
+                            return;
+                        };
+
+                        let comments =
+                            editor.update(cx, |editor, cx| editor.take_review_comments_for_agent(cx));
+                        if comments.is_empty() {
+                            return;
+                        }
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                        conversation_view.update(cx, |conversation_view, cx| {
+                            conversation_view.insert_review_comments(comments, window, cx);
+                        });
+                    },
+                )
+                .register_action(
                     |workspace: &mut Workspace, _: &AddSelectionToThread, window, cx| {
                         let Some(agent_panel) = workspace.panel::<AgentPanel>(cx) else {
                             return;
