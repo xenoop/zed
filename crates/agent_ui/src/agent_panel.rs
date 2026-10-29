@@ -644,26 +644,17 @@ pub fn init(cx: &mut App) {
                         else {
                             return;
                         };
-                        if editor.read(cx).total_review_comment_count() == 0 {
+                        if editor.read(cx).unsent_review_comment_count() == 0 {
                             return;
                         }
-                        // Check the destination before taking the comments, so
-                        // they stay in the diff when they cannot be inserted.
-                        let conversation_view =
-                            agent_panel.read(cx).active_conversation_view().cloned();
-                        let blocker = match &conversation_view {
-                            None => Some(
-                                "Open an agent thread to send the review to, then send it again.",
-                            ),
-                            Some(view) => view.read(cx).review_comments_blocker(cx),
-                        };
-                        let Some(conversation_view) = conversation_view.filter(|_| blocker.is_none())
+                        let Some(conversation_view) =
+                            agent_panel.read(cx).active_conversation_view().cloned()
                         else {
                             struct ReviewNotSent;
                             workspace.show_toast(
                                 workspace::Toast::new(
                                     workspace::notifications::NotificationId::unique::<ReviewNotSent>(),
-                                    blocker.unwrap_or_default(),
+                                    "Open an agent thread (Codex, Claude Code, ...) to send the review to, then send it again.",
                                 ),
                                 cx,
                             );
@@ -671,14 +662,28 @@ pub fn init(cx: &mut App) {
                             return;
                         };
 
-                        let comments =
-                            editor.update(cx, |editor, cx| editor.take_review_comments_for_agent(cx));
-                        workspace.focus_panel::<AgentPanel>(window, cx);
-                        conversation_view.update(cx, |_, cx| {
-                            cx.defer_in(window, move |conversation_view, window, cx| {
-                                conversation_view.insert_review_comments(comments, window, cx);
-                            });
+                        // The comments stay in the diff, waiting; the agent's
+                        // answer is split per comment and shown under each.
+                        let comments = editor.update(cx, |editor, cx| {
+                            editor.send_review_comments_to_agent(window, cx)
                         });
+                        let ids: Vec<usize> = comments.iter().map(|comment| comment.id).collect();
+                        let question = crate::conversation_view::review_question(&comments, cx);
+                        let answer = conversation_view.update(cx, |view, cx| {
+                            view.ask_active_thread(question, window, cx)
+                        });
+                        let editor = editor.downgrade();
+                        cx.spawn_in(window, async move |_, cx| {
+                            let answer = match answer {
+                                Ok(answer) => answer.await,
+                                Err(error) => Err(error),
+                            };
+                            let replies = crate::conversation_view::split_review_answer(&ids, answer);
+                            editor.update_in(cx, |editor, window, cx| {
+                                editor.set_review_comment_replies(replies, window, cx)
+                            })
+                        })
+                        .detach_and_log_err(cx);
                     },
                 )
                 .register_action(
