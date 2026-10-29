@@ -177,6 +177,47 @@ pub(super) struct StoredReviewComment {
     pub(super) range: Range<Anchor>,
     /// Whether this comment is currently being edited inline.
     pub(super) is_editing: bool,
+    /// The agent's answer to this comment, once sent.
+    pub(super) agent_reply: AgentReply,
+}
+
+/// Answers longer than this scroll inside their comment.
+const MAX_AGENT_REPLY_LINES: u32 = 14;
+
+/// Lines an agent reply takes under its comment (an estimate: the review box
+/// height is set in editor lines before the text is laid out).
+fn agent_reply_height(reply: &AgentReply) -> u32 {
+    const CHARS_PER_LINE: usize = 90;
+    match reply {
+        AgentReply::NotSent => 0,
+        AgentReply::Waiting | AgentReply::Failed(_) => 1,
+        AgentReply::Answered(text) => {
+            let lines: usize = text
+                .lines()
+                .map(|line| line.chars().count().div_ceil(CHARS_PER_LINE).max(1))
+                .sum();
+            // One more line for the reply's header and padding.
+            (lines as u32).clamp(1, MAX_AGENT_REPLY_LINES) + 1
+        }
+    }
+}
+
+/// Where a review comment is in its exchange with the agent thread.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum AgentReply {
+    #[default]
+    NotSent,
+    Waiting,
+    Answered(String),
+    /// Not answered (the send failed or the agent skipped it); sent again
+    /// with the next review.
+    Failed(String),
+}
+
+impl AgentReply {
+    fn needs_sending(&self) -> bool {
+        matches!(self, Self::NotSent | Self::Failed(_))
+    }
 }
 
 /// Represents an active diff review overlay that appears when clicking the "Add Review" button.
@@ -216,6 +257,8 @@ impl DiffReviewDragState {
 
 /// A review comment taken out of an editor for sending to an agent thread.
 pub struct ReviewCommentForAgent {
+    /// The stored comment's ID, for matching the agent's answer to it.
+    pub id: usize,
     /// The file path (relative to worktree) of the hunk the comment was left on.
     pub file_path: Arc<util::rel_path::RelPath>,
     pub code: ReviewCommentCode,
@@ -247,6 +290,7 @@ impl StoredReviewComment {
             comment,
             range: anchor_range,
             is_editing: false,
+            agent_reply: AgentReply::NotSent,
         }
     }
 }
@@ -779,6 +823,16 @@ impl Editor {
             .sum()
     }
 
+    /// Comments that the next "Send Review to Agent" would send: new ones,
+    /// edited ones and ones the agent did not answer.
+    pub fn unsent_review_comment_count(&self) -> usize {
+        self.stored_review_comments
+            .iter()
+            .flat_map(|(_, comments)| comments)
+            .filter(|comment| comment.agent_reply.needs_sending())
+            .count()
+    }
+
     /// Adds a new review comment to a specific hunk.
     pub(super) fn add_review_comment(
         &mut self,
@@ -807,7 +861,7 @@ impl Editor {
         }
 
         cx.emit(EditorEvent::ReviewCommentsChanged {
-            total_count: self.total_review_comment_count(),
+            total_count: self.unsent_review_comment_count(),
         });
         cx.notify();
         id
@@ -1195,7 +1249,7 @@ impl Editor {
             if let Some(index) = comments.iter().position(|c| c.id == id) {
                 comments.remove(index);
                 cx.emit(EditorEvent::ReviewCommentsChanged {
-                    total_count: self.total_review_comment_count(),
+                    total_count: self.unsent_review_comment_count(),
                 });
                 cx.notify();
                 return true;
@@ -1215,8 +1269,9 @@ impl Editor {
             if let Some(comment) = comments.iter_mut().find(|c| c.id == id) {
                 comment.comment = new_comment;
                 comment.is_editing = false;
+                comment.agent_reply = AgentReply::NotSent;
                 cx.emit(EditorEvent::ReviewCommentsChanged {
-                    total_count: self.total_review_comment_count(),
+                    total_count: self.unsent_review_comment_count(),
                 });
                 cx.notify();
                 return true;
@@ -1248,7 +1303,7 @@ impl Editor {
     /// from accumulating.
     pub(super) fn cleanup_orphaned_review_comments(&mut self, cx: &mut Context<Self>) {
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let original_count = self.total_review_comment_count();
+        let original_count = self.unsent_review_comment_count();
 
         // Remove comments with invalid hunk anchors
         self.stored_review_comments
@@ -1265,7 +1320,7 @@ impl Editor {
         self.stored_review_comments
             .retain(|(_, comments)| !comments.is_empty());
 
-        let new_count = self.total_review_comment_count();
+        let new_count = self.unsent_review_comment_count();
         if new_count != original_count {
             cx.emit(EditorEvent::ReviewCommentsChanged {
                 total_count: new_count,
@@ -2101,8 +2156,14 @@ impl Editor {
         if comment_count == 0 {
             base_height
         } else if comments_expanded {
-            // Header (1 line) + 2 lines per comment
-            base_height + 1 + (comment_count as u32 * 2)
+            // Header (1 line) + 2 lines per comment, plus room for the agent's
+            // answer under each one.
+            let reply_lines: u32 = self
+                .comments_for_hunk(hunk_key, snapshot)
+                .iter()
+                .map(|comment| agent_reply_height(&comment.agent_reply))
+                .sum();
+            base_height + 1 + (comment_count as u32 * 2) + reply_lines
         } else {
             // Just header when collapsed
             base_height + 1
@@ -2782,7 +2843,8 @@ impl Editor {
         let comment_id = comment.id;
         let is_editing = inline_editor.is_some();
 
-        h_flex()
+        let agent_reply = comment.agent_reply.clone();
+        let comment_row = h_flex()
             .w_full()
             .items_center()
             .gap_2()
@@ -2870,6 +2932,74 @@ impl Editor {
             } else {
                 // Display mode: no action buttons for now (edit/delete not yet implemented)
                 gpui::Empty.into_any_element()
+            });
+
+        v_flex()
+            .w_full()
+            .child(comment_row)
+            .when(agent_reply != AgentReply::NotSent, |this| {
+                this.child(Self::render_agent_reply(
+                    comment_id,
+                    agent_reply,
+                    action_icon_size,
+                    colors,
+                ))
+            })
+    }
+
+    /// The agent's answer under a review comment.
+    fn render_agent_reply(
+        comment_id: usize,
+        reply: AgentReply,
+        action_icon_size: IconSize,
+        colors: &theme::ThemeColors,
+    ) -> impl IntoElement {
+        let (text, color, answered) = match reply {
+            AgentReply::NotSent => (String::new(), Color::Muted, false),
+            AgentReply::Waiting => ("Waiting for the agent…".to_string(), Color::Muted, false),
+            AgentReply::Answered(text) => (text, Color::Default, true),
+            AgentReply::Failed(reason) => (
+                format!("Not answered: {reason} It will be sent again with the next review."),
+                Color::Error,
+                false,
+            ),
+        };
+        h_flex()
+            .w_full()
+            .items_start()
+            .gap_2()
+            .ml_6()
+            .px_2()
+            .py_1()
+            .border_l_2()
+            .border_color(colors.border_variant)
+            .child(
+                Icon::new(IconName::ZedAgent)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                div()
+                    .id(("agent-reply", comment_id))
+                    .flex_1()
+                    .max_h(rems(MAX_AGENT_REPLY_LINES as f32 * 1.25))
+                    .overflow_y_scroll()
+                    .text_sm()
+                    .child(Label::new(text).size(LabelSize::Small).color(color)),
+            )
+            .when(answered, |this| {
+                this.child(
+                    IconButton::new(("resolve-review-comment", comment_id), IconName::Check)
+                        .icon_color(Color::Muted)
+                        .icon_size(action_icon_size)
+                        .tooltip(Tooltip::text("Resolve (removes the comment)"))
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(
+                                Box::new(crate::actions::DeleteReviewComment { id: comment_id }),
+                                cx,
+                            );
+                        }),
+                )
             })
     }
 
@@ -2941,31 +3071,75 @@ impl Editor {
 }
 
 impl Editor {
-    /// Takes all stored review comments, resolved to the code they were left
-    /// on, in the order they appear in the diff.
-    pub fn take_review_comments_for_agent(
+    /// The comments to send to the agent (new, edited or unanswered ones),
+    /// resolved to the code they were left on and in diff order. They stay in
+    /// the diff, waiting for the agent's answers (`set_review_comment_replies`).
+    pub fn send_review_comments_to_agent(
         &mut self,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<ReviewCommentForAgent> {
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let mut comments: Vec<(Point, ReviewCommentForAgent)> = Vec::new();
-        for (hunk_key, hunk_comments) in self.take_all_review_comments(cx) {
+        for (hunk_key, hunk_comments) in &self.stored_review_comments {
             for comment in hunk_comments {
+                if !comment.agent_reply.needs_sending() {
+                    continue;
+                }
                 let start = comment.range.start.to_point(&snapshot);
                 let end = comment.range.end.to_point(&snapshot);
                 let code = self.review_comment_code(&snapshot, &comment.range, start..end, cx);
                 comments.push((
                     start,
                     ReviewCommentForAgent {
+                        id: comment.id,
                         file_path: hunk_key.file_path.clone(),
                         code,
-                        comment: comment.comment,
+                        comment: comment.comment.clone(),
                     },
                 ));
             }
         }
         comments.sort_by_key(|(start, _)| *start);
-        comments.into_iter().map(|(_, comment)| comment).collect()
+        let comments: Vec<ReviewCommentForAgent> =
+            comments.into_iter().map(|(_, comment)| comment).collect();
+        let replies = comments
+            .iter()
+            .map(|comment| (comment.id, AgentReply::Waiting))
+            .collect();
+        self.set_review_comment_replies(replies, window, cx);
+        comments
+    }
+
+    /// Records the agent's answers by comment ID and resizes the review boxes
+    /// that show them.
+    pub fn set_review_comment_replies(
+        &mut self,
+        replies: Vec<(usize, AgentReply)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut replies: HashMap<usize, AgentReply> = replies.into_iter().collect();
+        let mut changed_hunks = Vec::new();
+        for (hunk_key, comments) in &mut self.stored_review_comments {
+            let mut changed = false;
+            for comment in comments.iter_mut() {
+                if let Some(reply) = replies.remove(&comment.id) {
+                    comment.agent_reply = reply;
+                    changed = true;
+                }
+            }
+            if changed {
+                changed_hunks.push(hunk_key.clone());
+            }
+        }
+        for hunk_key in &changed_hunks {
+            self.refresh_diff_review_overlay_height(hunk_key, window, cx);
+        }
+        cx.emit(EditorEvent::ReviewCommentsChanged {
+            total_count: self.unsent_review_comment_count(),
+        });
+        cx.notify();
     }
 
     fn review_comment_code(
@@ -3026,6 +3200,7 @@ impl Editor {
 
     /// Takes all stored comments from all hunks, clearing the storage.
     /// Returns a Vec of (hunk_key, comments) pairs.
+    #[cfg(test)]
     pub(super) fn take_all_review_comments(
         &mut self,
         cx: &mut Context<Self>,
