@@ -34,7 +34,7 @@ use zed_actions::{
 };
 
 use crate::agent_model_selector::AgentModelSelector;
-use crate::buffer_codegen::{BufferCodegen, CodegenAlternative};
+use crate::buffer_codegen::{BufferCodegen, CodegenAlternative, InlineAssistAsksAgentThread};
 use crate::completion_provider::{
     PromptCompletionProvider, PromptCompletionProviderDelegate, PromptContextType,
 };
@@ -122,6 +122,23 @@ impl<T: 'static> Render for PromptEditor<T> {
         };
 
         buttons.extend(self.render_buttons(window, cx));
+
+        let asks_agent_thread = match &self.mode {
+            PromptEditorMode::Buffer { codegen, .. } => Some(codegen.read(cx).ask_agent_thread),
+            PromptEditorMode::Terminal { .. } => None,
+        };
+        let ask_agent_toggle = asks_agent_thread.map(|asks| {
+            IconButton::new("ask-agent-thread", IconName::Chat)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .toggle_state(asks)
+                .tooltip(Tooltip::text(if asks {
+                    "Asking the agent thread (Codex, Claude Code, ...). Click to use the inline model."
+                } else {
+                    "Ask the agent thread (Codex, Claude Code, ...) instead of the inline model"
+                }))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_ask_agent_thread(cx)))
+        });
 
         let menu_visible = self.is_completions_menu_visible(cx);
         let add_context_button = IconButton::new("add-context", IconName::AtSign)
@@ -222,7 +239,11 @@ impl<T: 'static> Render for PromptEditor<T> {
                                     .items_center()
                                     .gap_1()
                                     .child(add_context_button)
-                                    .child(self.model_selector.clone())
+                                    .children(ask_agent_toggle)
+                                    // The agent thread uses its own model.
+                                    .when(asks_agent_thread != Some(true), |this| {
+                                        this.child(self.model_selector.clone())
+                                    })
                                     .children(buttons),
                             ),
                     ),
@@ -309,6 +330,18 @@ impl<T: 'static> Focusable for PromptEditor<T> {
 
 impl<T: 'static> PromptEditor<T> {
     const MAX_LINES: u8 = 8;
+
+    fn toggle_ask_agent_thread(&mut self, cx: &mut Context<Self>) {
+        if let PromptEditorMode::Buffer { codegen, .. } = &self.mode {
+            let asks = codegen.update(cx, |codegen, cx| {
+                codegen.ask_agent_thread = !codegen.ask_agent_thread;
+                cx.notify();
+                codegen.ask_agent_thread
+            });
+            cx.set_global(InlineAssistAsksAgentThread(asks));
+            cx.notify();
+        }
+    }
 
     fn codegen_status<'a>(&'a self, cx: &'a App) -> &'a CodegenStatus {
         match &self.mode {

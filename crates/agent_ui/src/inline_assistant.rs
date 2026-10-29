@@ -16,7 +16,7 @@ use crate::{
 };
 use agent::ThreadStore;
 use agent_settings::AgentSettings;
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet, VecDeque, hash_map};
 use editor::EditorSnapshot;
 use editor::MultiBufferOffset;
@@ -1245,6 +1245,15 @@ impl InlineAssistant {
             self.prompt_history.pop_front();
         }
 
+        if assist.codegen.read(cx).ask_agent_thread {
+            let question = agent_question(&assist.codegen, &assist.range, &user_prompt, cx);
+            let answer = ask_agent_thread(&assist.workspace, question, window, cx);
+            assist
+                .codegen
+                .update(cx, |codegen, cx| codegen.start_with_answer(answer, cx));
+            return;
+        }
+
         let Some(model) = LanguageModelRegistry::read_global(cx).inline_assistant_model() else {
             return;
         };
@@ -1628,6 +1637,68 @@ impl InlineAssistGroupId {
         self.0 += 1;
         id
     }
+}
+
+/// The message sent to the agent thread: the selected code with its location,
+/// then the user's question.
+fn agent_question(
+    codegen: &Entity<BufferCodegen>,
+    range: &Range<Anchor>,
+    user_prompt: &str,
+    cx: &App,
+) -> String {
+    let snapshot = codegen.read(cx).buffer(cx).read(cx).snapshot(cx);
+    let start = range.start.to_point(&snapshot);
+    let end = range.end.to_point(&snapshot);
+    let path = snapshot
+        .point_to_buffer_point(start)
+        .and_then(|(buffer, _)| {
+            buffer
+                .file()
+                .map(|file| file.path().as_unix_str().to_string())
+        })
+        .unwrap_or_else(|| "untitled".to_string());
+    let row = |point: Point| {
+        snapshot
+            .point_to_buffer_point(point)
+            .map_or(point.row + 1, |(_, point)| point.row + 1)
+    };
+    let code: String = snapshot.text_for_range(start..end).collect();
+    let location = if code.is_empty() {
+        format!("`{path}` near line {}", row(start))
+    } else {
+        format!(
+            "`{path}` lines {}-{}:\n```\n{code}\n```",
+            row(start),
+            row(end)
+        )
+    };
+    format!(
+        "Question about {location}\n\n{user_prompt}\n\n\
+         (Answer in text. Only change files if the question asks for a change.)"
+    )
+}
+
+/// Sends `question` to the agent thread open in the agent panel and resolves
+/// with its answer.
+fn ask_agent_thread(
+    workspace: &WeakEntity<Workspace>,
+    question: String,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<Result<String>> {
+    let conversation_view = workspace
+        .upgrade()
+        .and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx))
+        .and_then(|panel| panel.read(cx).active_conversation_view().cloned());
+    let Some(conversation_view) = conversation_view else {
+        return Task::ready(Err(anyhow!(
+            "Open an agent thread (Codex, Claude Code, ...) in the agent panel first."
+        )));
+    };
+    conversation_view
+        .update(cx, |view, cx| view.ask_active_thread(question, window, cx))
+        .unwrap_or_else(|error| Task::ready(Err(error)))
 }
 
 pub struct InlineAssist {
