@@ -21,8 +21,8 @@ use client::zed_urls;
 use collections::{HashMap, HashSet, IndexMap};
 use editor::scroll::Autoscroll;
 use editor::{
-    Editor, EditorEvent, EditorMode, MultiBuffer, PathKey, ReviewCommentForAgent, SelectionEffects,
-    SizingBehavior,
+    Editor, EditorEvent, EditorMode, MultiBuffer, PathKey, ReviewCommentCode,
+    ReviewCommentForAgent, SelectionEffects, SizingBehavior,
 };
 use file_icons::FileIcons;
 use fs::Fs;
@@ -3785,21 +3785,40 @@ impl ConversationView {
     /// Inserts diff review comments into the active thread's message editor as
     /// a mention of each commented range followed by its comment, without
     /// sending. Returns false when there is no active thread to insert into.
+    /// Why review comments cannot be inserted right now, if they cannot. The
+    /// caller keeps the comments in the diff when this returns a reason.
+    pub(crate) fn review_comments_blocker(&self, cx: &App) -> Option<&'static str> {
+        let Some(active_thread) = self.active_thread() else {
+            return Some("The agent thread isn't ready yet. Send the review again once it is.");
+        };
+        let message_editor = active_thread.read(cx).active_editor(cx);
+        if message_editor.read(cx).editor().read(cx).read_only(cx) {
+            return Some(
+                "The agent's message box is read-only. Discard its restored draft, then send the review again.",
+            );
+        }
+        None
+    }
+
+    /// Inserts review comments into the active thread's message box without
+    /// sending it. Check `review_comments_blocker` first.
     pub(crate) fn insert_review_comments(
         &mut self,
         comments: Vec<ReviewCommentForAgent>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) {
         let Some(active_thread) = self.active_thread() else {
-            return false;
+            return;
         };
-        let message_editor = active_thread.update(cx, |thread, cx| thread.active_editor(cx));
+        let message_editor = active_thread.read(cx).active_editor(cx);
         message_editor.update(cx, |editor, cx| {
             editor.insert_text("Review comments on the diff:\n\n", window, cx);
             for comment in comments {
-                match comment.location {
-                    Some((buffer, range)) => {
+                let path = comment.file_path.as_unix_str();
+                match comment.code {
+                    ReviewCommentCode::Buffer { buffer, range } => {
+                        editor.insert_text(&format!("`{path}`: "), window, cx);
                         editor.insert_selections(
                             AgentContextSelection::Editor(vec![(buffer, range)]),
                             window,
@@ -3807,12 +3826,15 @@ impl ConversationView {
                         );
                         editor.insert_text(&format!("\n{}\n\n", comment.comment), window, cx);
                     }
-                    None => {
+                    ReviewCommentCode::Diff {
+                        text,
+                        row,
+                        starts_on_removed_line,
+                    } => {
+                        let file = if starts_on_removed_line { "old" } else { "current" };
                         editor.insert_text(
                             &format!(
-                                "`{}` (removed lines near line {}):\n{}\n\n",
-                                comment.file_path.as_unix_str(),
-                                comment.row,
+                                "`{path}` (diff from line {row} of the {file} file, removed lines start with -):\n```diff\n{text}```\n{}\n\n",
                                 comment.comment
                             ),
                             window,
@@ -3822,7 +3844,6 @@ impl ConversationView {
                 }
             }
         });
-        true
     }
 
     fn current_model_name(&self, cx: &App) -> SharedString {
@@ -15726,32 +15747,41 @@ pub(crate) mod tests {
         let comments = vec![
             ReviewCommentForAgent {
                 file_path: util::rel_path::rel_path("src/a.rs").into_arc(),
-                location: Some((buffer, range)),
-                row: 1,
+                code: ReviewCommentCode::Buffer { buffer, range },
                 comment: "Use a constant".to_string(),
             },
             ReviewCommentForAgent {
                 file_path: util::rel_path::rel_path("src/b.rs").into_arc(),
-                location: None,
-                row: 3,
+                code: ReviewCommentCode::Diff {
+                    text: "-old\n".to_string(),
+                    row: 3,
+                    starts_on_removed_line: true,
+                },
                 comment: "Why was this removed?".to_string(),
             },
         ];
 
-        let inserted = conversation_view.update_in(cx, |view, window, cx| {
+        let blocker = conversation_view.read_with(cx, |view, cx| view.review_comments_blocker(cx));
+        assert_eq!(blocker, None);
+        conversation_view.update_in(cx, |view, window, cx| {
             view.insert_review_comments(comments, window, cx)
         });
-        assert!(inserted);
 
         let message_editor = message_editor(&conversation_view, cx);
         message_editor.read_with(cx, |editor, cx| {
             assert_eq!(
                 editor.text(cx),
                 "Review comments on the diff:\n\n\
-                 selection \nUse a constant\n\n\
-                 `src/b.rs` (removed lines near line 3):\nWhy was this removed?\n\n"
+                 `src/a.rs`: selection \nUse a constant\n\n\
+                 `src/b.rs` (diff from line 3 of the old file, removed lines start with -):\n\
+                 ```diff\n-old\n```\nWhy was this removed?\n\n"
             );
         });
+
+        // A read-only message box (a restored draft) must not take the comments.
+        message_editor.update(cx, |editor, cx| editor.set_read_only(true, cx));
+        let blocker = conversation_view.read_with(cx, |view, cx| view.review_comments_blocker(cx));
+        assert!(blocker.is_some());
     }
 
     #[gpui::test]

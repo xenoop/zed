@@ -47090,14 +47090,15 @@ fn test_review_comments_for_agent_are_sorted_and_located(cx: &mut TestAppContext
         let summary = comments
             .iter()
             .map(|comment| {
-                let (buffer, range) = comment.location.as_ref().expect("comment has a location");
+                let ReviewCommentCode::Buffer { buffer, range } = &comment.code else {
+                    panic!("expected code in the current file");
+                };
                 let text = buffer
                     .read(cx)
                     .text_for_range(range.clone())
                     .collect::<String>();
                 (
                     comment.file_path.as_unix_str().to_string(),
-                    comment.row,
                     text,
                     comment.comment.clone(),
                 )
@@ -47108,16 +47109,88 @@ fn test_review_comments_for_agent_are_sorted_and_located(cx: &mut TestAppContext
             vec![
                 (
                     "file.rs".to_string(),
-                    1,
                     "one".to_string(),
                     "First".to_string()
                 ),
                 (
                     "file.rs".to_string(),
-                    3,
                     "three".to_string(),
                     "Second".to_string()
                 ),
+            ]
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_review_comments_for_agent_keep_removed_lines(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+
+    cx.set_state("ˇaaa\nbbb\nccc");
+    cx.set_head_text("aaa\nXXX\nbbb\nccc");
+    cx.run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.expand_all_diff_hunks(&Default::default(), window, cx);
+    });
+    cx.run_until_parked();
+
+    // Multi-buffer rows: 0 "aaa", 1 "XXX" (removed), 2 "bbb", 3 "ccc"
+    cx.update_editor(|editor, _window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let anchors =
+            |start: Point, end: Point| snapshot.anchor_before(start)..snapshot.anchor_after(end);
+        let key = test_hunk_key_with_anchor("file", snapshot.anchor_before(Point::new(1, 0)));
+        // Only the removed line.
+        editor.add_review_comment(
+            key.clone(),
+            "Why remove this?".to_string(),
+            anchors(Point::new(1, 0), Point::new(1, 3)),
+            cx,
+        );
+        // Across the removed line, with both ends on current lines.
+        editor.add_review_comment(
+            key.clone(),
+            "Across".to_string(),
+            anchors(Point::new(0, 0), Point::new(2, 3)),
+            cx,
+        );
+        // Current lines only.
+        editor.add_review_comment(
+            key,
+            "Current".to_string(),
+            anchors(Point::new(3, 0), Point::new(3, 3)),
+            cx,
+        );
+
+        let comments = editor.take_review_comments_for_agent(cx);
+        let summary = comments
+            .iter()
+            .map(|comment| match &comment.code {
+                ReviewCommentCode::Diff {
+                    text,
+                    row,
+                    starts_on_removed_line,
+                } => format!(
+                    "{}: diff {row} {starts_on_removed_line}\n{text}",
+                    comment.comment
+                ),
+                ReviewCommentCode::Buffer { buffer, range } => format!(
+                    "{}: buffer {}",
+                    comment.comment,
+                    buffer
+                        .read(cx)
+                        .text_for_range(range.clone())
+                        .collect::<String>()
+                ),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            vec![
+                "Across: diff 1 false\n aaa\n-XXX\n bbb\n".to_string(),
+                "Why remove this?: diff 2 true\n-XXX\n".to_string(),
+                "Current: buffer ccc".to_string(),
             ]
         );
     });

@@ -168,9 +168,20 @@ impl BranchDiff {
         let workspace_weak = cx.entity().downgrade();
         window
             .spawn(cx, async move |cx| {
-                // A failed lookup means the branch has no marker yet; anything
-                // since the default branch is then unreviewed.
-                let has_marker = matches!(marker_lookup.await, Ok(Ok(_)));
+                // Over the remote protocol `show` is the only lookup, and it
+                // cannot tell a missing ref from other git failures. A branch
+                // without a marker is the normal first-review case, so any git
+                // error falls back to the default-branch diff (and is logged);
+                // a cancelled job is a real error.
+                let has_marker = match marker_lookup.await? {
+                    Ok(_) => true,
+                    Err(error) => {
+                        log::info!(
+                            "no reviewed marker {marker}, showing changes since the default branch: {error:#}"
+                        );
+                        false
+                    }
+                };
                 workspace_weak.update_in(cx, |workspace, window, cx| {
                     if has_marker {
                         Self::deploy_branch_diff_with_base_ref(
