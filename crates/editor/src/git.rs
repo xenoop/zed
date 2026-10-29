@@ -218,12 +218,26 @@ impl DiffReviewDragState {
 pub struct ReviewCommentForAgent {
     /// The file path (relative to worktree) of the hunk the comment was left on.
     pub file_path: Arc<util::rel_path::RelPath>,
-    /// The commented code in its buffer, or `None` when the commented rows
-    /// only exist in the diff base (removed lines).
-    pub location: Option<(Entity<Buffer>, Range<text::Anchor>)>,
-    /// The 1-based row in the current file the comment is nearest to.
-    pub row: u32,
+    pub code: ReviewCommentCode,
     pub comment: String,
+}
+
+/// The code a review comment was left on.
+pub enum ReviewCommentCode {
+    /// Lines that exist in the current file.
+    Buffer {
+        buffer: Entity<Buffer>,
+        range: Range<text::Anchor>,
+    },
+    /// Lines that include removed code, which only the diff shows. Removed
+    /// lines are prefixed with `-`, the others with a space.
+    Diff {
+        text: String,
+        /// 1-based row of the first line: in the old file when the range
+        /// starts on a removed line, else in the current file.
+        row: u32,
+        starts_on_removed_line: bool,
+    },
 }
 
 impl StoredReviewComment {
@@ -758,7 +772,7 @@ impl Editor {
     }
 
     /// Returns the total count of stored review comments across all hunks.
-    pub(super) fn total_review_comment_count(&self) -> usize {
+    pub fn total_review_comment_count(&self) -> usize {
         self.stored_review_comments
             .iter()
             .map(|(_, v)| v.len())
@@ -2927,8 +2941,8 @@ impl Editor {
 }
 
 impl Editor {
-    /// Takes all stored review comments, resolved to buffer ranges, in the
-    /// order they appear in the diff.
+    /// Takes all stored review comments, resolved to the code they were left
+    /// on, in the order they appear in the diff.
     pub fn take_review_comments_for_agent(
         &mut self,
         cx: &mut Context<Self>,
@@ -2938,22 +2952,13 @@ impl Editor {
         for (hunk_key, hunk_comments) in self.take_all_review_comments(cx) {
             for comment in hunk_comments {
                 let start = comment.range.start.to_point(&snapshot);
-                let row = snapshot
-                    .point_to_buffer_point(start)
-                    .map(|(_, point)| point.row + 1)
-                    .unwrap_or(start.row + 1);
-                let location = snapshot
-                    .anchor_range_to_buffer_anchor_range(comment.range.clone())
-                    .and_then(|(buffer_snapshot, range)| {
-                        let buffer = self.buffer.read(cx).buffer(buffer_snapshot.remote_id())?;
-                        Some((buffer, range))
-                    });
+                let end = comment.range.end.to_point(&snapshot);
+                let code = self.review_comment_code(&snapshot, &comment.range, start..end, cx);
                 comments.push((
                     start,
                     ReviewCommentForAgent {
                         file_path: hunk_key.file_path.clone(),
-                        location,
-                        row,
+                        code,
                         comment: comment.comment,
                     },
                 ));
@@ -2961,6 +2966,62 @@ impl Editor {
         }
         comments.sort_by_key(|(start, _)| *start);
         comments.into_iter().map(|(_, comment)| comment).collect()
+    }
+
+    fn review_comment_code(
+        &self,
+        snapshot: &MultiBufferSnapshot,
+        range: &Range<Anchor>,
+        points: Range<Point>,
+        cx: &App,
+    ) -> ReviewCommentCode {
+        let rows = points.start.row..=points.end.row;
+        // A removed line in a diff resolves to a position in the current
+        // file, so check every row: any removed one means the buffer range
+        // would silently drop it.
+        let removed_rows: Vec<bool> = rows
+            .clone()
+            .map(|row| {
+                // anchor_after: at a line start, anchor_before would lean
+                // into a removed hunk that ends just before this line.
+                snapshot
+                    .anchor_after(Point::new(row, 0))
+                    .diff_base_anchor()
+                    .is_some()
+            })
+            .collect();
+
+        if !removed_rows.contains(&true)
+            && let Some((buffer_snapshot, buffer_range)) =
+                snapshot.anchor_range_to_buffer_anchor_range(range.clone())
+            && let Some(buffer) = self.buffer.read(cx).buffer(buffer_snapshot.remote_id())
+        {
+            return ReviewCommentCode::Buffer {
+                buffer,
+                range: buffer_range,
+            };
+        }
+
+        let line_starts = rows.clone().map(|row| Point::new(row, 0));
+        let mut text = String::new();
+        for (line_start, removed) in line_starts.zip(&removed_rows) {
+            let line_end = Point::new(
+                line_start.row,
+                snapshot.line_len(MultiBufferRow(line_start.row)),
+            );
+            text.push_str(if *removed { "-" } else { " " });
+            text.extend(snapshot.text_for_range(line_start..line_end));
+            text.push('\n');
+        }
+        let row = snapshot
+            .point_to_buffer_point(Point::new(points.start.row, 0))
+            .map(|(_, point)| point.row + 1)
+            .unwrap_or(points.start.row + 1);
+        ReviewCommentCode::Diff {
+            text,
+            row,
+            starts_on_removed_line: removed_rows.first().copied().unwrap_or(false),
+        }
     }
 
     /// Takes all stored comments from all hunks, clearing the storage.

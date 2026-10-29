@@ -644,21 +644,26 @@ pub fn init(cx: &mut App) {
                         else {
                             return;
                         };
-                        // Check for a thread before taking the comments, so they
-                        // are kept when there is nowhere to send them.
-                        let conversation_view = agent_panel
-                            .read(cx)
-                            .active_conversation_view()
-                            .filter(|view| view.read(cx).active_thread().is_some())
-                            .cloned();
-                        let Some(conversation_view) = conversation_view else {
-                            struct NoAgentThreadForReview;
+                        if editor.read(cx).total_review_comment_count() == 0 {
+                            return;
+                        }
+                        // Check the destination before taking the comments, so
+                        // they stay in the diff when they cannot be inserted.
+                        let conversation_view =
+                            agent_panel.read(cx).active_conversation_view().cloned();
+                        let blocker = match &conversation_view {
+                            None => Some(
+                                "Open an agent thread to send the review to, then send it again.",
+                            ),
+                            Some(view) => view.read(cx).review_comments_blocker(cx),
+                        };
+                        let Some(conversation_view) = conversation_view.filter(|_| blocker.is_none())
+                        else {
+                            struct ReviewNotSent;
                             workspace.show_toast(
                                 workspace::Toast::new(
-                                    workspace::notifications::NotificationId::unique::<
-                                        NoAgentThreadForReview,
-                                    >(),
-                                    "Open an agent thread to send the review to, then send it again.",
+                                    workspace::notifications::NotificationId::unique::<ReviewNotSent>(),
+                                    blocker.unwrap_or_default(),
                                 ),
                                 cx,
                             );
@@ -668,12 +673,11 @@ pub fn init(cx: &mut App) {
 
                         let comments =
                             editor.update(cx, |editor, cx| editor.take_review_comments_for_agent(cx));
-                        if comments.is_empty() {
-                            return;
-                        }
                         workspace.focus_panel::<AgentPanel>(window, cx);
-                        conversation_view.update(cx, |conversation_view, cx| {
-                            conversation_view.insert_review_comments(comments, window, cx);
+                        conversation_view.update(cx, |_, cx| {
+                            cx.defer_in(window, move |conversation_view, window, cx| {
+                                conversation_view.insert_review_comments(comments, window, cx);
+                            });
                         });
                     },
                 )
