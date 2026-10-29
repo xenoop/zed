@@ -214,6 +214,18 @@ impl DiffReviewDragState {
     }
 }
 
+/// A review comment taken out of an editor for sending to an agent thread.
+pub struct ReviewCommentForAgent {
+    /// The file path (relative to worktree) of the hunk the comment was left on.
+    pub file_path: Arc<util::rel_path::RelPath>,
+    /// The commented code in its buffer, or `None` when the commented rows
+    /// only exist in the diff base (removed lines).
+    pub location: Option<(Entity<Buffer>, Range<text::Anchor>)>,
+    /// The 1-based row in the current file the comment is nearest to.
+    pub row: u32,
+    pub comment: String,
+}
+
 impl StoredReviewComment {
     fn new(id: usize, comment: String, anchor_range: Range<Anchor>) -> Self {
         Self {
@@ -2911,6 +2923,44 @@ impl Editor {
             .map(|(_, p)| p.row)
             .unwrap_or(end_point.row);
         Some((start_row, end_row))
+    }
+}
+
+impl Editor {
+    /// Takes all stored review comments, resolved to buffer ranges, in the
+    /// order they appear in the diff.
+    pub fn take_review_comments_for_agent(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Vec<ReviewCommentForAgent> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let mut comments: Vec<(Point, ReviewCommentForAgent)> = Vec::new();
+        for (hunk_key, hunk_comments) in self.take_all_review_comments(cx) {
+            for comment in hunk_comments {
+                let start = comment.range.start.to_point(&snapshot);
+                let row = snapshot
+                    .point_to_buffer_point(start)
+                    .map(|(_, point)| point.row + 1)
+                    .unwrap_or(start.row + 1);
+                let location = snapshot
+                    .anchor_range_to_buffer_anchor_range(comment.range.clone())
+                    .and_then(|(buffer_snapshot, range)| {
+                        let buffer = self.buffer.read(cx).buffer(buffer_snapshot.remote_id())?;
+                        Some((buffer, range))
+                    });
+                comments.push((
+                    start,
+                    ReviewCommentForAgent {
+                        file_path: hunk_key.file_path.clone(),
+                        location,
+                        row,
+                        comment: comment.comment,
+                    },
+                ));
+            }
+        }
+        comments.sort_by_key(|(start, _)| *start);
+        comments.into_iter().map(|(_, comment)| comment).collect()
     }
 
     /// Takes all stored comments from all hunks, clearing the storage.

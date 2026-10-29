@@ -47066,6 +47066,64 @@ fn test_review_comment_update(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_review_comments_for_agent_are_sorted_and_located(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("one\ntwo\nthree\n", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    _ = editor.update(cx, |editor: &mut Editor, _window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let line_three =
+            snapshot.anchor_before(Point::new(2, 0))..snapshot.anchor_after(Point::new(2, 5));
+        let line_one =
+            snapshot.anchor_before(Point::new(0, 0))..snapshot.anchor_after(Point::new(0, 3));
+        let key = test_hunk_key_with_anchor("file.rs", line_one.start);
+        editor.add_review_comment(key.clone(), "Second".to_string(), line_three, cx);
+        editor.add_review_comment(key, "First".to_string(), line_one, cx);
+
+        let comments = editor.take_review_comments_for_agent(cx);
+        assert_eq!(editor.total_review_comment_count(), 0);
+
+        let summary = comments
+            .iter()
+            .map(|comment| {
+                let (buffer, range) = comment.location.as_ref().expect("comment has a location");
+                let text = buffer
+                    .read(cx)
+                    .text_for_range(range.clone())
+                    .collect::<String>();
+                (
+                    comment.file_path.as_unix_str().to_string(),
+                    comment.row,
+                    text,
+                    comment.comment.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    "file.rs".to_string(),
+                    1,
+                    "one".to_string(),
+                    "First".to_string()
+                ),
+                (
+                    "file.rs".to_string(),
+                    3,
+                    "three".to_string(),
+                    "Second".to_string()
+                ),
+            ]
+        );
+    });
+}
+
+#[gpui::test]
 fn test_review_comment_take_all(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

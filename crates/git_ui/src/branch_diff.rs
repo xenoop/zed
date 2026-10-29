@@ -2,7 +2,7 @@ use crate::{
     branch_picker,
     diff_multibuffer::DiffMultibuffer,
     project_diff::{
-        self, CompareWithBranch, DeployBranchDiff, ProjectDiff, ReviewDiff,
+        self, CompareWithBranch, DeployBranchDiff, DiffSinceReviewed, ProjectDiff, ReviewDiff,
         render_send_review_to_agent_button,
     },
 };
@@ -40,6 +40,11 @@ use workspace::{
 };
 use zed_actions::agent::ReviewBranchDiff;
 
+/// The ref that `xen reviewed` moves to the commit a branch was last reviewed at.
+fn reviewed_marker_ref(branch_name: &str) -> String {
+    format!("refs/xen/reviewed/{branch_name}")
+}
+
 /// The workspace item for a branch (merge-base) diff: "Changes since {branch}".
 /// It wraps a single [`DiffMultibuffer`] over [`DiffBase::Merge`] and delegates
 /// the [`Item`] surface to it. The merge base can be changed in place via the
@@ -74,6 +79,9 @@ impl BranchDiff {
             Self::deploy_branch_diff(workspace, window, cx)
         });
         workspace.register_action(Self::compare_with_branch);
+        workspace.register_action(|workspace, _: &DiffSinceReviewed, window, cx| {
+            Self::deploy_diff_since_reviewed(workspace, window, cx)
+        });
         workspace::register_serializable_item::<Self>(cx);
     }
 
@@ -133,6 +141,48 @@ impl BranchDiff {
                 anyhow::Ok(())
             })
             .detach_and_notify_err(workspace_weak, window, cx);
+    }
+
+    fn deploy_diff_since_reviewed(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let project = workspace.project().clone();
+        let Some(repository) = project.read(cx).active_repository(cx) else {
+            Self::deploy_branch_diff(workspace, window, cx);
+            return;
+        };
+        let Some(branch_name) = repository
+            .read(cx)
+            .branch
+            .as_ref()
+            .map(|branch| branch.name().to_owned())
+        else {
+            Self::deploy_branch_diff(workspace, window, cx);
+            return;
+        };
+        let marker: SharedString = reviewed_marker_ref(&branch_name).into();
+        let marker_lookup =
+            repository.update(cx, |repository, _| repository.show(marker.to_string()));
+        let workspace_weak = cx.entity().downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                // A failed lookup means the branch has no marker yet; anything
+                // since the default branch is then unreviewed.
+                let has_marker = matches!(marker_lookup.await, Ok(Ok(_)));
+                workspace_weak.update_in(cx, |workspace, window, cx| {
+                    if has_marker {
+                        Self::deploy_branch_diff_with_base_ref(
+                            workspace, project, repository, marker, None, window, cx,
+                        );
+                    } else {
+                        Self::deploy_branch_diff(workspace, window, cx);
+                    }
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_notify_err(cx.entity().downgrade(), window, cx);
     }
 
     fn compare_with_branch(

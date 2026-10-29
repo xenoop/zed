@@ -21,7 +21,8 @@ use client::zed_urls;
 use collections::{HashMap, HashSet, IndexMap};
 use editor::scroll::Autoscroll;
 use editor::{
-    Editor, EditorEvent, EditorMode, MultiBuffer, PathKey, SelectionEffects, SizingBehavior,
+    Editor, EditorEvent, EditorMode, MultiBuffer, PathKey, ReviewCommentForAgent, SelectionEffects,
+    SizingBehavior,
 };
 use file_icons::FileIcons;
 use fs::Fs;
@@ -3779,6 +3780,49 @@ impl ConversationView {
             self.pending_selections.push(selection);
             cx.notify();
         }
+    }
+
+    /// Inserts diff review comments into the active thread's message editor as
+    /// a mention of each commented range followed by its comment, without
+    /// sending. Returns false when there is no active thread to insert into.
+    pub(crate) fn insert_review_comments(
+        &mut self,
+        comments: Vec<ReviewCommentForAgent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(active_thread) = self.active_thread() else {
+            return false;
+        };
+        let message_editor = active_thread.update(cx, |thread, cx| thread.active_editor(cx));
+        message_editor.update(cx, |editor, cx| {
+            editor.insert_text("Review comments on the diff:\n\n", window, cx);
+            for comment in comments {
+                match comment.location {
+                    Some((buffer, range)) => {
+                        editor.insert_selections(
+                            AgentContextSelection::Editor(vec![(buffer, range)]),
+                            window,
+                            cx,
+                        );
+                        editor.insert_text(&format!("\n{}\n\n", comment.comment), window, cx);
+                    }
+                    None => {
+                        editor.insert_text(
+                            &format!(
+                                "`{}` (removed lines near line {}):\n{}\n\n",
+                                comment.file_path.as_unix_str(),
+                                comment.row,
+                                comment.comment
+                            ),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            }
+        });
+        true
     }
 
     fn current_model_name(&self, cx: &App) -> SharedString {
@@ -15662,6 +15706,52 @@ pub(crate) mod tests {
 
             assert_eq!(text, expected_txt);
         })
+    }
+
+    #[gpui::test]
+    async fn test_insert_review_comments(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let project = conversation_view.read_with(cx, |view, _| view.project.clone());
+        let buffer = project.update(cx, |project, cx| {
+            project.create_local_buffer("let a = 10 + 10;", None, false, cx)
+        });
+        let range = buffer.read_with(cx, |buffer, _| {
+            buffer.anchor_before(8)..buffer.anchor_after(15)
+        });
+        let comments = vec![
+            ReviewCommentForAgent {
+                file_path: util::rel_path::rel_path("src/a.rs").into_arc(),
+                location: Some((buffer, range)),
+                row: 1,
+                comment: "Use a constant".to_string(),
+            },
+            ReviewCommentForAgent {
+                file_path: util::rel_path::rel_path("src/b.rs").into_arc(),
+                location: None,
+                row: 3,
+                comment: "Why was this removed?".to_string(),
+            },
+        ];
+
+        let inserted = conversation_view.update_in(cx, |view, window, cx| {
+            view.insert_review_comments(comments, window, cx)
+        });
+        assert!(inserted);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.read_with(cx, |editor, cx| {
+            assert_eq!(
+                editor.text(cx),
+                "Review comments on the diff:\n\n\
+                 selection \nUse a constant\n\n\
+                 `src/b.rs` (removed lines near line 3):\nWhy was this removed?\n\n"
+            );
+        });
     }
 
     #[gpui::test]
