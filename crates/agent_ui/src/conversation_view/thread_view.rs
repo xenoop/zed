@@ -8892,6 +8892,25 @@ impl ThreadView {
                             }
                         });
 
+                    let comment_on_this_agent_response =
+                        ContextMenuEntry::new("Comment on This Agent Response").handler({
+                            let entity = entity.clone();
+                            move |window, cx| {
+                                entity.update(cx, |this, cx| {
+                                    let entries = this.thread.read(cx).entries();
+                                    if let Some(text) =
+                                        Self::get_agent_message_content(entries, entry_ix, cx)
+                                    {
+                                        this.insert_comments(
+                                            &[AgentComment::on_conversation(text)],
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                });
+                            }
+                        });
+
                     let scroll_item = if is_at_top {
                         ContextMenuEntry::new("Scroll to Bottom").handler({
                             let entity = entity.clone();
@@ -8934,7 +8953,7 @@ impl ThreadView {
                             })
                             .separator()
                         })
-                        .when_some(selected_text, |menu, selected_text| {
+                        .when_some(selected_text.clone(), |menu, selected_text| {
                             menu.entry("Copy", Some(Box::new(markdown::Copy)), move |_, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(
                                     selected_text.to_string(),
@@ -8953,6 +8972,24 @@ impl ThreadView {
                             )
                         })
                         .item(copy_this_agent_response)
+                        .separator()
+                        .when_some(selected_text, |menu, selected_text| {
+                            menu.entry("Comment on Selection", None, {
+                                let entity = entity.clone();
+                                move |window, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.insert_comments(
+                                            &[AgentComment::on_conversation(
+                                                selected_text.to_string(),
+                                            )],
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            })
+                        })
+                        .item(comment_on_this_agent_response)
                         .separator()
                         .item(scroll_item)
                         .item(open_thread_as_markdown)
