@@ -7767,6 +7767,62 @@ impl ThreadView {
         }
     }
 
+    fn render_branched_from_link(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let thread = self.thread.read(cx);
+        let native_agent = thread
+            .connection()
+            .clone()
+            .downcast::<agent::NativeAgentConnection>()?;
+        let source = native_agent
+            .0
+            .read(cx)
+            .thread_branched_from(thread.session_id(), cx)?;
+        let title: SharedString = agent::ThreadStore::try_global(cx)
+            .and_then(|store| {
+                store
+                    .read(cx)
+                    .entries()
+                    .find(|entry| entry.id == source.session_id)
+                    .map(|entry| entry.title)
+            })
+            .unwrap_or_else(|| "another thread".into());
+        let workspace = self.workspace.clone();
+
+        Some(
+            h_flex()
+                .px_5()
+                .pt_2()
+                .child(
+                    Button::new("branched-from", format!("Branched from {title}"))
+                        .start_icon(
+                            Icon::new(IconName::GitBranch)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .label_size(LabelSize::Small)
+                        .tooltip(Tooltip::text("Open the thread this one was branched from"))
+                        .on_click(move |_, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                                        panel.update(cx, |panel, cx| {
+                                            panel.open_thread(
+                                                source.session_id.clone(),
+                                                None,
+                                                Some(title.clone()),
+                                                window,
+                                                cx,
+                                            )
+                                        });
+                                    }
+                                })
+                                .log_err();
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn is_native_agent(&self, cx: &App) -> bool {
         self.thread
             .read(cx)
@@ -13697,6 +13753,7 @@ impl Render for ThreadView {
         let list_state = self.list_state.clone();
 
         let conversation = v_flex()
+            .children(self.render_branched_from_link(cx))
             .when(self.resumed_without_history, |this| {
                 this.child(Self::render_resume_notice(cx))
             })

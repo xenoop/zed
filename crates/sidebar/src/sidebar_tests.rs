@@ -1535,6 +1535,7 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
             highlight_positions: Vec::new(),
             worktrees: Vec::new(),
             diff_stats: DiffStats::default(),
+            branch_depth: 0,
         }))
     };
 
@@ -1627,6 +1628,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                branch_depth: 0,
             })),
             // Active thread with Running status
             ListEntry::Thread(Arc::new(ThreadEntry {
@@ -1654,6 +1656,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                branch_depth: 0,
             })),
             // Active thread with Error status
             ListEntry::Thread(Arc::new(ThreadEntry {
@@ -1681,6 +1684,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                branch_depth: 0,
             })),
             // Thread with WaitingForConfirmation status, not active
             // remote_connection: None,
@@ -1709,6 +1713,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                branch_depth: 0,
             })),
             // Background thread that completed (should show notification)
             // remote_connection: None,
@@ -1737,6 +1742,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                branch_depth: 0,
             })),
             // Collapsed project header
             ListEntry::ProjectHeader {
@@ -16025,4 +16031,32 @@ fn sidebar_painted_background_at(position: Point<Pixels>, cx: &mut VisualTestCon
             .expect("solid background at pointer");
         u32::from(Rgba::from(color))
     })
+}
+
+#[test]
+fn test_nest_branches_places_branches_under_their_parent() {
+    let session = |id: &str| acp::SessionId::new(id);
+    let items = vec!["branch-of-b", "a", "b", "branch-of-branch", "orphan-branch"];
+    let branch_parents = HashMap::from_iter([
+        (session("branch-of-b"), session("b")),
+        (session("branch-of-branch"), session("branch-of-b")),
+        (session("orphan-branch"), session("missing")),
+    ]);
+    let sessions: Vec<acp::SessionId> = items.iter().map(|id| session(id)).collect();
+
+    let nested = nest_branches(sessions, |session_id| Some(session_id), &branch_parents);
+    let nested: Vec<(&str, usize)> = nested
+        .iter()
+        .map(|(session_id, depth)| (session_id.0.as_ref(), *depth))
+        .collect();
+    assert_eq!(
+        nested,
+        [
+            ("a", 0),
+            ("b", 0),
+            ("branch-of-b", 1),
+            ("branch-of-branch", 2),
+            ("orphan-branch", 0),
+        ]
+    );
 }

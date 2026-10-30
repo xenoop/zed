@@ -29,6 +29,8 @@ pub type DbLanguageModel = crate::legacy_thread::SerializedLanguageModel;
 pub struct DbThreadMetadata {
     pub id: acp_v2::SessionId,
     pub parent_session_id: Option<acp_v2::SessionId>,
+    /// The thread this one was branched from, if it's a branch.
+    pub branched_from_session_id: Option<acp_v2::SessionId>,
     pub title: SharedString,
     pub updated_at: DateTime<Utc>,
     pub created_at: Option<DateTime<Utc>>,
@@ -558,7 +560,7 @@ pub(crate) struct ThreadsDatabase {
     save_count: std::sync::atomic::AtomicUsize,
 }
 
-const LIST_THREADS_QUERY: &str = "SELECT id, parent_id, folder_paths, folder_paths_order, summary, updated_at, created_at FROM threads ORDER BY updated_at DESC, created_at DESC";
+const LIST_THREADS_QUERY: &str = "SELECT id, parent_id, folder_paths, folder_paths_order, summary, updated_at, created_at, branched_from_id FROM threads ORDER BY updated_at DESC, created_at DESC";
 
 struct GlobalThreadsDatabase(Shared<Task<Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>>);
 
@@ -644,13 +646,22 @@ impl ThreadsDatabase {
             }
         }
 
+        if let Ok(mut s) = connection.exec(indoc! {"
+            ALTER TABLE threads ADD COLUMN branched_from_id TEXT;
+        "})
+        {
+            s().ok();
+        }
+
         // The columns added above are stored after the `data` blob, so reading
         // them from the table walks every thread's overflow pages. This index
         // covers `LIST_THREADS_QUERY`, so listing threads never touches the blobs.
         connection
             .exec(indoc! {"
-                CREATE INDEX IF NOT EXISTS threads_list_metadata ON threads (
-                    updated_at, created_at, id, parent_id, folder_paths, folder_paths_order, summary
+                DROP INDEX IF EXISTS threads_list_metadata;
+                CREATE INDEX IF NOT EXISTS threads_list_metadata_v2 ON threads (
+                    updated_at, created_at, id, parent_id, folder_paths, folder_paths_order, summary,
+                    branched_from_id
                 )
             "})
             .and_then(|mut create_index| create_index())
@@ -690,6 +701,10 @@ impl ThreadsDatabase {
             .subagent_context
             .as_ref()
             .map(|ctx| ctx.parent_thread_id.0.clone());
+        let branched_from_id = thread
+            .branched_from
+            .as_ref()
+            .map(|source| source.session_id.0.clone());
         let serialized_folder_paths = folder_paths.serialize();
         let (folder_paths_str, folder_paths_order_str): (Option<String>, Option<String>) =
             if folder_paths.is_empty() {
@@ -716,11 +731,12 @@ impl ThreadsDatabase {
         // created, not when it was saved to the database.
         let created_at = updated_at.clone();
 
-        let mut insert = connection.exec_bound::<(Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, String, String, DataType, Vec<u8>, String)>(indoc! {"
-            INSERT INTO threads (id, parent_id, folder_paths, folder_paths_order, summary, updated_at, data_type, data, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        let mut insert = connection.exec_bound::<(Arc<str>, Option<Arc<str>>, Option<String>, Option<String>, String, String, DataType, Vec<u8>, String, Option<Arc<str>>)>(indoc! {"
+            INSERT INTO threads (id, parent_id, folder_paths, folder_paths_order, summary, updated_at, data_type, data, created_at, branched_from_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ON CONFLICT(id) DO UPDATE SET
                 parent_id = excluded.parent_id,
+                branched_from_id = excluded.branched_from_id,
                 folder_paths = excluded.folder_paths,
                 folder_paths_order = excluded.folder_paths_order,
                 summary = excluded.summary,
@@ -739,6 +755,7 @@ impl ThreadsDatabase {
             data_type,
             data,
             created_at,
+            branched_from_id,
         ))?;
 
         Ok(())
@@ -758,6 +775,7 @@ impl ThreadsDatabase {
                 String,
                 String,
                 Option<String>,
+                Option<Arc<str>>,
             )>(LIST_THREADS_QUERY)?;
 
             let rows = select(())?;
@@ -771,6 +789,7 @@ impl ThreadsDatabase {
                 summary,
                 updated_at,
                 created_at,
+                branched_from_id,
             ) in rows
             {
                 let folder_paths = folder_paths
@@ -790,6 +809,7 @@ impl ThreadsDatabase {
                 threads.push(DbThreadMetadata {
                     id: acp_v2::SessionId::new(id),
                     parent_session_id: parent_id.map(acp_v2::SessionId::new),
+                    branched_from_session_id: branched_from_id.map(acp_v2::SessionId::new),
                     title: summary.into(),
                     updated_at: DateTime::parse_from_rfc3339(&updated_at)?.with_timezone(&Utc),
                     created_at,
@@ -1011,6 +1031,7 @@ mod tests {
         let metadata = DbThreadMetadata {
             id: acp_v2::SessionId::new(storage.clone()),
             parent_session_id: None,
+            branched_from_session_id: None,
             title: "Opaque session".into(),
             updated_at: Utc::now(),
             created_at: None,
@@ -1266,7 +1287,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             details,
-            ["SCAN threads USING COVERING INDEX threads_list_metadata"]
+            ["SCAN threads USING COVERING INDEX threads_list_metadata_v2"]
         );
     }
 
