@@ -307,6 +307,8 @@ actions!(
         CycleFavoriteModels,
         /// Expands the message editor to full size.
         ExpandMessageEditor,
+        /// Opens the most recent Zed Agent thread whose edits wrote the line under the cursor.
+        OpenThreadThatWroteLine,
         /// Archives the currently selected thread.
         ArchiveSelectedThread,
         /// Removes the currently selected thread.
