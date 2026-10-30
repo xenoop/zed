@@ -86,6 +86,75 @@ pub struct DbThread {
     /// [`crate::sandboxing::ThreadSandboxGrants`].
     #[serde(default)]
     pub sandbox_grants: DbSandboxGrants,
+    #[serde(default)]
+    pub branched_from: Option<DbBranchSource>,
+}
+
+/// Where a branched thread was copied from, so it can link back to its parent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DbBranchSource {
+    pub session_id: acp_v2::SessionId,
+    /// The user message whose turn ends the copied history.
+    pub user_message_id: ClientUserMessageId,
+}
+
+impl DbThread {
+    /// Copies this thread's history through the turn that starts with `user_message_id`
+    /// (that message and the agent's reply to it) into a new thread. Per-thread state
+    /// like sandbox grants and the draft prompt isn't carried over.
+    pub fn branch(
+        &self,
+        source_session_id: acp_v2::SessionId,
+        user_message_id: &ClientUserMessageId,
+    ) -> Result<DbThread> {
+        let start = self
+            .messages
+            .iter()
+            .position(|message| {
+                matches!(&**message, DbMessage::User(UserMessage { id, .. }) if id == user_message_id)
+            })
+            .ok_or_else(|| anyhow::anyhow!("message to branch from not found in thread"))?;
+        let end = self.messages[start + 1..]
+            .iter()
+            .position(|message| matches!(&**message, DbMessage::User(_)))
+            .map_or(self.messages.len(), |offset| start + 1 + offset);
+        let messages = self.messages[..end].to_vec();
+
+        let request_token_usage = self
+            .request_token_usage
+            .iter()
+            .filter(|(id, _)| {
+                messages.iter().any(|message| {
+                    matches!(&**message, DbMessage::User(UserMessage { id: message_id, .. }) if message_id == *id)
+                })
+            })
+            .map(|(id, usage)| (id.clone(), *usage))
+            .collect();
+
+        Ok(DbThread {
+            title: format!("Branch: {}", self.title).into(),
+            messages,
+            updated_at: Utc::now(),
+            detailed_summary: None,
+            initial_project_snapshot: self.initial_project_snapshot.clone(),
+            cumulative_token_usage: Default::default(),
+            request_token_usage,
+            model: self.model.clone(),
+            profile: self.profile.clone(),
+            subagent_context: None,
+            speed: self.speed,
+            thinking_enabled: self.thinking_enabled,
+            thinking_effort: self.thinking_effort.clone(),
+            draft_prompt: None,
+            ui_scroll_position: None,
+            sandboxed_terminal_temp_dir: None,
+            sandbox_grants: DbSandboxGrants::default(),
+            branched_from: Some(DbBranchSource {
+                session_id: source_session_id,
+                user_message_id: user_message_id.clone(),
+            }),
+        })
+    }
 }
 
 /// Serialized form of the sandbox permissions the user granted "for the rest of
@@ -169,6 +238,7 @@ impl SharedThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            branched_from: None,
         }
     }
 
@@ -355,6 +425,7 @@ impl DbThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            branched_from: None,
         })
     }
 }
@@ -971,7 +1042,59 @@ mod tests {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+            branched_from: None,
         }
+    }
+
+    #[test]
+    fn test_branch_copies_history_through_the_chosen_turn() {
+        let first_id = ClientUserMessageId::new();
+        let second_id = ClientUserMessageId::new();
+        let user_message = |id: &ClientUserMessageId, text: &str| {
+            Arc::new(DbMessage::User(UserMessage {
+                id: id.clone(),
+                content: vec![UserMessageContent::Text(text.to_string())].into(),
+            }))
+        };
+
+        let mut thread = make_thread("Refactor parser", Utc::now());
+        thread.messages = vec![
+            user_message(&first_id, "first question"),
+            Arc::new(DbMessage::Agent(AgentMessage::default())),
+            user_message(&second_id, "second question"),
+            Arc::new(DbMessage::Agent(AgentMessage::default())),
+        ];
+        thread.request_token_usage = HashMap::from_iter([
+            (first_id.clone(), language_model::TokenUsage::default()),
+            (second_id.clone(), language_model::TokenUsage::default()),
+        ]);
+        let source_session_id = acp_v2::SessionId::new("source");
+
+        let branch = thread
+            .branch(source_session_id.clone(), &first_id)
+            .expect("branching from an existing message should succeed");
+        assert_eq!(branch.title.as_ref(), "Branch: Refactor parser");
+        assert_eq!(branch.messages, thread.messages[..2].to_vec());
+        assert!(branch.request_token_usage.contains_key(&first_id));
+        assert!(!branch.request_token_usage.contains_key(&second_id));
+        assert_eq!(
+            branch.branched_from,
+            Some(DbBranchSource {
+                session_id: source_session_id.clone(),
+                user_message_id: first_id,
+            })
+        );
+
+        let last_turn = thread
+            .branch(source_session_id.clone(), &second_id)
+            .expect("branching from the last message should succeed");
+        assert_eq!(last_turn.messages, thread.messages);
+
+        assert!(
+            thread
+                .branch(source_session_id, &ClientUserMessageId::new())
+                .is_err()
+        );
     }
 
     #[gpui::test]

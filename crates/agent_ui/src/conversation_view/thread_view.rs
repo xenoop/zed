@@ -50,7 +50,7 @@ use ui::{
 };
 use url::Url;
 use util::markdown::source_position_from_fragment;
-use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
+use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME, notifications::NotifyTaskExt as _};
 
 use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
@@ -7271,6 +7271,8 @@ impl ThreadView {
                     .iter()
                     .all(acp_thread::content::can_convert_to_v1);
                 let is_editable = can_rewind && source_is_representable;
+                let can_branch =
+                    is_editable && message.client_id.is_some() && self.is_native_agent(cx);
                 let agent_name = if is_subagent {
                     "subagents".into()
                 } else {
@@ -7350,6 +7352,20 @@ impl ThreadView {
                                                     .icon_size(IconSize::XSmall)
                                                     .on_click(cx.listener(Self::cancel_editing))
                                             )
+                                            .when(can_branch, |this| {
+                                                this.child(
+                                                    IconButton::new(("branch", entry_ix), IconName::GitBranch)
+                                                        .icon_color(Color::Muted)
+                                                        .icon_size(IconSize::XSmall)
+                                                        .tooltip(Tooltip::text(
+                                                            "Branch: continue in a new thread from this point, leaving this one unchanged."
+                                                        ))
+                                                        .on_click(cx.listener(move |this, event, window, cx| {
+                                                            this.branch_from_message(entry_ix, window, cx);
+                                                            this.cancel_editing(event, window, cx);
+                                                        }))
+                                                )
+                                            })
                                             .child(
                                                 if is_loading_contents {
                                                     div()
@@ -7730,6 +7746,55 @@ impl ThreadView {
         } else {
             primary
         }
+    }
+
+    fn is_native_agent(&self, cx: &App) -> bool {
+        self.thread
+            .read(cx)
+            .connection()
+            .clone()
+            .downcast::<agent::NativeAgentConnection>()
+            .is_some()
+    }
+
+    fn branch_from_message(
+        &mut self,
+        entry_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let thread = self.thread.read(cx);
+        let Some(AgentThreadEntry::UserMessage(message)) = thread.entries().get(entry_ix) else {
+            return;
+        };
+        let Some(user_message_id) = message.client_id.clone() else {
+            return;
+        };
+        let Some(native_agent) = thread
+            .connection()
+            .clone()
+            .downcast::<agent::NativeAgentConnection>()
+        else {
+            return;
+        };
+        let session_id = thread.session_id().clone();
+        let branch = native_agent.0.update(cx, |agent, cx| {
+            agent.branch_thread(&session_id, user_message_id, cx)
+        });
+
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_this, cx| {
+            let (branch_session_id, title) = branch.await?;
+            workspace.update_in(cx, |workspace, window, cx| {
+                if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                    panel.update(cx, |panel, cx| {
+                        panel.open_thread(branch_session_id, None, Some(title), window, cx)
+                    });
+                }
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_notify_err(self.workspace.clone(), window, cx);
     }
 
     fn render_elicitation(
