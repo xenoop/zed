@@ -1,5 +1,6 @@
 use crate::{
     DEFAULT_THREAD_TITLE, SelectPermissionGranularity,
+    agent_comment::{AgentComment, comments_to_prompt_text},
     conversation_view::thread_search_bar::{ThreadSearchBar, ThreadSearchBarEvent},
     entry_view_state::TERMINAL_CONTENT_TOP_PADDING,
     open_abs_path_at_point, project_path_for_file_link,
@@ -1558,6 +1559,24 @@ impl ThreadView {
 
     /// Returns the currently active editor, either for a message that is being
     /// edited or the editor for a new message.
+    /// Adds comments to the message being written, leaving the cursor after them so the
+    /// user can keep typing.
+    pub(crate) fn insert_comments(
+        &mut self,
+        comments: &[AgentComment],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if comments.is_empty() {
+            return;
+        }
+        let editor = self.active_editor(cx);
+        editor.update(cx, |editor, cx| {
+            editor.insert_text(&comments_to_prompt_text(comments), window, cx);
+        });
+        editor.read(cx).focus_handle(cx).focus(window, cx);
+    }
+
     pub(crate) fn active_editor(&self, cx: &App) -> Entity<MessageEditor> {
         if let Some(index) = self.editing_message
             && let Some(editor) = self
@@ -7978,6 +7997,20 @@ impl ThreadView {
                 }))
         });
 
+        let comment_on_response_button = copy_response_index.map(|response_index| {
+            IconButton::new(("comment_on_agent_response", entry_ix), IconName::Quote)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("Comment on This Agent Response"))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let entries = this.thread.read(cx).entries();
+                    if let Some(text) = Self::get_agent_message_content(entries, response_index, cx)
+                    {
+                        this.insert_comments(&[AgentComment::on_conversation(text)], window, cx);
+                    }
+                }))
+        });
+
         let scroll_to_recent_user_prompt = IconButton::new(
             ("scroll_to_recent_user_prompt", entry_ix),
             IconName::UserArrowUp,
@@ -8118,6 +8151,9 @@ impl ThreadView {
             )
             .when_some(feedback_buttons, |this, buttons| this.child(buttons))
             .when_some(copy_response_button, |this, button| this.child(button))
+            .when_some(comment_on_response_button, |this, button| {
+                this.child(button)
+            })
             .child(scroll_to_recent_user_prompt)
             .when_some(scroll_to_top, |this, button| this.child(button))
             .into_any_element()

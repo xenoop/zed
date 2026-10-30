@@ -48,7 +48,9 @@ use crate::conversation_view::elicitation::{
     should_render_pinned_elicitation,
 };
 use crate::message_editor::SessionCapabilities;
-use crate::{AgentThreadSource, DEFAULT_THREAD_TITLE, resolve_agent_image};
+use crate::{
+    AgentThreadSource, DEFAULT_THREAD_TITLE, agent_comment::AgentComment, resolve_agent_image,
+};
 use lru::LruCache;
 use rope::Point;
 use settings::{NotifyWhenAgentWaiting, Settings as _, SettingsStore};
@@ -816,6 +818,7 @@ pub struct ConversationView {
     recovery: Option<ThreadRecovery>,
     saved_submissions: Vec<SavedSubmission>,
     pending_selections: Vec<AgentContextSelection>,
+    pending_comments: Vec<AgentComment>,
     focus_handle: FocusHandle,
     notifications: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
@@ -1147,6 +1150,7 @@ impl ConversationView {
             recovery: None,
             saved_submissions: Vec::new(),
             pending_selections: Vec::new(),
+            pending_comments: Vec::new(),
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
             auth_task: None,
@@ -1490,6 +1494,13 @@ impl ConversationView {
                         if let Some(recovery) = &this.recovery {
                             current.update(cx, |view, cx| {
                                 view.restore_recovery(recovery, window, cx);
+                            });
+                        }
+
+                        if !this.pending_comments.is_empty() {
+                            let comments = std::mem::take(&mut this.pending_comments);
+                            current.update(cx, |thread, cx| {
+                                thread.insert_comments(&comments, window, cx);
                             });
                         }
 
@@ -3736,6 +3747,22 @@ impl ConversationView {
 
     /// Inserts the selected text into the message editor or the message being
     /// edited, if any. Queues the selection until an editor is available.
+    pub(crate) fn insert_comments(
+        &mut self,
+        comments: Vec<AgentComment>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(active_thread) = self.active_thread() {
+            active_thread.update(cx, |thread, cx| {
+                thread.insert_comments(&comments, window, cx);
+            });
+        } else {
+            self.pending_comments.extend(comments);
+            cx.notify();
+        }
+    }
+
     pub(crate) fn insert_selection(
         &mut self,
         selection: AgentContextSelection,

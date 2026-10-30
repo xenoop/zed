@@ -46,7 +46,7 @@ use crate::terminal_thread_metadata_store::{
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
-    NewNativeAgentThreadFromSummary,
+    NewNativeAgentThreadFromSummary, agent_comment::AgentComment,
 };
 use crate::{
     AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, LoadThreadFromClipboard,
@@ -627,6 +627,37 @@ pub fn init(cx: &mut App) {
                                 window,
                                 cx,
                             );
+                        });
+                    },
+                )
+                .register_action(
+                    |workspace: &mut Workspace,
+                     _: &editor::actions::SendReviewToAgent,
+                     window,
+                     cx| {
+                        let Some(agent_panel) = workspace.panel::<AgentPanel>(cx) else {
+                            return;
+                        };
+                        let Some(editor) = workspace
+                            .active_item(cx)
+                            .and_then(|item| item.act_as::<Editor>(cx))
+                        else {
+                            return;
+                        };
+                        let comments = editor
+                            .update(cx, |editor, cx| editor.take_review_comments_for_agent(cx))
+                            .into_iter()
+                            .map(AgentComment::from_review_comment)
+                            .collect::<Vec<_>>();
+                        if comments.is_empty() {
+                            return;
+                        }
+
+                        if !agent_panel.focus_handle(cx).contains_focused(window, cx) {
+                            workspace.toggle_panel_focus::<AgentPanel>(window, cx);
+                        }
+                        agent_panel.update(cx, |panel, cx| {
+                            panel.insert_comments(comments, window, cx);
                         });
                     },
                 )
@@ -4036,6 +4067,25 @@ impl AgentPanel {
 
     pub fn retained_threads(&self) -> &HashMap<ThreadId, Entity<ConversationView>> {
         &self.retained_threads
+    }
+
+    /// Adds comments to the active thread's message, starting a new thread if none is open.
+    fn insert_comments(
+        &mut self,
+        comments: Vec<AgentComment>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_conversation_view().is_none() {
+            self.new_thread(&NewThread, window, cx);
+        }
+        let Some(conversation_view) = self.active_conversation_view().cloned() else {
+            log::error!("couldn't open an agent thread for review comments");
+            return;
+        };
+        conversation_view.update(cx, |conversation_view, cx| {
+            conversation_view.insert_comments(comments, window, cx);
+        });
     }
 
     pub fn active_conversation_view(&self) -> Option<&Entity<ConversationView>> {
