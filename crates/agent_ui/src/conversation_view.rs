@@ -3800,8 +3800,9 @@ impl ConversationView {
             .cloned()
             .context("The agent thread isn't ready yet. Ask again once it is.")?;
         let thread = thread_view.read(cx).thread.clone();
-        // A turn in progress would end first and be taken for the answer.
-        if thread.read(cx).status() != ThreadStatus::Idle {
+        // A turn in progress would end first and be taken for the answer. A new
+        // thread may not have confirmed it is idle yet; that is not a turn.
+        if thread.read(cx).status() == ThreadStatus::Generating {
             return Err(anyhow!(
                 "The agent is still working on something else. Ask again when it is done."
             ));

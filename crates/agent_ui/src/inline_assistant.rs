@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::context::load_context;
 use crate::mention_set::MentionSet;
 use crate::{
-    AgentPanel,
+    Agent, AgentPanel,
     buffer_codegen::{
         BufferCodegen, CodegenAlternative, CodegenEvent, InlineAssistAsksAgentThread,
     },
@@ -229,7 +229,10 @@ impl InlineAssistant {
             return;
         };
         let agent_panel = agent_panel.read(cx);
-        let has_agent_thread = agent_panel.active_conversation_view().is_some();
+        // An external agent (Claude, Codex, ...) can be asked without a Zed
+        // model; a thread is started for it if none is showing.
+        let has_agent_thread = agent_panel.active_conversation_view().is_some()
+            || matches!(agent_panel.selected_agent(cx), Agent::Custom { .. });
 
         let thread_store = agent_panel.thread_store().clone();
         let is_editor_target = matches!(inline_assist_target, InlineAssistTarget::Editor(_));
@@ -1702,26 +1705,31 @@ fn agent_question(
     )
 }
 
-/// Sends `question` to the agent thread open in the agent panel and resolves
-/// with its answer.
+/// Sends `question` to the agent thread in the agent panel, starting one with
+/// the selected agent when none is showing, and resolves with its answer.
 fn ask_agent_thread(
     workspace: &WeakEntity<Workspace>,
     question: String,
     window: &mut Window,
     cx: &mut App,
 ) -> Task<Result<String>> {
-    let conversation_view = workspace
+    let Some(agent_panel) = workspace
         .upgrade()
         .and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx))
-        .and_then(|panel| panel.read(cx).active_conversation_view().cloned());
-    let Some(conversation_view) = conversation_view else {
-        return Task::ready(Err(anyhow!(
-            "Open an agent thread (Codex, Claude Code, ...) in the agent panel first."
-        )));
+    else {
+        return Task::ready(Err(anyhow!("The agent panel isn't available.")));
     };
-    conversation_view
-        .update(cx, |view, cx| view.ask_active_thread(question, window, cx))
-        .unwrap_or_else(|error| Task::ready(Err(error)))
+    let thread = agent_panel.update(cx, |agent_panel, cx| {
+        agent_panel.ensure_agent_thread(window, cx)
+    });
+    window.spawn(cx, async move |cx| {
+        let conversation_view = thread.await?;
+        conversation_view
+            .update_in(cx, |view, window, cx| {
+                view.ask_active_thread(question, window, cx)
+            })??
+            .await
+    })
 }
 
 pub struct InlineAssist {

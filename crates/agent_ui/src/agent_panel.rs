@@ -647,38 +647,31 @@ pub fn init(cx: &mut App) {
                         if editor.read(cx).unsent_review_comment_count() == 0 {
                             return;
                         }
-                        let Some(conversation_view) =
-                            agent_panel.read(cx).active_conversation_view().cloned()
-                        else {
-                            struct ReviewNotSent;
-                            workspace.show_toast(
-                                workspace::Toast::new(
-                                    workspace::notifications::NotificationId::unique::<ReviewNotSent>(),
-                                    "Open an agent thread (Codex, Claude Code, ...) to send the review to, then send it again.",
-                                ),
-                                cx,
-                            );
-                            workspace.focus_panel::<AgentPanel>(window, cx);
-                            return;
-                        };
-
                         // The comments stay in the diff, waiting; the agent's
                         // answer is split per comment and shown under each.
+                        // Without a thread showing, one is started with the
+                        // selected agent.
                         let comments = editor.update(cx, |editor, cx| {
                             editor.send_review_comments_to_agent(window, cx)
                         });
                         let ids: Vec<usize> = comments.iter().map(|comment| comment.id).collect();
                         let question = crate::conversation_view::review_question(&comments, cx);
-                        let answer = conversation_view.update(cx, |view, cx| {
-                            view.ask_active_thread(question, window, cx)
+                        let thread = agent_panel.update(cx, |agent_panel, cx| {
+                            agent_panel.ensure_agent_thread(window, cx)
                         });
                         let editor = editor.downgrade();
                         cx.spawn_in(window, async move |_, cx| {
-                            let answer = match answer {
-                                Ok(answer) => answer.await,
-                                Err(error) => Err(error),
-                            };
-                            let replies = crate::conversation_view::split_review_answer(&ids, answer);
+                            let answer = async {
+                                let conversation_view = thread.await?;
+                                conversation_view
+                                    .update_in(cx, |view, window, cx| {
+                                        view.ask_active_thread(question, window, cx)
+                                    })??
+                                    .await
+                            }
+                            .await;
+                            let replies =
+                                crate::conversation_view::split_review_answer(&ids, answer);
                             editor.update_in(cx, |editor, window, cx| {
                                 editor.set_review_comment_replies(replies, window, cx)
                             })
@@ -4092,6 +4085,43 @@ impl AgentPanel {
 
     pub fn retained_threads(&self) -> &HashMap<ThreadId, Entity<ConversationView>> {
         &self.retained_threads
+    }
+
+    /// The thread that inline assist and review comments ask: the one showing
+    /// in the panel, or a new one with the selected agent (Claude, Codex, ...)
+    /// once it has connected. The panel is not focused.
+    pub(crate) fn ensure_agent_thread(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<ConversationView>>> {
+        const AGENT_START_TIMEOUT: Duration = Duration::from_secs(60);
+        const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+        if self.active_conversation_view().is_none() {
+            self.activate_new_thread(false, AgentThreadSource::AgentPanel, window, cx);
+        }
+        let Some(conversation_view) = self.active_conversation_view().cloned() else {
+            return Task::ready(Err(anyhow!(
+                "Open a project to start an agent thread in the agent panel."
+            )));
+        };
+        cx.spawn(async move |_, cx| {
+            let started = std::time::Instant::now();
+            loop {
+                let connected =
+                    conversation_view.read_with(cx, |view, _| view.active_thread().is_some());
+                if connected {
+                    return Ok(conversation_view);
+                }
+                if started.elapsed() > AGENT_START_TIMEOUT {
+                    return Err(anyhow!(
+                        "The agent didn't start within a minute; check the agent panel."
+                    ));
+                }
+                cx.background_executor().timer(POLL_INTERVAL).await;
+            }
+        })
     }
 
     pub fn active_conversation_view(&self) -> Option<&Entity<ConversationView>> {
@@ -9859,6 +9889,41 @@ mod tests {
         // Lines are 1-based and inclusive; the path is presented as
         // `<rel-path>:<start>-<end>`, with a trailing space.
         assert_eq!(pasted, "file.rs:2-3 ");
+    }
+
+    #[gpui::test]
+    async fn test_ensure_agent_thread_starts_one_when_none_is_showing(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        panel.read_with(&cx, |panel, _| {
+            assert!(panel.active_conversation_view().is_none());
+        });
+
+        let thread = panel.update_in(&mut cx, |panel, window, cx| {
+            panel.ensure_agent_thread(window, cx)
+        });
+        for _ in 0..20 {
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+        }
+        let conversation_view = thread.await.expect("a thread was started and connected");
+
+        panel.read_with(&cx, |panel, cx| {
+            let showing = panel
+                .active_conversation_view()
+                .expect("the new thread is showing in the panel");
+            assert_eq!(showing.entity_id(), conversation_view.entity_id());
+            assert!(showing.read(cx).active_thread().is_some());
+        });
+
+        // With a thread showing, the same one is used.
+        let again = panel.update_in(&mut cx, |panel, window, cx| {
+            panel.ensure_agent_thread(window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            again.await.expect("the showing thread").entity_id(),
+            conversation_view.entity_id()
+        );
     }
 
     async fn setup_panel(cx: &mut TestAppContext) -> (Entity<AgentPanel>, VisualTestContext) {
