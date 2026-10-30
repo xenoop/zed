@@ -90,6 +90,91 @@ pub struct DbThread {
     pub branched_from: Option<DbBranchSource>,
 }
 
+impl DbThread {
+    /// Whether one of this thread's `edit_file` or `write_file` calls wrote `line` into
+    /// the file at `path`. `path` is a project path as the agent's tools use it: the
+    /// worktree's root name followed by the file's path inside that worktree. Lines are
+    /// compared by content rather than position, so a match survives later edits that
+    /// move the line.
+    pub fn wrote_line(&self, path: &str, line: &str) -> bool {
+        let line = line.trim();
+        if line.is_empty() {
+            return false;
+        }
+        let path = path.replace('\\', "/");
+
+        self.messages.iter().any(|message| {
+            let DbMessage::Agent(agent_message) = &**message else {
+                return false;
+            };
+            agent_message.content.iter().any(|content| {
+                let AgentMessageContent::ToolUse(tool_use) = content else {
+                    return false;
+                };
+                let language_model::LanguageModelToolUseInput::Json(input) = &tool_use.input else {
+                    return false;
+                };
+                let Some(tool_path) = input.get("path").and_then(|path| path.as_str()) else {
+                    return false;
+                };
+                let tool_path = tool_path.replace('\\', "/");
+                if tool_path != path && !tool_path.ends_with(&format!("/{path}")) {
+                    return false;
+                }
+
+                let written_texts: Vec<&str> = match tool_use.name.as_ref() {
+                    "edit_file" => input
+                        .get("edits")
+                        .and_then(|edits| edits.as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|edit| edit.get("new_text")?.as_str())
+                        .collect(),
+                    "write_file" => input
+                        .get("content")
+                        .and_then(|content| content.as_str())
+                        .into_iter()
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                written_texts
+                    .iter()
+                    .any(|text| text.lines().any(|written_line| written_line.trim() == line))
+            })
+        })
+    }
+}
+
+/// Finds saved threads whose edits wrote `line` into the file at `path` (see
+/// [`DbThread::wrote_line`]), most recently updated first.
+pub fn find_threads_that_wrote_line(
+    path: String,
+    line: String,
+    cx: &mut App,
+) -> Task<Result<Vec<DbThreadMetadata>>> {
+    let database_future = ThreadsDatabase::connect(cx);
+    cx.spawn(async move |_cx| {
+        let database = database_future
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let mut threads = database.list_threads().await?;
+        threads.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+
+        let mut matches = Vec::new();
+        for metadata in threads {
+            let thread = database
+                .load_thread(metadata.id.clone())
+                .await
+                .log_err()
+                .flatten();
+            if thread.is_some_and(|thread| thread.wrote_line(&path, &line)) {
+                matches.push(metadata);
+            }
+        }
+        Ok(matches)
+    })
+}
+
 /// Where a branched thread was copied from, so it can link back to its parent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DbBranchSource {
@@ -1044,6 +1129,43 @@ mod tests {
             sandbox_grants: DbSandboxGrants::default(),
             branched_from: None,
         }
+    }
+
+    #[test]
+    fn test_wrote_line_matches_edit_and_write_tool_calls() {
+        let tool_use = |name: &str, input: serde_json::Value| {
+            AgentMessageContent::ToolUse(language_model::LanguageModelToolUse {
+                id: "tool-use".into(),
+                name: name.into(),
+                raw_input: input.to_string(),
+                input: language_model::LanguageModelToolUseInput::Json(input),
+                is_input_complete: true,
+                thought_signature: None,
+            })
+        };
+        let mut thread = make_thread("Add parser", Utc::now());
+        thread.messages = vec![Arc::new(DbMessage::Agent(AgentMessage {
+            content: vec![
+                tool_use(
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "zed/src/parser.rs",
+                        "edits": [{"old_text": "todo!()", "new_text": "    parse_tokens(input)\n"}],
+                    }),
+                ),
+                tool_use(
+                    "write_file",
+                    serde_json::json!({"path": "zed/src/lexer.rs", "content": "pub fn lex() {}\n"}),
+                ),
+            ],
+            ..AgentMessage::default()
+        }))];
+
+        assert!(thread.wrote_line("zed/src/parser.rs", "parse_tokens(input)"));
+        assert!(thread.wrote_line("zed/src/lexer.rs", "  pub fn lex() {}  "));
+        assert!(!thread.wrote_line("zed/src/parser.rs", "todo!()"));
+        assert!(!thread.wrote_line("zed/src/other.rs", "parse_tokens(input)"));
+        assert!(!thread.wrote_line("zed/src/parser.rs", "   "));
     }
 
     #[test]

@@ -50,9 +50,10 @@ use crate::{
 };
 use crate::{
     AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, LoadThreadFromClipboard,
-    NewTerminalThread, NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff, RenameSelectedThread,
-    ResetFastModeWarnings, ResetTrialEndUpsell, ResetTrialUpsell, ShowAllSidebarThreadMetadata,
-    ShowThreadMetadata, ToggleNewThreadMenu, ToggleOptionsMenu,
+    NewTerminalThread, NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff,
+    OpenThreadThatWroteLine, RenameSelectedThread, ResetFastModeWarnings, ResetTrialEndUpsell,
+    ResetTrialUpsell, ShowAllSidebarThreadMetadata, ShowThreadMetadata, ToggleNewThreadMenu,
+    ToggleOptionsMenu,
     conversation_view::{
         AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
     },
@@ -67,7 +68,7 @@ use chrono::{DateTime, Utc};
 use client::UserStore;
 use cloud_api_types::Plan;
 use collections::HashMap;
-use editor::{Editor, MultiBuffer};
+use editor::{Editor, MultiBuffer, ToPoint as _};
 use extension_host::ExtensionStore;
 use feature_flags::{CreateThreadToolFeatureFlag, FeatureFlagAppExt as _};
 
@@ -102,6 +103,7 @@ use workspace::{
     ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
     item::{ItemEvent, ItemHandle},
+    notifications::NotifyTaskExt as _,
 };
 
 const AGENT_PANEL_KEY: &str = "agent_panel";
@@ -628,6 +630,11 @@ pub fn init(cx: &mut App) {
                                 cx,
                             );
                         });
+                    },
+                )
+                .register_action(
+                    |workspace: &mut Workspace, _: &OpenThreadThatWroteLine, window, cx| {
+                        open_thread_that_wrote_line(workspace, window, cx);
                     },
                 )
                 .register_action(
@@ -1185,6 +1192,98 @@ pub struct AgentPanel {
     last_context_source: Option<AgentContextSource>,
 
     is_active: bool,
+}
+
+fn open_thread_that_wrote_line(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    struct ThreadThatWroteLineToast;
+    let show_toast = |workspace: &mut Workspace, message: String, cx: &mut Context<Workspace>| {
+        workspace.show_toast(
+            workspace::Toast::new(
+                workspace::notifications::NotificationId::unique::<ThreadThatWroteLineToast>(),
+                message,
+            )
+            .autohide(),
+            cx,
+        );
+    };
+
+    let Some(editor) = workspace
+        .active_item(cx)
+        .and_then(|item| item.act_as::<Editor>(cx))
+    else {
+        show_toast(
+            workspace,
+            "Open a file to find the thread that wrote a line.".into(),
+            cx,
+        );
+        return;
+    };
+    let line_and_path = editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let cursor = editor.selections.newest_anchor().head().to_point(&snapshot);
+        let (buffer, point) = snapshot.point_to_buffer_point(cursor)?;
+        let row = point.row;
+        let line = buffer
+            .text_for_range(
+                language::Point::new(row, 0)..language::Point::new(row, buffer.line_len(row)),
+            )
+            .collect::<String>();
+        let path = buffer.file()?.full_path(cx);
+        Some((path.to_string_lossy().into_owned(), line))
+    });
+    let Some((path, line)) = line_and_path else {
+        show_toast(
+            workspace,
+            "This editor isn't showing a saved file.".into(),
+            cx,
+        );
+        return;
+    };
+    if line.trim().is_empty() {
+        show_toast(workspace, "Put the cursor on a line with code.".into(), cx);
+        return;
+    }
+
+    let search = agent::find_threads_that_wrote_line(path, line, cx);
+    cx.spawn_in(window, async move |workspace, cx| {
+        let threads = search.await?;
+        workspace.update_in(cx, |workspace, window, cx| {
+            let Some(thread) = threads.first() else {
+                show_toast(workspace, "No Zed Agent thread wrote this line.".into(), cx);
+                return;
+            };
+            if threads.len() > 1 {
+                show_toast(
+                    workspace,
+                    format!(
+                        "Opened the most recent of {} threads that wrote this line.",
+                        threads.len()
+                    ),
+                    cx,
+                );
+            }
+            let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                return;
+            };
+            if !panel.focus_handle(cx).contains_focused(window, cx) {
+                workspace.toggle_panel_focus::<AgentPanel>(window, cx);
+            }
+            panel.update(cx, |panel, cx| {
+                panel.open_thread(
+                    thread.id.clone(),
+                    None,
+                    Some(thread.title.clone()),
+                    window,
+                    cx,
+                );
+            });
+        })
+    })
+    .detach_and_notify_err(cx.weak_entity(), window, cx);
 }
 
 impl AgentPanel {
