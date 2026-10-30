@@ -365,6 +365,8 @@ struct ThreadEntry {
     highlight_positions: Vec<usize>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     diff_stats: DiffStats,
+    /// How many branches deep this thread is under the thread it was branched from.
+    branch_depth: usize,
 }
 
 #[derive(Clone)]
@@ -556,6 +558,74 @@ fn root_repository_snapshots(
             .any(|p| p.as_path() == snapshot.work_directory_abs_path.as_ref());
         is_root.then_some(snapshot)
     })
+}
+
+/// Maps each branched Zed Agent thread to the thread it was branched from.
+fn branch_parents(cx: &App) -> HashMap<acp::SessionId, acp::SessionId> {
+    let Some(thread_store) = ThreadStore::try_global(cx) else {
+        return HashMap::default();
+    };
+    thread_store
+        .read(cx)
+        .entries()
+        .filter_map(|thread| Some((thread.id, thread.branched_from_session_id?)))
+        .collect()
+}
+
+/// Moves each branch to just after the thread it was branched from, keeping the order
+/// otherwise, and returns how many branches deep each item is. A branch whose parent
+/// isn't in `items` stays where it is, unnested.
+fn nest_branches<T>(
+    items: Vec<T>,
+    session_id: impl Fn(&T) -> Option<&acp::SessionId>,
+    branch_parents: &HashMap<acp::SessionId, acp::SessionId>,
+) -> Vec<(T, usize)> {
+    let index_by_session: HashMap<acp::SessionId, usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| Some((session_id(item)?.clone(), index)))
+        .collect();
+    let parent_index = |index: usize| -> Option<usize> {
+        let parent = branch_parents.get(session_id(&items[index])?)?;
+        index_by_session
+            .get(parent)
+            .copied()
+            .filter(|parent_index| *parent_index != index)
+    };
+
+    let mut children: HashMap<usize, Vec<usize>> = HashMap::default();
+    let mut roots = Vec::new();
+    for index in 0..items.len() {
+        match parent_index(index) {
+            Some(parent) => children.entry(parent).or_default().push(index),
+            None => roots.push(index),
+        }
+    }
+
+    let mut order = Vec::with_capacity(items.len());
+    let mut visited = vec![false; items.len()];
+    let mut stack: Vec<(usize, usize)> = roots.into_iter().rev().map(|index| (index, 0)).collect();
+    while let Some((index, depth)) = stack.pop() {
+        if std::mem::replace(&mut visited[index], true) {
+            continue;
+        }
+        order.push((index, depth));
+        if let Some(child_indices) = children.get(&index) {
+            stack.extend(child_indices.iter().rev().map(|child| (*child, depth + 1)));
+        }
+    }
+    // Threads that only branch from each other in a loop have no root; keep them flat.
+    order.extend(
+        (0..items.len())
+            .filter(|index| !visited[*index])
+            .map(|index| (index, 0)),
+    );
+
+    let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .filter_map(|(index, depth)| Some((slots.get_mut(index)?.take()?, depth)))
+        .collect()
 }
 
 fn workspace_path_list(workspace: &Entity<Workspace>, cx: &App) -> PathList {
@@ -1611,6 +1681,7 @@ impl Sidebar {
                 .iter()
                 .flat_map(|ws| all_thread_infos_for_workspace(ws, cx));
 
+            let branch_parents = branch_parents(cx);
             let mut threads: Vec<Arc<ThreadEntry>> = Vec::new();
             let mut has_running_threads = false;
             let mut waiting_thread_count: usize = 0;
@@ -1641,6 +1712,7 @@ impl Sidebar {
                             highlight_positions: Vec::new(),
                             worktrees,
                             diff_stats: DiffStats::default(),
+                            branch_depth: 0,
                         })
                     };
 
@@ -1814,6 +1886,19 @@ impl Sidebar {
                     let b_time = Self::thread_display_time(&b.metadata);
                     b_time.cmp(&a_time)
                 });
+                threads = nest_branches(
+                    threads,
+                    |thread| thread.metadata.session_id.as_ref(),
+                    &branch_parents,
+                )
+                .into_iter()
+                .map(|(mut thread, branch_depth)| {
+                    if branch_depth > 0 {
+                        Arc::make_mut(&mut thread).branch_depth = branch_depth;
+                    }
+                    thread
+                })
+                .collect();
             } else {
                 for info in live_infos {
                     if info.status == AgentThreadStatus::Running {
@@ -6335,6 +6420,8 @@ impl Sidebar {
 
         let (icon, icon_svg) = if is_draft {
             (IconName::Circle, None)
+        } else if thread.branch_depth > 0 {
+            (IconName::GitBranch, None)
         } else {
             (thread.icon, thread.icon_from_external_svg.clone())
         };
@@ -6530,7 +6617,7 @@ impl Sidebar {
         let can_open_as_markdown = thread.is_live || is_zed_thread;
         let folder_paths = thread.metadata.folder_paths().clone();
 
-        right_click_menu(context_menu_id)
+        let row = right_click_menu(context_menu_id)
             .trigger(move |_, _, _| thread_item)
             .menu({
                 let thread_id = thread.metadata.thread_id;
@@ -6636,6 +6723,14 @@ impl Sidebar {
                     })
                 }
             })
+            .into_any_element();
+
+        if thread.branch_depth == 0 {
+            return row;
+        }
+        div()
+            .pl(px(12. * thread.branch_depth as f32))
+            .child(row)
             .into_any_element()
     }
 

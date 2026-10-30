@@ -1932,6 +1932,20 @@ impl NativeAgent {
         }
     }
 
+    /// Where an open thread was branched from, if it's a branch.
+    pub fn thread_branched_from(
+        &self,
+        session_id: &acp_v2::SessionId,
+        cx: &App,
+    ) -> Option<DbBranchSource> {
+        self.sessions
+            .get(session_id)?
+            .thread
+            .read(cx)
+            .branched_from()
+            .cloned()
+    }
+
     /// Copies an open thread's history through the turn that starts with
     /// `user_message_id` into a new saved thread, leaving the original unchanged.
     /// Returns the new thread's session ID and title.
