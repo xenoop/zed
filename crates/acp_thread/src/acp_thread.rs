@@ -546,6 +546,9 @@ pub struct Elicitation {
     pub id: ElicitationEntryId,
     pub request: acp_v2::CreateElicitationRequest,
     pub status: ElicitationStatus,
+    /// A readable summary of what the user submitted, kept so an answered question
+    /// can keep showing its answer in the conversation.
+    pub answer: Option<SharedString>,
 }
 
 #[derive(Debug)]
@@ -616,6 +619,7 @@ impl ElicitationStore {
             id: id.clone(),
             request,
             status: ElicitationStatus::Pending { respond_tx },
+            answer: None,
         });
         (id, response_rx)
     }
@@ -645,6 +649,7 @@ impl ElicitationStore {
         if !matches!(elicitation.status, ElicitationStatus::Pending { .. }) {
             return false;
         }
+        elicitation.answer = elicitation_answer_summary(&elicitation.request, &response);
         let ElicitationStatus::Pending { respond_tx } = mem::replace(
             &mut elicitation.status,
             elicitation_status_for_response(&response),
@@ -2024,6 +2029,106 @@ impl Display for ToolCallStatus {
                 ToolCallStatus::Canceled => "Canceled",
             }
         )
+    }
+}
+
+/// Summarizes an accepted form response for display. A single answered field shows just
+/// its value; several fields show one `Title: value` line each.
+fn elicitation_answer_summary(
+    request: &acp_v2::CreateElicitationRequest,
+    response: &acp_v2::CreateElicitationResponse,
+) -> Option<SharedString> {
+    let acp_v2::ElicitationMode::Form(mode) = &request.mode else {
+        return None;
+    };
+    let acp_v2::ElicitationAction::Accept(accept) = &response.action else {
+        return None;
+    };
+    let content = accept.content.as_ref()?;
+
+    let answers = mode
+        .requested_schema
+        .properties
+        .iter()
+        .filter_map(|(name, property)| {
+            let value = match content.get(name)? {
+                acp_v2::ElicitationContentValue::String(value) => {
+                    elicitation_option_title(property, value)
+                }
+                acp_v2::ElicitationContentValue::Integer(value) => value.to_string(),
+                acp_v2::ElicitationContentValue::Number(value) => value.to_string(),
+                acp_v2::ElicitationContentValue::Boolean(value) => {
+                    if *value { "Yes" } else { "No" }.to_string()
+                }
+                acp_v2::ElicitationContentValue::StringArray(values) => values
+                    .iter()
+                    .map(|value| elicitation_option_title(property, value))
+                    .join(", "),
+                _ => return None,
+            };
+            if value.is_empty() {
+                return None;
+            }
+            Some((elicitation_property_title(name, property), value))
+        })
+        .collect::<Vec<_>>();
+
+    match answers.as_slice() {
+        [] => None,
+        [(_, value)] => Some(value.clone().into()),
+        answers => Some(
+            answers
+                .iter()
+                .map(|(title, value)| format!("{title}: {value}"))
+                .join("\n")
+                .into(),
+        ),
+    }
+}
+
+fn elicitation_property_title(name: &str, property: &acp_v2::ElicitationPropertySchema) -> String {
+    let title = match property {
+        acp_v2::ElicitationPropertySchema::String(schema) => schema.title.as_deref(),
+        acp_v2::ElicitationPropertySchema::Number(schema) => schema.title.as_deref(),
+        acp_v2::ElicitationPropertySchema::Integer(schema) => schema.title.as_deref(),
+        acp_v2::ElicitationPropertySchema::Boolean(schema) => schema.title.as_deref(),
+        acp_v2::ElicitationPropertySchema::Array(schema) => schema.title.as_deref(),
+        _ => None,
+    };
+    title.unwrap_or(name).to_string()
+}
+
+/// Maps a submitted option value back to the label the user picked.
+fn elicitation_option_title(property: &acp_v2::ElicitationPropertySchema, value: &str) -> String {
+    let title = match property {
+        acp_v2::ElicitationPropertySchema::String(schema) => schema
+            .one_of
+            .iter()
+            .flatten()
+            .find(|option| option.value == value)
+            .map(|option| option.title.clone()),
+        acp_v2::ElicitationPropertySchema::Array(schema) => match &schema.items {
+            acp_v2::MultiSelectItems::Titled(items) => items
+                .options
+                .iter()
+                .find(|option| option.value == value)
+                .map(|option| option.title.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    title.unwrap_or_else(|| value.to_string())
+}
+
+fn elicitation_tool_call_id(elicitation: &Elicitation) -> Option<&acp_v2::ToolCallId> {
+    let scope = match &elicitation.request.mode {
+        acp_v2::ElicitationMode::Form(mode) => &mode.scope,
+        acp_v2::ElicitationMode::Url(mode) => &mode.scope,
+        _ => return None,
+    };
+    match scope {
+        acp_v2::ElicitationScope::Session(scope) => scope.tool_call_id.as_ref(),
+        _ => None,
     }
 }
 
@@ -6779,6 +6884,14 @@ impl AcpThread {
                 matches!(entry, AgentThreadEntry::Elicitation(elicitation_id) if elicitation_id == id)
                     .then_some(index)
             })
+    }
+
+    /// Whether a question in this thread was asked on behalf of the given tool call.
+    pub fn tool_call_has_elicitation(&self, tool_call_id: &acp_v2::ToolCallId) -> bool {
+        self.elicitations
+            .elicitations()
+            .iter()
+            .any(|elicitation| elicitation_tool_call_id(elicitation) == Some(tool_call_id))
     }
 
     pub fn elicitation(&self, id: &ElicitationEntryId) -> Option<(usize, &Elicitation)> {
@@ -19798,6 +19911,76 @@ mod tests {
             };
             assert!(matches!(elicitation.status, ElicitationStatus::Canceled));
         });
+    }
+
+    #[test]
+    fn test_elicitation_answer_summary_uses_option_titles() {
+        let scope = acp_v2::ElicitationSessionScope::new(acp_v2::SessionId::new("session"));
+        let accept = |entries: Vec<(&str, acp_v2::ElicitationContentValue)>| {
+            acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Accept(
+                acp_v2::ElicitationAcceptAction::new().content(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key.to_string(), value))
+                        .collect::<std::collections::BTreeMap<_, _>>(),
+                ),
+            ))
+        };
+
+        let single_choice = acp_v2::CreateElicitationRequest::new(
+            acp_v2::ElicitationFormMode::new(
+                scope.clone(),
+                acp_v2::ElicitationSchema::new().property(
+                    "choice",
+                    acp_v2::StringPropertySchema::new()
+                        .one_of(vec![acp_v2::EnumOption::new("b", "Approach B")]),
+                    true,
+                ),
+            ),
+            "Which approach?",
+        );
+        assert_eq!(
+            elicitation_answer_summary(
+                &single_choice,
+                &accept(vec![("choice", acp_v2::ElicitationContentValue::from("b"))]),
+            ),
+            Some("Approach B".into())
+        );
+        assert_eq!(
+            elicitation_answer_summary(
+                &single_choice,
+                &acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Decline),
+            ),
+            None
+        );
+
+        let several_fields = acp_v2::CreateElicitationRequest::new(
+            acp_v2::ElicitationFormMode::new(
+                scope,
+                acp_v2::ElicitationSchema::new()
+                    .property(
+                        "name",
+                        acp_v2::StringPropertySchema::new().title("Name"),
+                        true,
+                    )
+                    .property(
+                        "confirm",
+                        acp_v2::BooleanPropertySchema::new().title("Confirm"),
+                        true,
+                    ),
+            ),
+            "Details",
+        );
+        assert_eq!(
+            elicitation_answer_summary(
+                &several_fields,
+                &accept(vec![
+                    ("name", acp_v2::ElicitationContentValue::from("widget")),
+                    ("confirm", acp_v2::ElicitationContentValue::Boolean(true)),
+                ]),
+            ),
+            Some("Confirm: Yes\nName: widget".into())
+        );
     }
 
     #[gpui::test]

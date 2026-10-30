@@ -44,7 +44,8 @@ use parking_lot::{Mutex, RwLock};
 use project::{AgentId, AgentServerStore, Project, ProjectEntryId, ProjectPath};
 
 use crate::conversation_view::elicitation::{
-    ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
+    ElicitationCard, ElicitationCardHandlers, ElicitationFormState,
+    should_render_pinned_elicitation,
 };
 use crate::message_editor::SessionCapabilities;
 use crate::{AgentThreadSource, DEFAULT_THREAD_TITLE, resolve_agent_image};
@@ -2938,23 +2939,17 @@ impl ConversationView {
         };
 
         let handlers = Self::request_elicitation_card_handlers(view);
-        let agent_display_name = self
-            .agent_server_store
-            .read(cx)
-            .agent_display_name(&self.agent.agent_id())
-            .unwrap_or_else(|| self.agent.agent_id().0);
 
         store
             .read(cx)
             .elicitations()
             .iter()
             .enumerate()
-            .filter(|(_, elicitation)| should_render_elicitation(elicitation))
+            .filter(|(_, elicitation)| should_render_pinned_elicitation(elicitation))
             .map(|(ix, elicitation)| {
                 ElicitationCard::new(
                     ix,
                     elicitation,
-                    agent_display_name.clone(),
                     self.request_elicitation_form_states.get(&elicitation.id),
                     handlers.clone(),
                 )
@@ -2980,15 +2975,6 @@ impl ConversationView {
                 move |elicitation_id, window, cx| {
                     view.update(cx, |this, cx| {
                         this.decline_request_elicitation(elicitation_id, window, cx);
-                    })
-                    .log_err();
-                }
-            },
-            {
-                let view = view.clone();
-                move |elicitation_id, window, cx| {
-                    view.update(cx, |this, cx| {
-                        this.cancel_request_elicitation(elicitation_id, window, cx);
                     })
                     .log_err();
                 }
@@ -3156,19 +3142,6 @@ impl ConversationView {
         self.respond_to_request_elicitation(
             elicitation_id,
             acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Decline),
-            cx,
-        );
-    }
-
-    fn cancel_request_elicitation(
-        &mut self,
-        elicitation_id: ElicitationEntryId,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.respond_to_request_elicitation(
-            elicitation_id,
-            acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Cancel),
             cx,
         );
     }

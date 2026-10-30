@@ -3542,19 +3542,6 @@ impl ThreadView {
         );
     }
 
-    fn cancel_elicitation(
-        &mut self,
-        elicitation_id: ElicitationEntryId,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.respond_to_elicitation(
-            elicitation_id,
-            acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Cancel),
-            cx,
-        );
-    }
-
     fn dismiss_url_elicitation(
         &mut self,
         elicitation_id: ElicitationEntryId,
@@ -7487,6 +7474,18 @@ impl ThreadView {
                 }
             }
             AgentThreadEntry::ToolCall(tool_call) => {
+                // A tool call that only asks the user something (like `ask_user`) is shown
+                // by its question card, which also keeps the answer, so it isn't drawn twice.
+                if tool_call.content().is_empty()
+                    && tool_call.authorization_id().is_none()
+                    && self
+                        .thread
+                        .read(cx)
+                        .tool_call_has_elicitation(&tool_call.id)
+                {
+                    return Empty.into_any();
+                }
+
                 // A canceled tool call that produced visible output is still worth
                 // showing, but one that was canceled before producing anything just
                 // renders as a useless "Canceled" card — hide those entirely.
@@ -7743,7 +7742,6 @@ impl ThreadView {
         ElicitationCard::new(
             entry_ix,
             elicitation,
-            self.agent_display_name.clone(),
             self.elicitation_form_states.get(&elicitation.id),
             self.elicitation_card_handlers(cx),
         )
@@ -7768,15 +7766,6 @@ impl ThreadView {
                 move |elicitation_id, window, cx| {
                     view.update(cx, |this, cx| {
                         this.decline_elicitation(elicitation_id, window, cx);
-                    })
-                    .log_err();
-                }
-            },
-            {
-                let view = view.clone();
-                move |elicitation_id, window, cx| {
-                    view.update(cx, |this, cx| {
-                        this.cancel_elicitation(elicitation_id, window, cx);
                     })
                     .log_err();
                 }

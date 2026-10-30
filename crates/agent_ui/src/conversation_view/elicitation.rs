@@ -383,6 +383,7 @@ mod tests {
                         "Choose an answer.",
                     ),
                     status: pending_status(),
+                    answer: None,
                 },
                 events: Rc::default(),
             }
@@ -409,7 +410,6 @@ mod tests {
             let handlers = ElicitationCardHandlers {
                 on_submit: response_handler("submit"),
                 on_decline: response_handler("decline"),
-                on_cancel: response_handler("cancel"),
                 on_dismiss_url: response_handler("dismiss"),
                 on_open_url: {
                     let events = self.events.clone();
@@ -450,14 +450,8 @@ mod tests {
                     panic!("form submission must not send a chat message");
                 })
                 .child(
-                    ElicitationCard::new(
-                        0,
-                        &self.elicitation,
-                        "Claude Code".into(),
-                        Some(&self.form_state),
-                        handlers,
-                    )
-                    .render(cx),
+                    ElicitationCard::new(0, &self.elicitation, Some(&self.form_state), handlers)
+                        .render(cx),
                 )
         }
     }
@@ -560,13 +554,13 @@ mod tests {
         cx.update(|window, cx| assert!(other.focus_handle(cx).is_focused(window)));
         press_keys(cx, "tab");
         cx.update(|window, _| assert!(submit_focus.is_focused(window)));
-        press_keys(cx, "enter tab enter tab space");
-        assert_eq!(*events.borrow(), ["submit", "decline", "cancel"]);
+        press_keys(cx, "enter tab enter");
+        assert_eq!(*events.borrow(), ["submit", "decline"]);
 
-        press_keys(cx, "shift-tab space");
-        assert_eq!(*events.borrow(), ["submit", "decline", "cancel", "decline"]);
+        press_keys(cx, "space");
+        assert_eq!(*events.borrow(), ["submit", "decline", "decline"]);
         let decline_focus =
-            cx.update(|window, cx| window.focused(cx).expect("Decline should be focused"));
+            cx.update(|window, cx| window.focused(cx).expect("Skip should be focused"));
 
         cx.update(|window, cx| window.focus(&submit_focus, cx));
         view.update(cx, |view, cx| {
@@ -679,8 +673,8 @@ mod tests {
         let url_events = url.read_with(cx, |url, _| url.events.clone());
         cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
 
-        press_keys(cx, "tab tab tab enter");
-        assert_eq!(*form_events.borrow(), ["cancel"]);
+        press_keys(cx, "tab tab enter");
+        assert_eq!(*form_events.borrow(), ["decline"]);
         press_keys(cx, "tab enter");
         assert_eq!(
             *url_events.borrow(),
@@ -688,9 +682,9 @@ mod tests {
         );
 
         press_keys(cx, "shift-tab enter");
-        assert_eq!(*form_events.borrow(), ["cancel", "cancel"]);
-        press_keys(cx, "shift-tab shift-tab enter");
-        assert_eq!(*form_events.borrow(), ["cancel", "cancel", "submit"]);
+        assert_eq!(*form_events.borrow(), ["decline", "decline"]);
+        press_keys(cx, "shift-tab enter");
+        assert_eq!(*form_events.borrow(), ["decline", "decline", "submit"]);
         press_keys(cx, "shift-tab");
         cx.update(|window, cx| assert!(editor.focus_handle(cx).is_focused(window)));
 
@@ -698,7 +692,7 @@ mod tests {
             url.elicitation.status = ElicitationStatus::Accepted;
             cx.notify();
         });
-        press_keys(cx, "tab tab tab tab enter tab enter");
+        press_keys(cx, "tab tab tab enter tab enter");
         assert_eq!(
             *url_events.borrow(),
             [
@@ -708,7 +702,7 @@ mod tests {
                 "dismiss",
             ]
         );
-        assert_eq!(*form_events.borrow(), ["cancel", "cancel", "submit"]);
+        assert_eq!(*form_events.borrow(), ["decline", "decline", "submit"]);
     }
 
     #[test]
@@ -812,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn should_render_pending_and_accepted_url_elicitations() {
+    fn should_render_questions_in_conversation_and_pinned() {
         let pending = Elicitation {
             id: ElicitationEntryId("pending".into()),
             request: acp::CreateElicitationRequest::new(
@@ -823,8 +817,10 @@ mod tests {
                 "Review this request.",
             ),
             status: pending_status(),
+            answer: None,
         };
         assert!(should_render_elicitation(&pending));
+        assert!(should_render_pinned_elicitation(&pending));
 
         let accepted_url = Elicitation {
             id: ElicitationEntryId("accepted-url".into()),
@@ -837,8 +833,10 @@ mod tests {
                 "Authorize Zed in your browser.",
             ),
             status: ElicitationStatus::Accepted,
+            answer: None,
         };
         assert!(should_render_elicitation(&accepted_url));
+        assert!(should_render_pinned_elicitation(&accepted_url));
 
         let accepted_form = Elicitation {
             id: ElicitationEntryId("accepted-form".into()),
@@ -850,8 +848,10 @@ mod tests {
                 "Review this request.",
             ),
             status: ElicitationStatus::Accepted,
+            answer: Some("Approach B".into()),
         };
-        assert!(!should_render_elicitation(&accepted_form));
+        assert!(should_render_elicitation(&accepted_form));
+        assert!(!should_render_pinned_elicitation(&accepted_form));
 
         let pending_unknown = Elicitation {
             id: ElicitationEntryId("pending-unknown".into()),
@@ -860,8 +860,10 @@ mod tests {
                 "Use a future input mode.",
             ),
             status: pending_status(),
+            answer: None,
         };
         assert!(!should_render_elicitation(&pending_unknown));
+        assert!(!should_render_pinned_elicitation(&pending_unknown));
     }
 
     #[test]
@@ -1332,13 +1334,13 @@ impl Component for ElicitationCardPreview {
                     "Terminal States",
                     vec![
                         single_example(
-                            "Declined",
-                            render_form_preview(6, ElicitationStatus::Declined, &[], window, cx),
+                            "Answered",
+                            render_form_preview(6, ElicitationStatus::Accepted, &[], window, cx),
                         )
                         .width(px(640.)),
                         single_example(
-                            "Canceled",
-                            render_form_preview(7, ElicitationStatus::Canceled, &[], window, cx),
+                            "Skipped",
+                            render_form_preview(7, ElicitationStatus::Declined, &[], window, cx),
                         )
                         .width(px(640.)),
                     ],
@@ -1373,7 +1375,9 @@ fn render_form_preview(
         }
     }
 
-    render_preview_card(entry_ix, request, status, form_state.as_ref(), cx)
+    let answer = matches!(status, ElicitationStatus::Accepted)
+        .then(|| SharedString::from("Account Name: Zed Industries\nEnvironment: Production"));
+    render_preview_card(entry_ix, request, status, answer, form_state.as_ref(), cx)
 }
 
 fn preview_url() -> &'static str {
@@ -1395,13 +1399,14 @@ fn render_url_preview(
         "Authorize Zed in your browser to finish signing in.",
     );
 
-    render_preview_card(entry_ix, request, status, None, cx)
+    render_preview_card(entry_ix, request, status, None, None, cx)
 }
 
 fn render_preview_card(
     entry_ix: usize,
     request: acp::CreateElicitationRequest,
     status: ElicitationStatus,
+    answer: Option<SharedString>,
     form_state: Option<&ElicitationFormState>,
     cx: &App,
 ) -> AnyElement {
@@ -1409,6 +1414,7 @@ fn render_preview_card(
         id: ElicitationEntryId(format!("preview-elicitation-{entry_ix}").into()),
         request,
         status,
+        answer,
     };
 
     div()
@@ -1418,7 +1424,6 @@ fn render_preview_card(
             ElicitationCard::new(
                 entry_ix,
                 &elicitation,
-                "Example Agent".into(),
                 form_state,
                 ElicitationCardHandlers::noop(),
             )
@@ -1775,7 +1780,6 @@ type MultiSelectHandler = Rc<dyn Fn(ElicitationEntryId, String, String, bool, &m
 pub(crate) struct ElicitationCardHandlers {
     on_submit: RespondHandler,
     on_decline: RespondHandler,
-    on_cancel: RespondHandler,
     on_dismiss_url: RespondHandler,
     on_open_url: OpenUrlHandler,
     on_boolean_change: BooleanHandler,
@@ -1787,7 +1791,6 @@ impl ElicitationCardHandlers {
     pub(crate) fn new(
         on_submit: impl Fn(ElicitationEntryId, &mut Window, &mut App) + 'static,
         on_decline: impl Fn(ElicitationEntryId, &mut Window, &mut App) + 'static,
-        on_cancel: impl Fn(ElicitationEntryId, &mut Window, &mut App) + 'static,
         on_dismiss_url: impl Fn(ElicitationEntryId, &mut Window, &mut App) + 'static,
         on_open_url: impl Fn(ElicitationEntryId, String, &mut Window, &mut App) + 'static,
         on_boolean_change: impl Fn(ElicitationEntryId, String, bool, &mut App) + 'static,
@@ -1797,7 +1800,6 @@ impl ElicitationCardHandlers {
         Self {
             on_submit: Rc::new(on_submit),
             on_decline: Rc::new(on_decline),
-            on_cancel: Rc::new(on_cancel),
             on_dismiss_url: Rc::new(on_dismiss_url),
             on_open_url: Rc::new(on_open_url),
             on_boolean_change: Rc::new(on_boolean_change),
@@ -1811,7 +1813,6 @@ impl ElicitationCardHandlers {
             |_, _, _| {},
             |_, _, _| {},
             |_, _, _| {},
-            |_, _, _| {},
             |_, _, _, _| {},
             |_, _, _, _| {},
             |_, _, _, _| {},
@@ -1820,7 +1821,22 @@ impl ElicitationCardHandlers {
     }
 }
 
+/// Questions in the conversation stay visible after they're answered, so the answer
+/// reads in place under the question.
 pub(crate) fn should_render_elicitation(elicitation: &Elicitation) -> bool {
+    match &elicitation.request.mode {
+        acp::ElicitationMode::Form(_) => true,
+        acp::ElicitationMode::Url(_) => matches!(
+            elicitation.status,
+            ElicitationStatus::Pending { .. } | ElicitationStatus::Accepted
+        ),
+        _ => false,
+    }
+}
+
+/// Questions that aren't part of a conversation are pinned above the message editor,
+/// so they're only shown while they still need the user.
+pub(crate) fn should_render_pinned_elicitation(elicitation: &Elicitation) -> bool {
     matches!(
         (&elicitation.status, &elicitation.request.mode),
         (
@@ -1884,7 +1900,6 @@ fn is_url_display_segment_boundary(character: char) -> bool {
 pub(crate) struct ElicitationCard<'a> {
     entry_ix: usize,
     elicitation: &'a Elicitation,
-    requester_name: SharedString,
     form_state: Option<&'a ElicitationFormState>,
     handlers: ElicitationCardHandlers,
 }
@@ -1893,14 +1908,12 @@ impl<'a> ElicitationCard<'a> {
     pub(crate) fn new(
         entry_ix: usize,
         elicitation: &'a Elicitation,
-        requester_name: SharedString,
         form_state: Option<&'a ElicitationFormState>,
         handlers: ElicitationCardHandlers,
     ) -> Self {
         Self {
             entry_ix,
             elicitation,
-            requester_name,
             form_state,
             handlers,
         }
@@ -1913,35 +1926,34 @@ impl<'a> ElicitationCard<'a> {
             .colors()
             .element_background
             .blend(cx.theme().colors().editor_foreground.opacity(0.025));
-        let tool_name_font_size = rems_from_px(13_f32);
         let is_pending = matches!(&self.elicitation.status, ElicitationStatus::Pending { .. });
         let is_accepted_url = matches!(
             (&self.elicitation.status, &self.elicitation.request.mode),
             (ElicitationStatus::Accepted, acp::ElicitationMode::Url(_))
         );
         let (status_label, status_icon, status_color) = match &self.elicitation.status {
-            ElicitationStatus::Pending { .. } => ("Waiting for input", IconName::Info, Color::Info),
+            ElicitationStatus::Pending { .. } => (None, IconName::Info, Color::Info),
             ElicitationStatus::Accepted if is_accepted_url => {
-                ("Waiting for completion", IconName::Info, Color::Info)
+                (Some("Waiting for completion"), IconName::Info, Color::Info)
             }
-            ElicitationStatus::Accepted => ("Submitted", IconName::Check, Color::Success),
-            ElicitationStatus::Declined => ("Declined", IconName::Close, Color::Muted),
-            ElicitationStatus::Canceled => ("Canceled", IconName::Circle, Color::Muted),
-            ElicitationStatus::Completed => ("Completed", IconName::Check, Color::Success),
+            ElicitationStatus::Accepted => (Some("Answered"), IconName::Check, Color::Success),
+            ElicitationStatus::Declined | ElicitationStatus::Canceled => {
+                (Some("Skipped"), IconName::Close, Color::Muted)
+            }
+            ElicitationStatus::Completed => (Some("Completed"), IconName::Check, Color::Success),
         };
 
-        let body = v_flex()
-            .gap_2()
-            .p_3()
-            .child(Label::new(self.elicitation.request.message.clone()).size(LabelSize::Small));
         let body = match &self.elicitation.request.mode {
-            acp::ElicitationMode::Form(mode) if is_pending => {
-                body.child(self.render_form(mode, cx))
-            }
+            acp::ElicitationMode::Form(mode) if is_pending => Some(self.render_form(mode, cx)),
             acp::ElicitationMode::Url(mode) if is_pending || is_accepted_url => {
-                body.child(self.render_url_elicitation(mode))
+                Some(self.render_url_elicitation(mode))
             }
-            _ => body,
+            acp::ElicitationMode::Form(_) => self
+                .elicitation
+                .answer
+                .clone()
+                .map(|answer| Label::new(answer).size(LabelSize::Small).into_any_element()),
+            _ => None,
         };
 
         v_flex()
@@ -1957,8 +1969,10 @@ impl<'a> ElicitationCard<'a> {
             .overflow_hidden()
             .child(
                 h_flex()
-                    .h_8()
-                    .p_1()
+                    .min_h_8()
+                    .py_1()
+                    .px_2()
+                    .gap_1p5()
                     .w_full()
                     .justify_between()
                     .bg(header_background)
@@ -1966,25 +1980,27 @@ impl<'a> ElicitationCard<'a> {
                         h_flex()
                             .min_w_0()
                             .gap_1p5()
-                            .px_1()
                             .child(
                                 Icon::new(status_icon)
                                     .size(IconSize::Small)
                                     .color(status_color),
                             )
                             .child(
-                                Label::new(format!("Input Requested by {}", self.requester_name))
-                                    .size(LabelSize::Custom(tool_name_font_size))
-                                    .truncate(),
+                                Label::new(self.elicitation.request.message.clone())
+                                    .size(LabelSize::Custom(rems_from_px(13_f32))),
                             ),
                     )
-                    .child(
-                        Label::new(status_label)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
+                    .when_some(status_label, |this, status_label| {
+                        this.child(
+                            Label::new(status_label)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    }),
             )
-            .child(body)
+            .when_some(body, |this, body| {
+                this.child(v_flex().p_3().gap_2().child(body))
+            })
             .when(is_pending || is_accepted_url, |this| {
                 this.child(self.render_actions(cx))
             })
@@ -2339,11 +2355,9 @@ impl<'a> ElicitationCard<'a> {
         let on_submit = self.handlers.on_submit.clone();
         let on_open_url = self.handlers.on_open_url.clone();
         let on_decline = self.handlers.on_decline.clone();
-        let on_cancel = self.handlers.on_cancel.clone();
         let on_dismiss_url = self.handlers.on_dismiss_url.clone();
         let submit_id = self.elicitation.id.clone();
         let decline_id = self.elicitation.id.clone();
-        let cancel_id = self.elicitation.id.clone();
         let dismiss_id = self.elicitation.id.clone();
 
         h_flex()
@@ -2376,24 +2390,11 @@ impl<'a> ElicitationCard<'a> {
             )
             .when(!is_accepted_url, |this| {
                 this.child(
-                    Button::new(("elicitation-decline", self.entry_ix), "Decline")
+                    Button::new(("elicitation-skip", self.entry_ix), "Skip")
                         .tab_index(0_isize)
-                        .start_icon(
-                            Icon::new(IconName::Close)
-                                .size(IconSize::XSmall)
-                                .color(Color::Error),
-                        )
                         .label_size(LabelSize::Small)
                         .on_click(move |_, window, cx| {
                             on_decline(decline_id.clone(), window, cx);
-                        }),
-                )
-                .child(
-                    Button::new(("elicitation-cancel", self.entry_ix), "Cancel")
-                        .tab_index(0_isize)
-                        .label_size(LabelSize::Small)
-                        .on_click(move |_, window, cx| {
-                            on_cancel(cancel_id.clone(), window, cx);
                         }),
                 )
             })
