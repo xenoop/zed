@@ -6,9 +6,10 @@ use crate::{
 use anyhow::Result;
 use buffer_diff::BufferDiff;
 use collections::{HashMap, HashSet};
+use db::kvp::KeyValueStore;
 use editor::{
-    EditorEvent, EditorSettings, SelectionEffects, SplittableEditor, actions::GoToHunk,
-    multibuffer_context_lines, scroll::Autoscroll,
+    EditorEvent, EditorSettings, ReviewCommentForAgent, SelectionEffects, SplittableEditor,
+    actions::GoToHunk, multibuffer_context_lines, scroll::Autoscroll,
 };
 use futures::{FutureExt as _, StreamExt as _, stream};
 use futures_lite::future::yield_now;
@@ -26,6 +27,7 @@ use project::{
         diff_buffer_list::{self, BranchDiffEvent, DiffBase},
     },
 };
+use serde::{Deserialize, Serialize};
 use settings::{GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore};
 use std::{collections::BTreeMap, sync::Arc};
 use theme::ActiveTheme;
@@ -49,6 +51,42 @@ struct BufferSubscriptions {
     _conflict_set_subscription: Option<Subscription>,
 }
 
+/// A review comment as saved between sessions.
+#[derive(Serialize, Deserialize)]
+struct SavedReviewComment {
+    path: String,
+    start_row: u32,
+    end_row: u32,
+    code: String,
+    comment: String,
+}
+
+impl SavedReviewComment {
+    fn from_review_comment(comment: &ReviewCommentForAgent) -> Self {
+        Self {
+            path: comment.path.as_unix_str().to_string(),
+            start_row: *comment.rows.start(),
+            end_row: *comment.rows.end(),
+            code: comment.code.clone(),
+            comment: comment.comment.clone(),
+        }
+    }
+
+    fn into_review_comment(self) -> Option<ReviewCommentForAgent> {
+        let path = if self.path.is_empty() {
+            Arc::from(RelPath::empty())
+        } else {
+            Arc::from(RelPath::from_unix_str(&self.path).log_err()?)
+        };
+        Some(ReviewCommentForAgent {
+            path,
+            rows: self.start_row..=self.end_row,
+            code: self.code,
+            comment: self.comment,
+        })
+    }
+}
+
 pub struct DiffMultibuffer {
     multibuffer: Entity<MultiBuffer>,
     branch_diff: Entity<diff_buffer_list::DiffBufferList>,
@@ -58,7 +96,13 @@ pub struct DiffMultibuffer {
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
     review_comment_count: usize,
+    review_comments_key: Option<String>,
+    /// Saved comments whose code isn't shown yet, retried after each refresh.
+    unrestored_review_comments: Vec<ReviewCommentForAgent>,
+    review_comments_loaded: bool,
     empty_label: SharedString,
+    _load_review_comments: Task<()>,
+    _save_review_comments: Task<()>,
     _task: Task<Result<()>>,
     _subscription: Subscription,
 }
@@ -68,6 +112,7 @@ impl DiffMultibuffer {
         branch_diff: Entity<diff_buffer_list::DiffBufferList>,
         multibuffer_capability: Capability,
         empty_label: impl Into<SharedString>,
+        review_comments_kind: &'static str,
         configure_editor: impl FnOnce(&mut SplittableEditor, &mut Context<SplittableEditor>) + 'static,
         project: Entity<Project>,
         workspace: Entity<Workspace>,
@@ -102,6 +147,7 @@ impl DiffMultibuffer {
             cx.subscribe(&primary_editor, |this, _editor, event: &EditorEvent, cx| {
                 if let EditorEvent::ReviewCommentsChanged { total_count } = event {
                     this.review_comment_count = *total_count;
+                    this.save_review_comments(cx);
                     cx.notify();
                 }
             });
@@ -161,6 +207,8 @@ impl DiffMultibuffer {
             async |cx| Self::refresh(this, cx).await
         });
 
+        let load_review_comments = Self::load_review_comments(review_comments_kind, cx);
+
         Self {
             workspace: workspace.downgrade(),
             branch_diff,
@@ -170,7 +218,12 @@ impl DiffMultibuffer {
             buffer_subscriptions: Default::default(),
             pending_scroll: None,
             review_comment_count: 0,
+            review_comments_key: None,
+            unrestored_review_comments: Vec::new(),
+            review_comments_loaded: false,
             empty_label: empty_label.into(),
+            _load_review_comments: load_review_comments,
+            _save_review_comments: Task::ready(()),
             _task: task,
             _subscription: Subscription::join(
                 branch_diff_subscription,
@@ -729,10 +782,94 @@ impl DiffMultibuffer {
                 });
             }
             this.pending_scroll.take();
+            this.restore_review_comments(cx);
             cx.notify();
         })?;
 
         Ok(())
+    }
+
+    fn load_review_comments(
+        review_comments_kind: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let kvp = KeyValueStore::global(cx);
+        // Runs after construction, since the workspace may be mid-update while this
+        // view is being created.
+        cx.spawn(async move |this, cx| {
+            let key = this
+                .update(cx, |this, cx| {
+                    let workspace_id = this
+                        .workspace
+                        .read_with(cx, |workspace, _| workspace.database_id())
+                        .ok()
+                        .flatten()?;
+                    let key = format!(
+                        "diff-review-comments-{review_comments_kind}-{}",
+                        i64::from(workspace_id)
+                    );
+                    this.review_comments_key = Some(key.clone());
+                    Some(key)
+                })
+                .ok()
+                .flatten();
+            let Some(key) = key else {
+                return;
+            };
+            let saved = cx
+                .background_spawn(async move { kvp.read_kvp(&key) })
+                .await
+                .log_err()
+                .flatten()
+                .and_then(|json| serde_json::from_str::<Vec<SavedReviewComment>>(&json).log_err())
+                .unwrap_or_default();
+            this.update(cx, |this, cx| {
+                this.unrestored_review_comments = saved
+                    .into_iter()
+                    .filter_map(SavedReviewComment::into_review_comment)
+                    .collect();
+                this.review_comments_loaded = true;
+                this.restore_review_comments(cx);
+            })
+            .log_err();
+        })
+    }
+
+    fn restore_review_comments(&mut self, cx: &mut Context<Self>) {
+        if self.unrestored_review_comments.is_empty() {
+            return;
+        }
+        let comments = std::mem::take(&mut self.unrestored_review_comments);
+        let primary_editor = self.editor.read(cx).rhs_editor().clone();
+        self.unrestored_review_comments = primary_editor.update(cx, |editor, cx| {
+            editor.restore_review_comments(comments, cx)
+        });
+    }
+
+    fn save_review_comments(&mut self, cx: &mut Context<Self>) {
+        // Saving before the earlier comments are loaded would overwrite them.
+        if !self.review_comments_loaded {
+            return;
+        }
+        let Some(key) = self.review_comments_key.clone() else {
+            return;
+        };
+        let primary_editor = self.editor.read(cx).rhs_editor().clone();
+        let saved = primary_editor
+            .read(cx)
+            .review_comments_with_code(cx)
+            .iter()
+            .chain(&self.unrestored_review_comments)
+            .map(SavedReviewComment::from_review_comment)
+            .collect::<Vec<_>>();
+        let kvp = KeyValueStore::global(cx);
+        self._save_review_comments = cx.background_spawn(async move {
+            if saved.is_empty() {
+                kvp.delete_kvp(key).await.log_err();
+            } else if let Some(json) = serde_json::to_string(&saved).log_err() {
+                kvp.write_kvp(key, json).await.log_err();
+            }
+        });
     }
 
     pub(crate) fn active_project_path(&self, cx: &App) -> Option<ProjectPath> {

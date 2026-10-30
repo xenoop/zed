@@ -210,6 +210,7 @@ impl UnstagedDiff {
                 branch_diff,
                 Capability::ReadWrite,
                 "No unstaged changes",
+                "unstaged",
                 move |editor, cx| {
                     editor.set_diff_hunk_renderer(Some(Arc::new(UnstagedDiffHunkRenderer)), cx);
                     editor.rhs_editor().update(cx, |rhs_editor, _cx| {

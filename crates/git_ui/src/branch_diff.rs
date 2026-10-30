@@ -337,6 +337,7 @@ impl BranchDiff {
                 branch_diff,
                 Capability::ReadWrite,
                 "No changes",
+                "branch",
                 move |editor, cx| {
                     editor.set_diff_hunk_renderer(Some(Arc::new(HiddenDiffHunkRenderer)), cx);
                     editor.rhs_editor().update(cx, move |rhs_editor, _cx| {
