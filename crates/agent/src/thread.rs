@@ -1335,6 +1335,7 @@ pub struct Thread {
     pub(crate) action_log: Entity<ActionLog>,
     /// If this is a subagent thread, contains context about the parent
     subagent_context: Option<SubagentContext>,
+    branched_from: Option<crate::db::DbBranchSource>,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
     draft_prompt: Option<Vec<acp_v2::ContentBlock>>,
     ui_scroll_position: Option<gpui::ListOffset>,
@@ -1485,6 +1486,7 @@ impl Thread {
             project,
             action_log,
             subagent_context: None,
+            branched_from: None,
             draft_prompt: None,
             ui_scroll_position: None,
             running_subagents: Vec::new(),
@@ -1857,6 +1859,7 @@ impl Thread {
             prompt_capabilities_tx,
             prompt_capabilities_rx,
             subagent_context: db_thread.subagent_context,
+            branched_from: db_thread.branched_from,
             draft_prompt: db_thread.draft_prompt,
             ui_scroll_position: db_thread.ui_scroll_position.map(|sp| gpui::ListOffset {
                 item_ix: sp.item_ix,
@@ -1967,6 +1970,7 @@ impl Thread {
             }),
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
+            branched_from: self.branched_from.clone(),
         };
 
         cx.background_spawn(async move {
@@ -4569,6 +4573,10 @@ impl Thread {
 
     pub fn depth(&self) -> u8 {
         self.subagent_context.as_ref().map(|c| c.depth).unwrap_or(0)
+    }
+
+    pub fn branched_from(&self) -> Option<&crate::db::DbBranchSource> {
+        self.branched_from.as_ref()
     }
 
     #[cfg(any(test, feature = "test-support"))]

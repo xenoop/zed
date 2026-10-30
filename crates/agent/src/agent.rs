@@ -1932,6 +1932,48 @@ impl NativeAgent {
         }
     }
 
+    /// Copies an open thread's history through the turn that starts with
+    /// `user_message_id` into a new saved thread, leaving the original unchanged.
+    /// Returns the new thread's session ID and title.
+    pub fn branch_thread(
+        &mut self,
+        session_id: &acp_v2::SessionId,
+        user_message_id: ClientUserMessageId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(acp_v2::SessionId, SharedString)>> {
+        let Some(session) = self.sessions.get(session_id) else {
+            return Task::ready(Err(anyhow!("thread {session_id:?} is not open")));
+        };
+        let Some(project_state) = self.projects.get(&session.project_id) else {
+            return Task::ready(Err(anyhow!("the thread's project is no longer open")));
+        };
+        let folder_paths = PathList::new(
+            &project_state
+                .project
+                .read(cx)
+                .visible_worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                .collect::<Vec<_>>(),
+        );
+        let db_thread = session.thread.read(cx).to_db(cx);
+        let thread_store = self.thread_store.clone();
+        let source_session_id = session_id.clone();
+
+        cx.spawn(async move |_this, cx| {
+            let branch = db_thread
+                .await
+                .branch(source_session_id, &user_message_id)?;
+            let title = branch.title.clone();
+            let branch_session_id = acp_v2::SessionId::new(uuid::Uuid::new_v4().to_string());
+            thread_store
+                .update(cx, |store, cx| {
+                    store.save_thread(branch_session_id.clone(), branch, folder_paths, cx)
+                })
+                .await?;
+            Ok((branch_session_id, title))
+        })
+    }
+
     fn save_thread(&mut self, thread: Entity<Thread>, cx: &mut Context<Self>) {
         let id = thread.read(cx).id().clone();
         let Some(session) = self.sessions.get(&id) else {
