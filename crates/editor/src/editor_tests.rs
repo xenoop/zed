@@ -47066,6 +47066,36 @@ fn test_review_comment_update(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_take_review_comments_for_agent_includes_code(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("fn main() {\n    todo!()\n}\n", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    _ = editor.update(cx, |editor: &mut Editor, _window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let start = snapshot.anchor_before(Point::new(1, 0));
+        let end = snapshot.anchor_after(Point::new(1, 11));
+        let key = test_hunk_key_with_anchor("src/main.rs", start);
+        editor.add_review_comment(key, "Implement this".to_string(), start..end, cx);
+
+        let comments = editor.take_review_comments_for_agent(cx);
+        assert_eq!(
+            comments,
+            vec![ReviewCommentForAgent {
+                path: Arc::from(util::rel_path::RelPath::from_unix_str("src/main.rs").unwrap()),
+                rows: 1..=1,
+                code: "    todo!()".to_string(),
+                comment: "Implement this".to_string(),
+            }]
+        );
+        assert_eq!(editor.total_review_comment_count(), 0);
+    });
+}
+
+#[gpui::test]
 fn test_review_comment_take_all(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

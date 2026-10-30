@@ -166,6 +166,16 @@ pub(super) struct DiffHunkKey {
     pub(super) hunk_start_anchor: Anchor,
 }
 
+/// A review comment with the code it was left on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReviewCommentForAgent {
+    pub path: Arc<util::rel_path::RelPath>,
+    /// Zero-based rows in the file.
+    pub rows: std::ops::RangeInclusive<u32>,
+    pub code: String,
+    pub comment: String,
+}
+
 /// A review comment stored locally before being sent to the Agent panel.
 #[derive(Clone)]
 pub(super) struct StoredReviewComment {
@@ -1105,6 +1115,46 @@ impl Editor {
     pub(super) fn cancel_diff_review_drag(&mut self, cx: &mut Context<Self>) {
         self.diff_review_drag_state = None;
         cx.notify();
+    }
+
+    /// Removes every review comment in this editor and returns each one with the
+    /// file and code it was left on, so it can be handed to an agent.
+    pub fn take_review_comments_for_agent(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Vec<ReviewCommentForAgent> {
+        self.dismiss_all_diff_review_overlays(cx);
+        let stored_comments = std::mem::take(&mut self.stored_review_comments);
+        self.next_review_comment_id = 0;
+        cx.emit(EditorEvent::ReviewCommentsChanged { total_count: 0 });
+        cx.notify();
+
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        stored_comments
+            .into_iter()
+            .flat_map(|(hunk_key, comments)| {
+                let path = hunk_key.file_path;
+                comments
+                    .into_iter()
+                    .map(move |comment| (path.clone(), comment))
+            })
+            .map(|(path, comment)| {
+                let start = comment.range.start.to_point(&snapshot);
+                let end = comment.range.end.to_point(&snapshot);
+                let start_row = snapshot
+                    .point_to_buffer_point(start)
+                    .map_or(start.row, |(_, point)| point.row);
+                let end_row = snapshot
+                    .point_to_buffer_point(end)
+                    .map_or(end.row, |(_, point)| point.row);
+                ReviewCommentForAgent {
+                    path,
+                    rows: start_row..=end_row,
+                    code: snapshot.text_for_range(start..end).collect(),
+                    comment: comment.comment,
+                }
+            })
+            .collect()
     }
 
     /// Dismisses all diff review overlays.
