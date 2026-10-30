@@ -100,29 +100,35 @@ impl DbThread {
     /// move the line.
     pub fn wrote_line(&self, path: &str, line: &str) -> bool {
         let line = line.trim();
-        if line.is_empty() {
-            return false;
-        }
-        let path = path.replace('\\', "/");
+        !line.is_empty()
+            && self
+                .written_lines()
+                .iter()
+                .any(|(written_path, written_line)| {
+                    written_line == line && written_path_matches(written_path, path)
+                })
+    }
 
-        self.messages.iter().any(|message| {
+    /// Every non-blank line this thread's `edit_file` and `write_file` calls wrote, trimmed,
+    /// with the path each was written to, without duplicates.
+    pub fn written_lines(&self) -> Vec<(String, String)> {
+        let mut written_lines = Vec::new();
+        let mut seen = collections::HashSet::default();
+        for message in &self.messages {
             let DbMessage::Agent(agent_message) = &**message else {
-                return false;
+                continue;
             };
-            agent_message.content.iter().any(|content| {
+            for content in &agent_message.content {
                 let AgentMessageContent::ToolUse(tool_use) = content else {
-                    return false;
+                    continue;
                 };
                 let language_model::LanguageModelToolUseInput::Json(input) = &tool_use.input else {
-                    return false;
+                    continue;
                 };
                 let Some(tool_path) = input.get("path").and_then(|path| path.as_str()) else {
-                    return false;
+                    continue;
                 };
                 let tool_path = tool_path.replace('\\', "/");
-                if tool_path != path && !tool_path.ends_with(&format!("/{path}")) {
-                    return false;
-                }
 
                 let written_texts: Vec<&str> = match tool_use.name.as_ref() {
                     "edit_file" => input
@@ -139,16 +145,30 @@ impl DbThread {
                         .collect(),
                     _ => Vec::new(),
                 };
-                written_texts
-                    .iter()
-                    .any(|text| text.lines().any(|written_line| written_line.trim() == line))
-            })
-        })
+                for line in written_texts.iter().flat_map(|text| text.lines()) {
+                    let line = line.trim();
+                    if !line.is_empty() && seen.insert((tool_path.clone(), line.to_string())) {
+                        written_lines.push((tool_path.clone(), line.to_string()));
+                    }
+                }
+            }
+        }
+        written_lines
     }
+}
+
+/// Whether a path written by an agent tool (`root/src/file.rs`, or an absolute path)
+/// refers to the project path `path`.
+fn written_path_matches(written_path: &str, path: &str) -> bool {
+    let path = path.replace('\\', "/");
+    written_path == path || written_path.ends_with(&format!("/{path}"))
 }
 
 /// Finds saved threads whose edits wrote `line` into the file at `path` (see
 /// [`DbThread::wrote_line`]), most recently updated first.
+///
+/// Uses an index of the lines each thread wrote, so only threads saved since the last
+/// search are read again.
 pub fn find_threads_that_wrote_line(
     path: String,
     line: String,
@@ -162,18 +182,37 @@ pub fn find_threads_that_wrote_line(
         let mut threads = database.list_threads().await?;
         threads.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
 
-        let mut matches = Vec::new();
-        for metadata in threads {
-            let thread = database
+        let indexed_versions = database.written_line_index_versions().await?;
+        for metadata in &threads {
+            let version = metadata.updated_at.to_rfc3339();
+            if indexed_versions.get(&metadata.id) == Some(&version) {
+                continue;
+            }
+            let Some(thread) = database
                 .load_thread(metadata.id.clone())
                 .await
                 .log_err()
-                .flatten();
-            if thread.is_some_and(|thread| thread.wrote_line(&path, &line)) {
-                matches.push(metadata);
-            }
+                .flatten()
+            else {
+                continue;
+            };
+            database
+                .replace_written_lines(metadata.id.clone(), version, thread.written_lines())
+                .await
+                .log_err();
         }
-        Ok(matches)
+        database.prune_written_lines().await.log_err();
+
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            return Ok(Vec::new());
+        }
+        let path = path.replace('\\', "/");
+        let matching_sessions = database.sessions_that_wrote_line(path, line).await?;
+        Ok(threads
+            .into_iter()
+            .filter(|metadata| matching_sessions.contains(&metadata.id))
+            .collect())
     })
 }
 
@@ -653,6 +692,29 @@ impl ThreadsDatabase {
             s().ok();
         }
 
+        for statement in [
+            indoc! {"
+                CREATE TABLE IF NOT EXISTS thread_written_lines (
+                    session_id TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    line TEXT NOT NULL
+                )
+            "},
+            "CREATE INDEX IF NOT EXISTS thread_written_lines_by_line ON thread_written_lines (line, path, session_id)",
+            "CREATE INDEX IF NOT EXISTS thread_written_lines_by_session ON thread_written_lines (session_id)",
+            indoc! {"
+                CREATE TABLE IF NOT EXISTS thread_written_lines_versions (
+                    session_id TEXT PRIMARY KEY,
+                    updated_at TEXT NOT NULL
+                )
+            "},
+        ] {
+            connection
+                .exec(statement)
+                .and_then(|mut create| create())
+                .map_err(|e| e.context("Failed to create the written lines index"))?;
+        }
+
         // The columns added above are stored after the `data` blob, so reading
         // them from the table walks every thread's overflow pages. This index
         // covers `LIST_THREADS_QUERY`, so listing threads never touches the blobs.
@@ -818,6 +880,86 @@ impl ThreadsDatabase {
             }
 
             Ok(threads)
+        })
+    }
+
+    /// The `updated_at` of each thread as of when its written lines were last indexed.
+    fn written_line_index_versions(&self) -> Task<Result<HashMap<acp_v2::SessionId, String>>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            let mut select = connection.select::<(Arc<str>, String)>(indoc! {"
+                SELECT session_id, updated_at FROM thread_written_lines_versions
+            "})?;
+            Ok(select()?
+                .into_iter()
+                .map(|(session_id, updated_at)| (acp_v2::SessionId::new(session_id), updated_at))
+                .collect())
+        })
+    }
+
+    fn replace_written_lines(
+        &self,
+        session_id: acp_v2::SessionId,
+        updated_at: String,
+        written_lines: Vec<(String, String)>,
+    ) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            connection.with_savepoint("replace_written_lines", || {
+                connection.exec_bound::<Arc<str>>(indoc! {"
+                    DELETE FROM thread_written_lines WHERE session_id = ?
+                "})?(session_id.0.clone())?;
+                let mut insert = connection.exec_bound::<(Arc<str>, String, String)>(indoc! {"
+                    INSERT INTO thread_written_lines (session_id, path, line) VALUES (?, ?, ?)
+                "})?;
+                for (path, line) in written_lines {
+                    insert((session_id.0.clone(), path, line))?;
+                }
+                connection.exec_bound::<(Arc<str>, String)>(indoc! {"
+                    INSERT OR REPLACE INTO thread_written_lines_versions (session_id, updated_at)
+                    VALUES (?, ?)
+                "})?((session_id.0.clone(), updated_at))?;
+                Ok(())
+            })
+        })
+    }
+
+    /// Drops index entries for threads that were deleted.
+    fn prune_written_lines(&self) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            connection.exec(
+                "DELETE FROM thread_written_lines WHERE session_id NOT IN (SELECT id FROM threads)",
+            )?()?;
+            connection.exec(
+                "DELETE FROM thread_written_lines_versions WHERE session_id NOT IN (SELECT id FROM threads)",
+            )?()?;
+            Ok(())
+        })
+    }
+
+    fn sessions_that_wrote_line(
+        &self,
+        path: String,
+        line: String,
+    ) -> Task<Result<collections::HashSet<acp_v2::SessionId>>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            // Tool paths may be absolute, so a written path also matches when it ends
+            // with `/<path>`.
+            let mut select = connection.select_bound::<(String, String), Arc<str>>(indoc! {"
+                SELECT DISTINCT session_id FROM thread_written_lines
+                WHERE line = ?1
+                    AND (path = ?2 OR substr(path, -length(?2) - 1) = '/' || ?2)
+            "})?;
+            Ok(select((line, path))?
+                .into_iter()
+                .map(acp_v2::SessionId::new)
+                .collect())
         })
     }
 
@@ -1237,6 +1379,90 @@ mod tests {
             thread
                 .branch(source_session_id, &ClientUserMessageId::new())
                 .is_err()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_written_lines_index(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+        let session_id = acp_v2::SessionId::new("writer");
+        database
+            .save_thread(
+                session_id.clone(),
+                make_thread("Writer", Utc::now()),
+                PathList::default(),
+            )
+            .await
+            .unwrap();
+
+        database
+            .replace_written_lines(
+                session_id.clone(),
+                "v1".into(),
+                vec![("/home/me/zed/src/parser.rs".into(), "parse(input)".into())],
+            )
+            .await
+            .unwrap();
+        let matches = |path: &str, line: &str| {
+            database.sessions_that_wrote_line(path.to_string(), line.to_string())
+        };
+        assert!(
+            matches("zed/src/parser.rs", "parse(input)")
+                .await
+                .unwrap()
+                .contains(&session_id)
+        );
+        assert!(
+            matches("src/other.rs", "parse(input)")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches("ser.rs", "parse(input)").await.unwrap().is_empty());
+        assert_eq!(
+            database
+                .written_line_index_versions()
+                .await
+                .unwrap()
+                .get(&session_id),
+            Some(&"v1".to_string())
+        );
+
+        database
+            .replace_written_lines(
+                session_id.clone(),
+                "v2".into(),
+                vec![("zed/src/parser.rs".into(), "parse_all(input)".into())],
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches("zed/src/parser.rs", "parse(input)")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !matches("zed/src/parser.rs", "parse_all(input)")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        database.delete_thread(session_id.clone()).await.unwrap();
+        database.prune_written_lines().await.unwrap();
+        assert!(
+            matches("zed/src/parser.rs", "parse_all(input)")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            database
+                .written_line_index_versions()
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
