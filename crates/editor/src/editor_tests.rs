@@ -47096,6 +47096,43 @@ fn test_take_review_comments_for_agent_includes_code(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_restore_review_comments_follows_moved_code(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("fn main() {\n    todo!()\n}\n", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    _ = editor.update(cx, |editor: &mut Editor, window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let start = snapshot.anchor_before(Point::new(1, 0));
+        let end = snapshot.anchor_after(Point::new(1, 11));
+        let key = test_hunk_key_with_anchor("", start);
+        editor.add_review_comment(key, "Implement this".to_string(), start..end, cx);
+        let saved = editor.take_review_comments_for_agent(cx);
+
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges([Point::new(0, 0)..Point::new(0, 0)])
+        });
+        editor.insert("// header\n", window, cx);
+
+        let missing = ReviewCommentForAgent {
+            code: "not in this file".to_string(),
+            ..saved[0].clone()
+        };
+        let unplaced = editor.restore_review_comments(vec![saved[0].clone(), missing.clone()], cx);
+        assert_eq!(unplaced, vec![missing]);
+
+        let restored = editor.review_comments_with_code(cx);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].rows, 2..=2);
+        assert_eq!(restored[0].code, "    todo!()");
+        assert_eq!(restored[0].comment, "Implement this");
+    });
+}
+
+#[gpui::test]
 fn test_review_comment_take_all(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

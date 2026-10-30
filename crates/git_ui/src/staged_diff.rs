@@ -185,6 +185,7 @@ impl StagedDiff {
                 branch_diff,
                 Capability::ReadOnly,
                 "No staged changes",
+                "staged",
                 move |editor, cx| {
                     editor.set_diff_hunk_renderer(Some(Arc::new(StagedDiffHunkRenderer)), cx);
                     editor.rhs_editor().update(cx, |rhs_editor, _cx| {

@@ -243,6 +243,7 @@ impl ProjectDiff {
                 branch_diff,
                 Capability::ReadWrite,
                 "No uncommitted changes",
+                "uncommitted",
                 move |editor, cx| {
                     editor.set_diff_hunk_renderer(Some(Arc::new(DefaultDiffHunkRenderer)), cx);
                     editor.rhs_editor().update(cx, |rhs_editor, _cx| {

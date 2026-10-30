@@ -1123,20 +1123,24 @@ impl Editor {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Vec<ReviewCommentForAgent> {
+        let comments = self.review_comments_with_code(cx);
         self.dismiss_all_diff_review_overlays(cx);
-        let stored_comments = std::mem::take(&mut self.stored_review_comments);
+        self.stored_review_comments.clear();
         self.next_review_comment_id = 0;
         cx.emit(EditorEvent::ReviewCommentsChanged { total_count: 0 });
         cx.notify();
+        comments
+    }
 
+    /// Returns every review comment in this editor with the file and code it was left on.
+    pub fn review_comments_with_code(&self, cx: &App) -> Vec<ReviewCommentForAgent> {
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        stored_comments
-            .into_iter()
+        self.stored_review_comments
+            .iter()
             .flat_map(|(hunk_key, comments)| {
-                let path = hunk_key.file_path;
                 comments
-                    .into_iter()
-                    .map(move |comment| (path.clone(), comment))
+                    .iter()
+                    .map(move |comment| (hunk_key.file_path.clone(), comment))
             })
             .map(|(path, comment)| {
                 let start = comment.range.start.to_point(&snapshot);
@@ -1151,10 +1155,79 @@ impl Editor {
                     path,
                     rows: start_row..=end_row,
                     code: snapshot.text_for_range(start..end).collect(),
-                    comment: comment.comment,
+                    comment: comment.comment.clone(),
                 }
             })
             .collect()
+    }
+
+    /// Adds back review comments saved earlier with [`Self::review_comments_with_code`].
+    /// Each comment goes on the lines of its file that still hold its code, preferring
+    /// its original rows, so it follows the code if lines were added above it. Comments
+    /// whose code isn't shown in this editor are returned.
+    pub fn restore_review_comments(
+        &mut self,
+        comments: Vec<ReviewCommentForAgent>,
+        cx: &mut Context<Self>,
+    ) -> Vec<ReviewCommentForAgent> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let max_row = snapshot.max_point().row;
+        let mut unplaced = Vec::new();
+
+        for comment in comments {
+            let code_lines: Vec<&str> = comment.code.split('\n').collect();
+            let line_count = code_lines.len() as u32;
+            let matches_at = |row: u32| {
+                // Matches how comments are keyed when added: buffers without a file
+                // use an empty path.
+                let is_in_file = match snapshot.file_at(Point::new(row, 0)) {
+                    Some(file) => file.path() == &comment.path,
+                    None => comment.path.is_empty(),
+                };
+                is_in_file
+                    && row + line_count - 1 <= max_row
+                    && code_lines.iter().enumerate().all(|(offset, code_line)| {
+                        let row = row + offset as u32;
+                        let line_end = Point::new(row, snapshot.line_len(MultiBufferRow(row)));
+                        snapshot
+                            .text_for_range(Point::new(row, 0)..line_end)
+                            .collect::<String>()
+                            == *code_line
+                    })
+            };
+            let buffer_row = |row: u32| {
+                snapshot
+                    .point_to_buffer_point(Point::new(row, 0))
+                    .map(|(_, point)| point.row)
+            };
+
+            let matching_rows: Vec<u32> = (0..=max_row).filter(|row| matches_at(*row)).collect();
+            let Some(row) = matching_rows
+                .iter()
+                .find(|row| buffer_row(**row) == Some(*comment.rows.start()))
+                .or_else(|| matching_rows.first())
+                .copied()
+            else {
+                unplaced.push(comment);
+                continue;
+            };
+
+            let last_row = row + line_count - 1;
+            let start = Point::new(row, 0);
+            let end = Point::new(last_row, snapshot.line_len(MultiBufferRow(last_row)));
+            let hunk_key = DiffHunkKey {
+                file_path: comment.path,
+                hunk_start_anchor: snapshot.anchor_before(start),
+            };
+            self.add_review_comment(
+                hunk_key,
+                comment.comment,
+                snapshot.anchor_after(start)..snapshot.anchor_before(end),
+                cx,
+            );
+        }
+
+        unplaced
     }
 
     /// Dismisses all diff review overlays.
