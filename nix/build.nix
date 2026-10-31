@@ -352,8 +352,11 @@ craneLib.buildPackage (
     # without the env var generate-licenses fails due to crane's fetchCargoVendor, see:
     # https://github.com/zed-industries/zed/issues/19971#issuecomment-2688455390
     # TODO: put this in a separate derivation that depends on src to avoid running it on every build
+    # cargo-about 0.8.2 can segfault here; the script has already written the theme and icon
+    # licenses by then, so build with that incomplete list instead of failing the whole build.
     preBuild = ''
-      ALLOW_MISSING_LICENSES=yes bash script/generate-licenses
+      ALLOW_MISSING_LICENSES=yes bash script/generate-licenses || \
+        echo "warning: generate-licenses failed (cargo-about crashed); building with an incomplete assets/licenses.md" >&2
       echo nightly > crates/zed/RELEASE_CHANNEL
     '';
 
