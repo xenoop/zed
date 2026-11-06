@@ -13,6 +13,7 @@ use crate::{
     buffer_codegen::{
         BufferCodegen, CodegenAlternative, CodegenEvent, InlineAssistAsksAgentThread,
     },
+    conversation_view::{INLINE_QUESTION_PREFIX, INLINE_QUESTION_SUFFIX},
     inline_prompt_editor::{CodegenStatus, InlineAssistId, PromptEditor, PromptEditorEvent},
     terminal_inline_assistant::TerminalInlineAssistant,
 };
@@ -1699,10 +1700,7 @@ fn agent_question(
             row(end)
         )
     };
-    format!(
-        "Question about {location}\n\n{user_prompt}\n\n\
-         (Answer in text. Only change files if the question asks for a change.)"
-    )
+    format!("{INLINE_QUESTION_PREFIX}{location}\n\n{user_prompt}\n\n{INLINE_QUESTION_SUFFIX}")
 }
 
 /// Sends `question` to the agent thread in the agent panel, starting one with

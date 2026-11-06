@@ -4366,12 +4366,20 @@ fn plan_label_markdown_style(
     }
 }
 
+/// Questions asked from the editor (inline assist, review comments) begin and
+/// end with these, so the agent chat can collapse their turns: the answers are
+/// shown in the editor already.
+pub(crate) const INLINE_QUESTION_PREFIX: &str = "Question about ";
+pub(crate) const INLINE_QUESTION_SUFFIX: &str =
+    "(Answer in text. Only change files if the question asks for a change.)";
+pub(crate) const REVIEW_QUESTION_PREFIX: &str = "Review comments on the diff.";
+
 /// The message that sends review comments to the agent: each comment with an
 /// ID (`R<n>`), the code it is about, and instructions to answer per ID so
 /// [`split_review_answer`] can put each answer under its comment.
 pub(crate) fn review_question(comments: &[ReviewCommentForAgent], cx: &App) -> String {
-    let mut question = String::from(
-        "Review comments on the diff. Answer each comment in its own section that \
+    let mut question = format!(
+        "{REVIEW_QUESTION_PREFIX} Answer each comment in its own section that \
          starts with its ID alone on a line, like `R1:`. Answer in text; only change \
          files where a comment asks for a change.\n",
     );

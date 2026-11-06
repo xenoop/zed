@@ -762,6 +762,9 @@ pub struct ThreadView {
     pub expanded_tool_call_raw_inputs: HashSet<acp_v2::ToolCallId>,
     collapsed_sandbox_authorization_details: HashSet<acp_v2::ToolCallId>,
     collapsed_sandbox_network_details: HashSet<acp_v2::ToolCallId>,
+    /// Questions asked from the editor (by the index of their user message)
+    /// that the user expanded in the chat; the rest stay collapsed.
+    expanded_editor_questions: HashSet<usize>,
     /// Sandbox escalation prompts whose "surprising Unicode" warning the user
     /// has explicitly acknowledged. Until a prompt's tool call is in this set,
     /// its allow buttons stay disabled. See [`Self::sandbox_confusable_findings`].
@@ -1305,6 +1308,7 @@ impl ThreadView {
             editor_expanded: false,
             should_be_following: false,
             editing_message: None,
+            expanded_editor_questions: HashSet::default(),
             message_queue: MessageQueue::default(),
             turn_fields: TurnFields::default(),
             discarded_partial_edits: HashSet::default(),
@@ -7404,6 +7408,33 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
     }
 }
 
+/// A one-line summary of a question asked from the editor (inline assist or
+/// review comments), or `None` for any other message.
+fn editor_question_summary(text: &str) -> Option<SharedString> {
+    use super::{INLINE_QUESTION_PREFIX, INLINE_QUESTION_SUFFIX, REVIEW_QUESTION_PREFIX};
+    if text.starts_with(REVIEW_QUESTION_PREFIX) {
+        let count = text
+            .lines()
+            .filter(|line| {
+                line.split_once(':')
+                    .and_then(|(label, _)| label.strip_prefix('R'))
+                    .is_some_and(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
+            })
+            .count();
+        return Some(match count {
+            1 => "Review comment, answered in the diff".into(),
+            count => format!("{count} review comments, answered in the diff").into(),
+        });
+    }
+    let location = text
+        .strip_prefix(INLINE_QUESTION_PREFIX)
+        .filter(|_| text.trim_end().ends_with(INLINE_QUESTION_SUFFIX))?
+        .lines()
+        .next()?
+        .trim_end_matches(':');
+    Some(format!("Question about {location}, answered in the editor").into())
+}
+
 impl ThreadView {
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
@@ -7438,6 +7469,106 @@ impl ThreadView {
     }
 
     fn render_entry(
+        &self,
+        entry_ix: usize,
+        total_entries: usize,
+        entry: &AgentThreadEntry,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let Some((question_ix, summary)) = self.editor_question_for_entry(entry_ix, cx) else {
+            return self.render_entry_contents(entry_ix, total_entries, entry, window, cx);
+        };
+        let expanded = self.expanded_editor_questions.contains(&question_ix);
+        if entry_ix != question_ix {
+            return if expanded {
+                self.render_entry_contents(entry_ix, total_entries, entry, window, cx)
+            } else {
+                Empty.into_any_element()
+            };
+        }
+        let header = self.render_editor_question_header(question_ix, summary, expanded, cx);
+        if !expanded {
+            return header;
+        }
+        v_flex()
+            .child(header)
+            .child(self.render_entry_contents(entry_ix, total_entries, entry, window, cx))
+            .into_any_element()
+    }
+
+    /// The user message that starts the turn `entry_ix` belongs to, with a
+    /// short summary, when that message is a question asked from the editor.
+    fn editor_question_for_entry(
+        &self,
+        entry_ix: usize,
+        cx: &Context<Self>,
+    ) -> Option<(usize, SharedString)> {
+        let entries = self.thread.read(cx).entries();
+        let question_ix = (0..=entry_ix).rev().find(|ix| {
+            matches!(
+                entries.get(*ix),
+                Some(AgentThreadEntry::UserMessage(message)) if !message.indented
+            )
+        })?;
+        let AgentThreadEntry::UserMessage(message) = entries.get(question_ix)? else {
+            return None;
+        };
+        let text = message
+            .content
+            .source_blocks()
+            .iter()
+            .find_map(|block| match block {
+                acp_v2::ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })?;
+        editor_question_summary(text).map(|summary| (question_ix, summary))
+    }
+
+    fn render_editor_question_header(
+        &self,
+        question_ix: usize,
+        summary: SharedString,
+        expanded: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .id(("editor-question", question_ix))
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_1p5()
+            .cursor_pointer()
+            .child(
+                Icon::new(IconName::ReplyArrowRight)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new(summary)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate(),
+            )
+            .child(div().flex_1())
+            .child(
+                Label::new(if expanded { "Hide" } else { "Show" })
+                    .size(LabelSize::Small)
+                    .color(Color::Accent),
+            )
+            .tooltip(Tooltip::text(
+                "Asked from the editor; the answer is shown there.",
+            ))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.expanded_editor_questions.remove(&question_ix) {
+                    this.expanded_editor_questions.insert(question_ix);
+                }
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    fn render_entry_contents(
         &self,
         entry_ix: usize,
         total_entries: usize,
@@ -14749,6 +14880,38 @@ mod tests {
     use util::path;
     use util::paths::PathStyle;
     use workspace::MultiWorkspace;
+
+    #[test]
+    fn test_editor_question_summary() {
+        use super::super::{
+            INLINE_QUESTION_PREFIX, INLINE_QUESTION_SUFFIX, REVIEW_QUESTION_PREFIX,
+        };
+
+        let inline = format!(
+            "{INLINE_QUESTION_PREFIX}`src/lib.rs` lines 18-20:\n```\nfn a() {{}}\n```\n\nWhy?\n\n{INLINE_QUESTION_SUFFIX}"
+        );
+        assert_eq!(
+            editor_question_summary(&inline).as_deref(),
+            Some("Question about `src/lib.rs` lines 18-20, answered in the editor")
+        );
+
+        let review = format!(
+            "{REVIEW_QUESTION_PREFIX} Answer each comment, like `R1:`.\n\
+             \nR1: `a.rs` lines 1-2\n```\nx\n```\nwhy?\n\
+             \nR2: `b.rs` lines 3-3\n```\ny\n```\nand this?\n"
+        );
+        assert_eq!(
+            editor_question_summary(&review).as_deref(),
+            Some("2 review comments, answered in the diff")
+        );
+
+        // An ordinary message, even one starting the same way, stays visible.
+        assert_eq!(
+            editor_question_summary("Question about the build failure"),
+            None
+        );
+        assert_eq!(editor_question_summary("hello"), None);
+    }
 
     #[test]
     fn test_reported_activity_completion_status() {
