@@ -196,7 +196,9 @@ impl InlineAssistant {
                 {
                     for assist_id in editor_assists.assist_ids.clone() {
                         let assist = &self.assists[&assist_id];
-                        if let CodegenStatus::Done = assist.codegen.read(cx).status(cx) {
+                        if let CodegenStatus::Done = assist.codegen.read(cx).status(cx)
+                            && !asks_agent_thread(assist, cx)
+                        {
                             self.finish_assist(assist_id, false, window, cx)
                         }
                     }
@@ -768,7 +770,9 @@ impl InlineAssistant {
             for assist_id in &editor_assists.assist_ids {
                 let assist = &self.assists[assist_id];
                 let assist_range = assist.range.to_offset(&buffer);
-                if assist_range.contains(&selection.start) && assist_range.contains(&selection.end)
+                if assist_range.contains(&selection.start)
+                    && assist_range.contains(&selection.end)
+                    && !asks_agent_thread(assist, cx)
                 {
                     if matches!(assist.codegen.read(cx).status(cx), CodegenStatus::Pending) {
                         self.dismiss_assist(*assist_id, window, cx);
@@ -902,7 +906,8 @@ impl InlineAssistant {
                     if matches!(
                         assist.codegen.read(cx).status(cx),
                         CodegenStatus::Error(_) | CodegenStatus::Done
-                    ) {
+                    ) && !asks_agent_thread(assist, cx)
+                    {
                         let assist_range = assist.range.to_offset(&snapshot);
                         if edited_ranges
                             .iter()
@@ -1701,6 +1706,13 @@ fn agent_question(
         )
     };
     format!("{INLINE_QUESTION_PREFIX}{location}\n\n{user_prompt}\n\n{INLINE_QUESTION_SUFFIX}")
+}
+
+/// Whether `assist` asks the agent thread a question. Its answer changes
+/// nothing in the buffer, so saving, typing or pressing Enter in the editor
+/// must not close it; only its close buttons (or closing the editor) do.
+fn asks_agent_thread(assist: &InlineAssist, cx: &App) -> bool {
+    assist.codegen.read(cx).ask_agent_thread
 }
 
 /// Sends `question` to the agent thread in the agent panel, starting one with

@@ -343,6 +343,15 @@ impl<T: 'static> PromptEditor<T> {
         }
     }
 
+    /// Whether this box asks the agent thread a question; its answer has
+    /// nothing to accept, so only the close buttons dismiss it.
+    fn asks_agent_thread(&self, cx: &App) -> bool {
+        match &self.mode {
+            PromptEditorMode::Buffer { codegen, .. } => codegen.read(cx).ask_agent_thread,
+            PromptEditorMode::Terminal { .. } => false,
+        }
+    }
+
     fn codegen_status<'a>(&'a self, cx: &'a App) -> &'a CodegenStatus {
         match &self.mode {
             PromptEditorMode::Buffer { codegen, .. } => codegen.read(cx).status(cx),
@@ -554,6 +563,9 @@ impl<T: 'static> PromptEditor<T> {
         cx: &mut Context<Self>,
     ) {
         match self.codegen_status(cx) {
+            // Escape is pressed often (vim mode, closing completions); an
+            // answer stays until it is closed with its buttons.
+            CodegenStatus::Done | CodegenStatus::Error(_) if self.asks_agent_thread(cx) => {}
             CodegenStatus::Idle | CodegenStatus::Done | CodegenStatus::Error(_) => {
                 cx.emit(PromptEditorEvent::CancelRequested);
             }
@@ -588,7 +600,7 @@ impl<T: 'static> PromptEditor<T> {
                 if self.edited_since_done {
                     self.fire_started_telemetry(cx);
                     cx.emit(PromptEditorEvent::StartRequested);
-                } else {
+                } else if !self.asks_agent_thread(cx) {
                     cx.emit(PromptEditorEvent::ConfirmRequested { execute });
                 }
             }
@@ -1955,5 +1967,96 @@ mod tests {
         cx.run_until_parked();
 
         prompt_editor.read_with(cx, |prompt_editor, cx| prompt_editor.prompt(cx))
+    }
+
+    #[gpui::test]
+    async fn test_answer_box_is_only_closed_explicitly(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", serde_json::json!({"file": ""}))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let buffer = cx.update(|_window, cx| {
+            cx.new(|cx| MultiBuffer::singleton(cx.new(|cx| Buffer::local("fn a() {}\n", cx)), cx))
+        });
+        let range = buffer.read_with(cx, |buffer, cx| {
+            let snapshot = buffer.snapshot(cx);
+            snapshot.anchor_before(MultiBufferOffset(0))
+                ..snapshot.anchor_after(MultiBufferOffset(9))
+        });
+        let session_id = Uuid::new_v4();
+        let codegen = cx.update(|_window, cx| {
+            cx.new(|cx| {
+                BufferCodegen::new(
+                    buffer.clone(),
+                    range,
+                    None,
+                    session_id,
+                    Arc::new(prompt_store::PromptBuilder::new(None).unwrap()),
+                    cx,
+                )
+            })
+        });
+        let prompt_buffer = cx.update(|_window, cx| {
+            cx.new(|cx| MultiBuffer::singleton(cx.new(|cx| Buffer::local("", cx)), cx))
+        });
+        let thread_store = cx.update(|_window, cx| cx.new(|cx| ThreadStore::new(cx)));
+        let project_handle = workspace.update(cx, |workspace, _| workspace.project().downgrade());
+        let prompt_editor = cx.update(|window, cx| {
+            cx.new(|cx| {
+                PromptEditor::new_buffer(
+                    InlineAssistId::default(),
+                    Arc::new(Mutex::new(EditorMargins::default())),
+                    VecDeque::new(),
+                    prompt_buffer,
+                    codegen.clone(),
+                    session_id,
+                    fs,
+                    thread_store,
+                    project_handle,
+                    workspace.downgrade(),
+                    window,
+                    cx,
+                )
+            })
+        });
+
+        codegen.update(cx, |codegen, cx| {
+            codegen.ask_agent_thread = true;
+            codegen.start_with_answer(gpui::Task::ready(Ok("Because.".to_string())), cx);
+        });
+        cx.run_until_parked();
+
+        let closed = Rc::new(RefCell::new(0));
+        cx.update(|_window, cx| {
+            let closed = closed.clone();
+            cx.subscribe(&prompt_editor, move |_, event: &PromptEditorEvent, _cx| {
+                if matches!(
+                    event,
+                    PromptEditorEvent::CancelRequested | PromptEditorEvent::ConfirmRequested { .. }
+                ) {
+                    *closed.borrow_mut() += 1;
+                }
+            })
+            .detach();
+        });
+
+        // Escape and Enter leave an answer open.
+        prompt_editor.update_in(cx, |editor, window, cx| {
+            editor.cancel(&editor::actions::Cancel, window, cx);
+            editor.handle_confirm(false, cx);
+        });
+        assert_eq!(*closed.borrow(), 0);
+
+        // A rewrite (not a question) still closes on Escape.
+        codegen.update(cx, |codegen, _| codegen.ask_agent_thread = false);
+        prompt_editor.update_in(cx, |editor, window, cx| {
+            editor.cancel(&editor::actions::Cancel, window, cx);
+        });
+        assert_eq!(*closed.borrow(), 1);
     }
 }
