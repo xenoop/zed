@@ -187,7 +187,7 @@ impl BranchDiff {
                 workspace_weak.update_in(cx, |workspace, window, cx| {
                     if has_marker {
                         Self::deploy_branch_diff_with_base_ref(
-                            workspace, project, repository, marker, None, window, cx,
+                            workspace, project, repository, marker, None, None, window, cx,
                         );
                     } else {
                         Self::deploy_branch_diff(workspace, window, cx);
