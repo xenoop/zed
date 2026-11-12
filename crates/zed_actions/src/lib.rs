@@ -620,6 +620,19 @@ pub mod agent {
             /// Merges the changes of this working tree's only fork into it.
             /// With several forks, pick one from the Forks menu.
             PullFromFork,
+            /// Starts a review of the active thread's changes in a fork: the
+            /// agent there writes a change guide and you comment on it.
+            ReviewThread,
+            /// In a review fork, tells the reviewed thread the changes are
+            /// approved.
+            ApproveReview,
+            /// In a review fork, tells the reviewed thread what to change.
+            RequestReviewChanges,
+            /// Starts a thread that lands the active thread's changes.
+            LandChanges,
+            /// Sends the agent's last reply in this thread to the thread it
+            /// was forked from or started by.
+            SendToParentThread,
         ]
     );
 

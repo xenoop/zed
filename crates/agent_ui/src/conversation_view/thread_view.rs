@@ -2893,6 +2893,27 @@ impl ThreadView {
 
     // message queueing
 
+    /// Takes a message from another thread: sent now if the agent is idle,
+    /// queued behind the current turn otherwise.
+    pub(crate) fn deliver_message(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let content: Vec<acp_v2::ContentBlock> = vec![text.into()];
+        if self.thread.read(cx).status() == ThreadStatus::Generating {
+            self.add_to_queue(content, Vec::new(), window, cx);
+        } else {
+            self.send_content(
+                Task::ready(Ok(Some((content, Vec::new())))),
+                false,
+                window,
+                cx,
+            );
+        }
+    }
+
     fn queue_message(
         &mut self,
         message_editor: Entity<MessageEditor>,
@@ -7455,6 +7476,9 @@ async fn record_last_turn_snapshot(
 /// review comments), or `None` for any other message.
 fn editor_question_summary(text: &str) -> Option<SharedString> {
     use super::{INLINE_QUESTION_PREFIX, INLINE_QUESTION_SUFFIX, REVIEW_QUESTION_PREFIX};
+    if let Some(summary) = crate::thread_fork::delivered_message_summary(text) {
+        return Some(summary.into());
+    }
     if let Some(rest) = text.strip_prefix(crate::thread_fork::FORK_CONTEXT_PREFIX) {
         let title = rest
             .trim_start()

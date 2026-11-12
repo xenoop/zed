@@ -220,6 +220,8 @@
       "alt-shift-f": "agent::ForkThread",
       "alt-shift-m": "agent::MergeIntoParent",
       "alt-shift-p": "agent::PullFromFork",
+      "alt-shift-r": "agent::ReviewThread",
+      "alt-shift-l": "agent::LandChanges",
       "ctrl-n": "agent::NewThread",
       "ctrl-alt-c": "agent::OpenSettings",
       "shift-alt-i": "agent::ToggleOptionsMenu",

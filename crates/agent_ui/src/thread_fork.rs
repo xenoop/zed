@@ -44,6 +44,10 @@ pub(crate) struct ForkRecord {
     /// The verdict of a review fork, once submitted.
     #[serde(default)]
     pub verdict: Option<ReviewVerdict>,
+    /// The thread that was forked, so messages back reach it rather than
+    /// whichever thread its workspace shows.
+    #[serde(default)]
+    pub parent_thread_id: Option<crate::thread_metadata_store::ThreadId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,11 +171,142 @@ pub(crate) fn first_message(
     parent_title: Option<&str>,
     transcript: &str,
 ) -> String {
+    let context = fork_context_message(parent_title, transcript);
     match kind {
-        ForkKind::Fork | ForkKind::Review | ForkKind::Land => {
-            fork_context_message(parent_title, transcript)
-        }
+        ForkKind::Fork | ForkKind::Land => context,
+        ForkKind::Review => context.replace(
+            "Do not act on the conversation yet: reply with one short line saying you are ready.",
+            REVIEW_INSTRUCTIONS,
+        ),
     }
+}
+
+const REVIEW_INSTRUCTIONS: &str = "You are the reviewer of that thread's work. The work is \
+     everything between the repository's default branch and this worktree's HEAD commit, \
+     which is a snapshot that includes the uncommitted changes. Do not change any files. \
+     Write a change guide: an ordered walkthrough of the change for a reader who has not \
+     seen it, one step per logical change, each naming the files and lines involved and \
+     saying what changed and why it matters, with anything risky, unclear or untested \
+     called out. I will then comment and give a verdict.";
+
+/// Starts a message that carries a review's verdict to the reviewed thread.
+pub(crate) const VERDICT_PREFIX: &str = "Review verdict:";
+/// Starts a message passed on from another thread.
+pub(crate) const THREAD_MESSAGE_PREFIX: &str = "Message from thread";
+/// Starts the first message of a thread that lands changes.
+pub(crate) const LAND_PREFIX: &str = "Land the changes of thread";
+
+const MAX_FORWARDED_BYTES: usize = 8_000;
+
+fn clipped(text: &str) -> &str {
+    let mut end = text.len().min(MAX_FORWARDED_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// The message a review's verdict reaches the reviewed thread with: the
+/// verdict, what the user added, and the reviewer's last findings.
+pub(crate) fn verdict_message(
+    verdict: ReviewVerdict,
+    note: &str,
+    reviewer_findings: &str,
+) -> String {
+    let (label, instruction) = match verdict {
+        ReviewVerdict::Approved => (
+            "approved",
+            "No changes are required. Take note of the findings below, if any.",
+        ),
+        ReviewVerdict::ChangesRequested => (
+            "changes requested",
+            "Address what is asked below, then say what you changed.",
+        ),
+    };
+    let mut message = format!("{VERDICT_PREFIX} {label}. {instruction}\n");
+    if !note.trim().is_empty() {
+        message.push_str(&format!("\nFrom me:\n{}\n", note.trim()));
+    }
+    if !reviewer_findings.trim().is_empty() {
+        message.push_str(&format!(
+            "\nThe reviewer's findings:\n{}\n",
+            clipped(reviewer_findings.trim())
+        ));
+    }
+    message
+}
+
+/// The message another thread's reply is passed on with.
+pub(crate) fn thread_message(sender_title: Option<&str>, text: &str) -> String {
+    let title = sender_title.unwrap_or("another thread");
+    format!(
+        "{THREAD_MESSAGE_PREFIX} \"{title}\":\n\n{}\n",
+        clipped(text.trim())
+    )
+}
+
+/// The first message of a thread that lands another thread's changes.
+/// `steps` is the project's own landing procedure, when it has one.
+pub(crate) fn land_message(parent_title: Option<&str>, steps: Option<&str>) -> String {
+    let title = parent_title.unwrap_or("this working tree");
+    let steps = steps
+        .map(str::trim)
+        .filter(|steps| !steps.is_empty())
+        .unwrap_or(
+            "1. Make sure the work is committed in sensible commits on the current branch.\n\
+         2. Bring the branch up to date with the default branch (rebase unless the \
+         project merges).\n\
+         3. Run the project's checks and tests; stop if they fail.\n\
+         4. Push the branch, and open or update its pull request.",
+        );
+    format!(
+        "{LAND_PREFIX} \"{title}\". You are in the same working tree as that thread. \
+         Follow these steps in order. Stop at the first step that fails and do not force \
+         anything (no force-push, no skipped checks).\n\n{steps}\n\n\
+         Finish with a short report: what landed, what did not, and what I need to do.\n"
+    )
+}
+
+/// The project's own landing procedure, from `.zed/land.md` in the working
+/// tree, if it has one.
+pub(crate) async fn landing_steps(
+    project: &Entity<Project>,
+    directory: &str,
+    cx: &mut AsyncApp,
+) -> Option<String> {
+    let script = format!("cat {}/.zed/land.md 2>/dev/null || true", quote(directory));
+    run_script(project, script, cx)
+        .await
+        .log_err()
+        .filter(|steps| !steps.trim().is_empty())
+}
+
+/// The one-line form of a message delivered from another thread, a verdict
+/// or a landing request, for the collapsed row in the transcript.
+pub(crate) fn delivered_message_summary(text: &str) -> Option<String> {
+    if let Some(rest) = text.strip_prefix(VERDICT_PREFIX) {
+        let verdict = rest.trim_start().split('.').next().unwrap_or_default();
+        return Some(format!("Review verdict: {verdict}"));
+    }
+    let quoted_title = |rest: &str| {
+        rest.trim_start()
+            .strip_prefix('"')
+            .and_then(|rest| rest.split_once('"'))
+            .map(|(title, _)| title.to_string())
+    };
+    if let Some(rest) = text.strip_prefix(THREAD_MESSAGE_PREFIX) {
+        return Some(match quoted_title(rest) {
+            Some(title) => format!("Message from thread \"{title}\""),
+            None => "Message from another thread".to_string(),
+        });
+    }
+    if let Some(rest) = text.strip_prefix(LAND_PREFIX) {
+        return Some(match quoted_title(rest) {
+            Some(title) => format!("Landing the changes of \"{title}\""),
+            None => "Landing changes".to_string(),
+        });
+    }
+    None
 }
 
 /// What a merge did, in a sentence for a notification.
@@ -205,6 +340,9 @@ pub(crate) fn slash_command_action(text: &str) -> Option<Box<dyn gpui::Action>> 
     match text {
         "/fork" => Some(Box::new(zed_actions::agent::ForkThread)),
         "/merge" => Some(Box::new(zed_actions::agent::MergeIntoParent)),
+        "/review" => Some(Box::new(zed_actions::agent::ReviewThread)),
+        "/land" => Some(Box::new(zed_actions::agent::LandChanges)),
+        "/send-to-parent" => Some(Box::new(zed_actions::agent::SendToParentThread)),
         _ => None,
     }
 }
@@ -544,6 +682,7 @@ mod tests {
                 kind: ForkKind::Fork,
                 parent_title: None,
                 verdict: None,
+                parent_thread_id: None,
             };
             cx.update(|cx| upsert_record(record.clone(), cx));
             cx.run_until_parked();
@@ -664,6 +803,60 @@ mod tests {
             ),
             "Merged 2 files from worktrees/fork. Resolve the conflict markers in: b"
         );
+    }
+
+    #[test]
+    fn test_review_land_and_thread_messages() {
+        let review = first_message(&ForkKind::Review, Some("Fix the parser"), "hello");
+        assert!(review.starts_with(FORK_CONTEXT_PREFIX));
+        assert!(review.contains("Write a change guide"));
+        assert!(!review.contains("reply with one short line"));
+
+        let verdict = verdict_message(
+            ReviewVerdict::ChangesRequested,
+            "Rename the helper.\n",
+            "1. The parser drops the last token.",
+        );
+        assert_eq!(
+            verdict,
+            "Review verdict: changes requested. Address what is asked below, then say what you \
+             changed.\n\nFrom me:\nRename the helper.\n\nThe reviewer's findings:\n\
+             1. The parser drops the last token.\n"
+        );
+        assert_eq!(
+            delivered_message_summary(&verdict).as_deref(),
+            Some("Review verdict: changes requested")
+        );
+        let approved = verdict_message(ReviewVerdict::Approved, "", "");
+        assert_eq!(
+            delivered_message_summary(&approved).as_deref(),
+            Some("Review verdict: approved")
+        );
+
+        let forwarded = thread_message(Some("Review: Fix the parser"), "All good.");
+        assert_eq!(
+            forwarded,
+            "Message from thread \"Review: Fix the parser\":\n\nAll good.\n"
+        );
+        assert_eq!(
+            delivered_message_summary(&forwarded).as_deref(),
+            Some("Message from thread \"Review: Fix the parser\"")
+        );
+
+        let land = land_message(Some("Fix the parser"), None);
+        assert!(land.contains("Push the branch"));
+        assert!(land.contains("no force-push"));
+        assert_eq!(
+            delivered_message_summary(&land).as_deref(),
+            Some("Landing the changes of \"Fix the parser\"")
+        );
+        let custom = land_message(None, Some("1. make ship\n"));
+        assert!(custom.contains("1. make ship") && !custom.contains("Push the branch"));
+
+        assert!(delivered_message_summary("An ordinary message").is_none());
+        for command in ["/review", "/land", "/send-to-parent"] {
+            assert!(slash_command_action(command).is_some(), "{command}");
+        }
     }
 
     #[gpui::test]

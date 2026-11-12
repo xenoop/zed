@@ -4537,7 +4537,7 @@ pub(crate) fn split_review_answer(
 
 /// The text of the last assistant message from `first_entry` on: the agent's
 /// final answer for the turn, without its reasoning.
-fn final_answer(thread: &AcpThread, first_entry: usize, cx: &App) -> String {
+pub(crate) fn final_answer(thread: &AcpThread, first_entry: usize, cx: &App) -> String {
     let answer = thread
         .entries()
         .get(first_entry..)

@@ -560,6 +560,70 @@ pub fn init(cx: &mut App) {
                         task.detach_and_notify_err(cx.weak_entity(), window, cx);
                     },
                 )
+                .register_action(
+                    |workspace, _: &zed_actions::agent::ReviewThread, window, cx| {
+                        let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                            return;
+                        };
+                        let task = panel.update(cx, |panel, cx| {
+                            panel.fork_active_thread(
+                                crate::thread_fork::ForkKind::Review,
+                                window,
+                                cx,
+                            )
+                        });
+                        task.detach_and_notify_err(cx.weak_entity(), window, cx);
+                    },
+                )
+                .register_action(
+                    |workspace, _: &zed_actions::agent::ApproveReview, window, cx| {
+                        let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                            return;
+                        };
+                        let task = panel.update(cx, |panel, cx| {
+                            panel.submit_review(
+                                crate::thread_fork::ReviewVerdict::Approved,
+                                window,
+                                cx,
+                            )
+                        });
+                        task.detach_and_notify_err(cx.weak_entity(), window, cx);
+                    },
+                )
+                .register_action(
+                    |workspace, _: &zed_actions::agent::RequestReviewChanges, window, cx| {
+                        let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                            return;
+                        };
+                        let task = panel.update(cx, |panel, cx| {
+                            panel.submit_review(
+                                crate::thread_fork::ReviewVerdict::ChangesRequested,
+                                window,
+                                cx,
+                            )
+                        });
+                        task.detach_and_notify_err(cx.weak_entity(), window, cx);
+                    },
+                )
+                .register_action(
+                    |workspace, _: &zed_actions::agent::LandChanges, window, cx| {
+                        let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                            return;
+                        };
+                        let task = panel.update(cx, |panel, cx| panel.land_changes(window, cx));
+                        task.detach_and_notify_err(cx.weak_entity(), window, cx);
+                    },
+                )
+                .register_action(
+                    |workspace, _: &zed_actions::agent::SendToParentThread, window, cx| {
+                        let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                            return;
+                        };
+                        let task = panel
+                            .update(cx, |panel, cx| panel.send_last_reply_to_parent(window, cx));
+                        task.detach_and_notify_err(cx.weak_entity(), window, cx);
+                    },
+                )
                 .register_action(|workspace, action: &ReviewBranchDiff, window, cx| {
                     let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
                         return;
@@ -1210,6 +1274,8 @@ pub struct AgentPanel {
     last_created_entry_kind: AgentPanelEntryKind,
     draft_thread: Option<Entity<ConversationView>>,
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
+    /// For threads started to land another thread's changes: that thread.
+    land_parents: HashMap<ThreadId, ThreadId>,
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
     #[cfg(test)]
@@ -1631,6 +1697,7 @@ impl AgentPanel {
             draft_thread: None,
             persist_selected_agent_task: Task::ready(()),
             retained_threads: HashMap::default(),
+            land_parents: HashMap::default(),
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
             #[cfg(test)]
@@ -3348,6 +3415,9 @@ impl AgentPanel {
             .as_ref()
             .map(|thread| thread.read(cx).to_markdown(cx))
             .unwrap_or_default();
+        let parent_thread_id = self
+            .active_conversation_view()
+            .map(|view| view.read(cx).thread_id);
         let agent = self.selected_agent.clone();
         let workspace = self.workspace.clone();
         let multi_workspace = window.window_handle().downcast::<MultiWorkspace>();
@@ -3389,6 +3459,7 @@ impl AgentPanel {
                 kind: kind.clone(),
                 parent_title: parent_title.clone(),
                 verdict: None,
+                parent_thread_id,
             };
             cx.update(|_, cx| thread_fork::upsert_record(record, cx))?;
 
@@ -3492,6 +3563,241 @@ impl AgentPanel {
         })
     }
 
+    fn conversation_view_for_thread(
+        &self,
+        thread_id: ThreadId,
+        cx: &App,
+    ) -> Option<Entity<ConversationView>> {
+        self.active_conversation_view()
+            .filter(|view| view.read(cx).thread_id == thread_id)
+            .or_else(|| self.retained_threads.get(&thread_id))
+            .cloned()
+    }
+
+    /// Hands a message to one of this panel's threads: `thread_id` when it
+    /// is still loaded, otherwise the thread the panel shows.
+    pub(crate) fn deliver_message(
+        &mut self,
+        thread_id: Option<ThreadId>,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let conversation_view = thread_id
+            .and_then(|thread_id| self.conversation_view_for_thread(thread_id, cx))
+            .or_else(|| self.active_conversation_view().cloned())
+            .context("That workspace has no thread to receive the message")?;
+        let thread_view = conversation_view
+            .read(cx)
+            .active_thread()
+            .cloned()
+            .context("The receiving thread is not ready yet")?;
+        thread_view.update(cx, |thread_view, cx| {
+            thread_view.deliver_message(text, window, cx)
+        });
+        Ok(())
+    }
+
+    /// Hands a message to the thread working in the working tree at `path`,
+    /// in whichever window has it open.
+    fn deliver_to_working_tree(
+        &mut self,
+        path: &str,
+        thread_id: Option<ThreadId>,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        if self.working_tree_path(cx).as_deref() == Some(path) {
+            return self.deliver_message(thread_id, text, window, cx);
+        }
+        let this = cx.entity();
+        let matches = |panel: &Entity<AgentPanel>, cx: &App| {
+            *panel != this && panel.read(cx).working_tree_path(cx).as_deref() == Some(path)
+        };
+        let find = |multi_workspace: &MultiWorkspace, cx: &App| {
+            multi_workspace.workspaces().find_map(|workspace| {
+                let panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
+                matches(&panel, cx).then_some(panel)
+            })
+        };
+
+        if let Some(Some(multi_workspace)) = window.root::<MultiWorkspace>()
+            && let Some(panel) = find(multi_workspace.read(cx), cx)
+        {
+            return panel.update(cx, |panel, cx| {
+                panel.deliver_message(thread_id, text, window, cx)
+            });
+        }
+        let current_window = window.window_handle();
+        for other_window in cx.windows() {
+            if other_window == current_window {
+                continue;
+            }
+            let Some(handle) = other_window.downcast::<MultiWorkspace>() else {
+                continue;
+            };
+            let Some(panel) = handle
+                .read(cx)
+                .ok()
+                .and_then(|multi_workspace| find(multi_workspace, cx))
+            else {
+                continue;
+            };
+            return handle.update(cx, |_, window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.deliver_message(thread_id, text, window, cx)
+                })
+            })?;
+        }
+        Err(anyhow!(
+            "The workspace of {path} is not open, so the message could not be delivered"
+        ))
+    }
+
+    /// The active thread's title, the agent's last reply in it, and what
+    /// the user has typed but not sent.
+    fn active_thread_summary(&self, cx: &App) -> Option<(Option<String>, String, String)> {
+        let thread_view = self.active_thread_view(cx)?;
+        let thread_view = thread_view.read(cx);
+        let thread = thread_view.thread.read(cx);
+        let title = thread.title().map(|title| title.to_string());
+        let last_reply = crate::conversation_view::final_answer(thread, 0, cx);
+        let draft = thread_view.message_editor.read(cx).text(cx);
+        Some((title, last_reply, draft))
+    }
+
+    /// In a review fork: records the verdict and tells the reviewed thread,
+    /// with what the user typed in the message editor and the reviewer's
+    /// last findings.
+    pub(crate) fn submit_review(
+        &mut self,
+        verdict: crate::thread_fork::ReviewVerdict,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        use crate::thread_fork::{self, ForkKind};
+        let record = self
+            .working_tree_path(cx)
+            .and_then(|path| thread_fork::record_for_fork(&path, cx))
+            .filter(|record| record.kind == ForkKind::Review);
+        let Some(mut record) = record else {
+            return Task::ready(Err(anyhow!(
+                "This thread is not a review of another thread"
+            )));
+        };
+        let Some((_, findings, note)) = self.active_thread_summary(cx) else {
+            return Task::ready(Err(anyhow!("The review thread is not ready yet")));
+        };
+        let message = thread_fork::verdict_message(verdict, &note, &findings);
+        let result = self.deliver_to_working_tree(
+            &record.parent_path.clone(),
+            record.parent_thread_id,
+            message,
+            window,
+            cx,
+        );
+        if result.is_ok() {
+            record.verdict = Some(verdict);
+            thread_fork::upsert_record(record, cx);
+            if let Some(thread_view) = self.active_thread_view(cx) {
+                let message_editor = thread_view.read(cx).message_editor.clone();
+                message_editor.update(cx, |editor, cx| editor.clear(window, cx));
+            }
+            cx.notify();
+        }
+        Task::ready(result)
+    }
+
+    /// Sends the agent's last reply in the active thread to the thread it
+    /// was forked from, or that started it to land changes.
+    pub(crate) fn send_last_reply_to_parent(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some((title, last_reply, _)) = self.active_thread_summary(cx) else {
+            return Task::ready(Err(anyhow!("There is no thread to send from")));
+        };
+        let message = crate::thread_fork::thread_message(title.as_deref(), &last_reply);
+        let active_thread_id = self
+            .active_conversation_view()
+            .map(|view| view.read(cx).thread_id);
+        if let Some(parent_thread_id) =
+            active_thread_id.and_then(|thread_id| self.land_parents.get(&thread_id).copied())
+        {
+            return Task::ready(self.deliver_message(Some(parent_thread_id), message, window, cx));
+        }
+        let record = self
+            .working_tree_path(cx)
+            .and_then(|path| crate::thread_fork::record_for_fork(&path, cx));
+        let Some(record) = record else {
+            return Task::ready(Err(anyhow!("This thread has no parent thread")));
+        };
+        Task::ready(self.deliver_to_working_tree(
+            &record.parent_path,
+            record.parent_thread_id,
+            message,
+            window,
+            cx,
+        ))
+    }
+
+    /// Starts a thread, in this working tree, that lands the active
+    /// thread's changes following the project's `.zed/land.md` (or a
+    /// default procedure).
+    pub(crate) fn land_changes(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(path) = self.working_tree_path(cx) else {
+            return Task::ready(Err(anyhow!("Landing changes needs a git repository")));
+        };
+        let project = self.project.clone();
+        let parent_thread_id = self
+            .active_conversation_view()
+            .map(|view| view.read(cx).thread_id);
+        let parent_title = self
+            .active_thread_summary(cx)
+            .and_then(|(title, _, _)| title);
+        let agent = self.selected_agent.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let steps = crate::thread_fork::landing_steps(&project, &path, cx).await;
+            let message =
+                crate::thread_fork::land_message(parent_title.as_deref(), steps.as_deref());
+            let title = crate::thread_fork::fork_thread_title(
+                &crate::thread_fork::ForkKind::Land,
+                parent_title.as_deref(),
+            );
+            let options = CreateThreadOptions {
+                title: Some(title.into()),
+                initial_content: Some(AgentInitialContent::ContentBlock {
+                    blocks: vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                        message,
+                    ))],
+                    auto_submit: true,
+                }),
+                agent: Some(agent),
+                model: None,
+                work_dirs: None,
+            };
+            this.update_in(cx, |panel, window, cx| {
+                let thread_id = panel.create_thread_with_options(
+                    options,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                );
+                if let Some(parent_thread_id) = parent_thread_id {
+                    panel.land_parents.insert(thread_id, parent_thread_id);
+                }
+                panel.activate_retained_thread(thread_id, true, window, cx);
+            })?;
+            Ok(())
+        })
+    }
+
     /// Removes a merged fork's worktree; one with unmerged changes is kept.
     pub(crate) fn remove_fork(
         &mut self,
@@ -3509,10 +3815,34 @@ impl AgentPanel {
         let panel = cx.weak_entity();
         let workspace = self.workspace.clone();
         let working_tree_path = self.working_tree_path(cx);
+        // The latest verdict among this working tree's reviews.
+        let review_verdict = working_tree_path.as_ref().and_then(|path| {
+            crate::thread_fork::records_for_parent(path, cx)
+                .iter()
+                .rev()
+                .find_map(|record| record.verdict)
+        });
+        let is_land_thread = self
+            .active_conversation_view()
+            .is_some_and(|view| self.land_parents.contains_key(&view.read(cx).thread_id));
         PopoverMenu::new("thread-forks-menu")
             .trigger_with_tooltip(
-                IconButton::new("thread-forks", IconName::GitBranch).icon_size(IconSize::Small),
-                Tooltip::text("Forks"),
+                IconButton::new("thread-forks", IconName::GitBranch)
+                    .icon_size(IconSize::Small)
+                    .icon_color(match review_verdict {
+                        Some(crate::thread_fork::ReviewVerdict::Approved) => Color::Success,
+                        Some(crate::thread_fork::ReviewVerdict::ChangesRequested) => Color::Warning,
+                        None => Color::Default,
+                    }),
+                Tooltip::text(match review_verdict {
+                    Some(crate::thread_fork::ReviewVerdict::Approved) => {
+                        "Forks and Reviews (review approved)"
+                    }
+                    Some(crate::thread_fork::ReviewVerdict::ChangesRequested) => {
+                        "Forks and Reviews (review requested changes)"
+                    }
+                    None => "Forks and Reviews",
+                }),
             )
             .anchor(Anchor::TopRight)
             .menu(move |window, cx| {
@@ -3526,18 +3856,50 @@ impl AgentPanel {
                     .map(|path| crate::thread_fork::records_for_parent(path, cx))
                     .unwrap_or_default();
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                    menu = menu.action("Fork Thread", Box::new(zed_actions::agent::ForkThread));
-                    if own_record.is_some() {
+                    menu = menu
+                        .action("Fork Thread", Box::new(zed_actions::agent::ForkThread))
+                        .action("Review Thread", Box::new(zed_actions::agent::ReviewThread))
+                        .action("Land Changes", Box::new(zed_actions::agent::LandChanges));
+                    if let Some(own_record) = &own_record {
+                        menu = menu.separator();
+                        if own_record.kind == crate::thread_fork::ForkKind::Review {
+                            menu = menu
+                                .action(
+                                    "Submit Review: Approve",
+                                    Box::new(zed_actions::agent::ApproveReview),
+                                )
+                                .action(
+                                    "Submit Review: Request Changes",
+                                    Box::new(zed_actions::agent::RequestReviewChanges),
+                                );
+                        }
                         menu = menu.action(
                             "Merge into Parent",
                             Box::new(zed_actions::agent::MergeIntoParent),
+                        );
+                    }
+                    if own_record.is_some() || is_land_thread {
+                        menu = menu.action(
+                            "Send Last Reply to Parent Thread",
+                            Box::new(zed_actions::agent::SendToParentThread),
                         );
                     }
                     if !forks.is_empty() {
                         menu = menu.separator().header("Forks of This Working Tree");
                     }
                     for record in forks {
-                        let name = record.display_name();
+                        let name = match (&record.kind, record.verdict) {
+                            (_, Some(crate::thread_fork::ReviewVerdict::Approved)) => {
+                                format!("{} (approved)", record.display_name())
+                            }
+                            (_, Some(crate::thread_fork::ReviewVerdict::ChangesRequested)) => {
+                                format!("{} (changes requested)", record.display_name())
+                            }
+                            (crate::thread_fork::ForkKind::Review, None) => {
+                                format!("{} (review)", record.display_name())
+                            }
+                            (_, None) => record.display_name(),
+                        };
                         menu = menu.entry(format!("Pull Changes from {name}"), None, {
                             let panel = panel.clone();
                             let workspace = workspace.clone();
@@ -15406,6 +15768,7 @@ mod tests {
         (panel, cx)
     }
 
+    #[allow(clippy::disallowed_methods)]
     #[gpui::test]
     async fn test_fork_thread_then_merge_and_pull(cx: &mut TestAppContext) {
         init_test(cx);
@@ -15493,5 +15856,186 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("not a fork"), "{error:#}");
+
+        // As a review fork, its verdict reaches the reviewed thread in the
+        // parent's window, with the note typed in the review thread.
+        cx.update(|_, cx| {
+            let mut record = record.clone();
+            record.kind = crate::thread_fork::ForkKind::Review;
+            record.parent_thread_id = None;
+            crate::thread_fork::upsert_record(record, cx);
+        });
+        for (panel, cx) in [(&panel, &mut cx), (&fork_panel, &mut fork_cx)] {
+            let workspace = panel.read_with(cx, |panel, _| panel.workspace.upgrade().unwrap());
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.add_panel(panel.clone(), window, cx);
+            });
+            open_thread_with_connection(panel, StubAgentConnection::new(), cx);
+        }
+        crate::test_support::type_draft_prompt(&fork_panel, "Rename the helper.", &mut fork_cx);
+        fork_panel
+            .update_in(&mut fork_cx, |panel, window, cx| {
+                panel.submit_review(
+                    crate::thread_fork::ReviewVerdict::ChangesRequested,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        // Sending snapshots the working tree with real git first.
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if !user_message_texts(&panel, &cx).is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let received = user_message_texts(&panel, &cx);
+        assert_eq!(received.len(), 1, "{received:?}");
+        assert!(
+            received[0].starts_with("Review verdict: changes requested."),
+            "{received:?}"
+        );
+        assert!(received[0].contains("Rename the helper."), "{received:?}");
+        assert_eq!(
+            cx.update(|_, cx| crate::thread_fork::record_for_fork(&record.fork_path, cx))
+                .and_then(|record| record.verdict),
+            Some(crate::thread_fork::ReviewVerdict::ChangesRequested)
+        );
+        let draft = fork_panel.read_with(&fork_cx, |panel, cx| {
+            let thread_view = panel.active_thread_view(cx).unwrap();
+            thread_view.read(cx).message_editor.read(cx).text(cx)
+        });
+        assert_eq!(draft, "");
+    }
+
+    /// The user messages of the thread the panel shows.
+    fn user_message_texts(panel: &Entity<AgentPanel>, cx: &VisualTestContext) -> Vec<String> {
+        panel.read_with(cx, |panel, cx| {
+            let thread = panel.active_agent_thread(cx).unwrap();
+            thread_user_message_texts(&thread, cx)
+        })
+    }
+
+    fn thread_user_message_texts(thread: &Entity<AcpThread>, cx: &App) -> Vec<String> {
+        thread
+            .read(cx)
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                acp_thread::AgentThreadEntry::UserMessage(message) => {
+                    Some(message.content.to_markdown(cx))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    async fn test_messages_between_threads_are_sent_or_queued(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new();
+        open_thread_with_connection(&panel, connection.clone(), &mut cx);
+
+        // An idle thread takes the message as its next turn.
+        let finish_first = connection.defer_next_prompt_response();
+        let first = crate::thread_fork::thread_message(Some("Fork: A"), "first finding");
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.deliver_message(None, first.clone(), window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(user_message_texts(&panel, &cx), vec![first.clone()]);
+
+        // A busy thread queues it, and takes it when the turn ends.
+        let second = crate::thread_fork::thread_message(Some("Fork: B"), "second finding");
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.deliver_message(None, second.clone(), window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(user_message_texts(&panel, &cx), vec![first.clone()]);
+        finish_first
+            .send(Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(user_message_texts(&panel, &cx), vec![first, second]);
+    }
+
+    #[gpui::test]
+    async fn test_land_changes_starts_a_thread_that_reports_back(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree("/project", json!({ ".git": {}, "file.txt": "" }))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+            cx.new(|cx| AgentPanel::new(workspace, window, cx))
+        });
+        cx.run_until_parked();
+        cx.executor().allow_parking();
+
+        let _stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        panel.update(&mut cx, |panel, _| panel.selected_agent = Agent::Stub);
+        let parent_connection = StubAgentConnection::new();
+        open_thread_with_connection(&panel, parent_connection.clone(), &mut cx);
+        let finish_parent_turn = parent_connection.defer_next_prompt_response();
+        send_message(&panel, &mut cx);
+        finish_parent_turn
+            .send(Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
+        let parent_thread_id = panel.read_with(&cx, |panel, cx| {
+            panel.active_conversation_view().unwrap().read(cx).thread_id
+        });
+        let parent_thread =
+            panel.read_with(&cx, |panel, cx| panel.active_agent_thread(cx).unwrap());
+
+        panel
+            .update_in(&mut cx, |panel, window, cx| panel.land_changes(window, cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        let land_thread_id = panel.read_with(&cx, |panel, cx| {
+            panel.active_conversation_view().unwrap().read(cx).thread_id
+        });
+        assert_ne!(land_thread_id, parent_thread_id);
+        let land_messages = user_message_texts(&panel, &cx);
+        assert_eq!(land_messages.len(), 1, "{land_messages:?}");
+        assert!(
+            land_messages[0].starts_with(crate::thread_fork::LAND_PREFIX),
+            "{land_messages:?}"
+        );
+        assert!(land_messages[0].contains("Push the branch"));
+
+        // Its report goes back to the thread whose changes it landed.
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.send_last_reply_to_parent(window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        let parent_messages = cx.update(|_, cx| thread_user_message_texts(&parent_thread, cx));
+        assert_eq!(parent_messages.len(), 2, "{parent_messages:?}");
+        assert!(
+            parent_messages[1].starts_with(crate::thread_fork::THREAD_MESSAGE_PREFIX),
+            "{parent_messages:?}"
+        );
     }
 }

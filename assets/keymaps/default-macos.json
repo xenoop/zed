@@ -257,6 +257,8 @@
       "alt-shift-f": "agent::ForkThread",
       "alt-shift-m": "agent::MergeIntoParent",
       "alt-shift-p": "agent::PullFromFork",
+      "alt-shift-r": "agent::ReviewThread",
+      "alt-shift-l": "agent::LandChanges",
       "cmd-n": "agent::NewThread",
       "cmd-alt-c": "agent::OpenSettings",
       "cmd-alt-m": "agent::ToggleOptionsMenu",
