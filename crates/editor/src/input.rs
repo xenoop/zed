@@ -70,6 +70,11 @@ impl Editor {
     }
 
     pub fn handle_input(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.comment_mode() {
+            self.start_review_comment(Some(text), window, cx);
+            return;
+        }
+
         let text: Arc<str> = text.into();
 
         if self.read_only(cx) {

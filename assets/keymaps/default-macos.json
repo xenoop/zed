@@ -1831,6 +1831,14 @@
       "cmd-shift-y": "git::MarkAllFilesSeen",
       "alt-]": "git::GoToNextChangedFile",
       "alt-[": "git::GoToPreviousChangedFile",
+      "cmd-alt-m": "editor::CommentOnSelection",
+      "cmd-alt-c": "editor::ToggleCommentMode",
+    },
+  },
+  {
+    "context": "ReviewComment > Editor",
+    "bindings": {
+      "cmd-enter": "editor::SendDiffReviewCommentNow",
     },
   },
 ]

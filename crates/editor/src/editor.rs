@@ -1183,6 +1183,7 @@ pub struct Editor {
     stored_review_comments: Vec<(DiffHunkKey, Vec<StoredReviewComment>)>,
     /// Counter for generating unique comment IDs.
     next_review_comment_id: usize,
+    comment_mode: bool,
     hovered_diff_hunk_row: Option<DisplayRow>,
     lsp_data_tasks: HashMap<BufferId, HashMap<LspDataKind, Shared<Task<()>>>>,
     offscreen_lsp_data_tasks: HashMap<LspDataKind, (BufferId, Task<()>)>,
@@ -2554,6 +2555,7 @@ impl Editor {
             diff_review_overlays: Vec::new(),
             stored_review_comments: Vec::new(),
             next_review_comment_id: 0,
+            comment_mode: false,
             hovered_diff_hunk_row: None,
             _subscriptions: (!is_minimap)
                 .then(|| {
@@ -3441,7 +3443,7 @@ impl Editor {
     }
 
     pub fn read_only(&self, cx: &App) -> bool {
-        self.read_only || self.buffer.read(cx).read_only()
+        self.read_only || self.comment_mode || self.buffer.read(cx).read_only()
     }
 
     pub fn set_read_only(&mut self, read_only: bool) {

@@ -630,6 +630,93 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_diff_review_overlay(display_range, window, cx);
+    }
+
+    /// Whether typing on code starts a review comment instead of editing.
+    pub fn comment_mode(&self) -> bool {
+        self.comment_mode
+    }
+
+    /// In comment mode the editor does not edit its buffers: typed text opens
+    /// a review comment on the selected lines instead.
+    pub fn set_comment_mode(&mut self, comment_mode: bool, cx: &mut Context<Self>) {
+        if self.comment_mode != comment_mode {
+            self.comment_mode = comment_mode;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn toggle_comment_mode(
+        &mut self,
+        _: &ToggleCommentMode,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A review box's own input is an editor too: let its diff handle this.
+        if !self.show_diff_review_button {
+            cx.propagate();
+            return;
+        }
+        self.set_comment_mode(!self.comment_mode, cx);
+    }
+
+    pub(super) fn comment_on_selection(
+        &mut self,
+        _: &CommentOnSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.show_diff_review_button {
+            cx.propagate();
+            return;
+        }
+        self.start_review_comment(None, window, cx);
+    }
+
+    /// Opens a review comment on the lines of the newest selection, with
+    /// `text` (what the user typed in comment mode) already in it.
+    pub fn start_review_comment(
+        &mut self,
+        text: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.show_diff_review_button {
+            return;
+        }
+        let snapshot = self.snapshot(window, cx);
+        let selection = self.selections.newest::<Point>(&snapshot.display_snapshot);
+        let mut end = selection.end;
+        // A selection that ends at the start of a line does not include that line.
+        if end.column == 0 && end.row > selection.start.row {
+            end = Point::new(end.row - 1, 0);
+        }
+        let start_row = selection
+            .start
+            .to_display_point(&snapshot.display_snapshot)
+            .row();
+        let end_row = end.to_display_point(&snapshot.display_snapshot).row();
+        let Some(prompt_editor) = self.open_diff_review_overlay(start_row..end_row, window, cx)
+        else {
+            return;
+        };
+        if let Some(text) = text {
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.move_to_end(&crate::actions::MoveToEnd, window, cx);
+                prompt_editor.insert(text, window, cx);
+            });
+        }
+    }
+
+    /// Opens (or focuses) the review box for the given rows and returns its
+    /// input editor.
+    fn open_diff_review_overlay(
+        &mut self,
+        display_range: Range<DisplayRow>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Editor>> {
         let Range { start, end } = display_range.sorted();
 
         let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
@@ -668,9 +755,10 @@ impl Editor {
             Self::hunk_keys_match(&overlay.hunk_key, &new_hunk_key, &buffer_snapshot)
         }) {
             // Just focus the existing overlay's prompt editor
-            let focus_handle = existing_overlay.prompt_editor.focus_handle(cx);
+            let prompt_editor = existing_overlay.prompt_editor.clone();
+            let focus_handle = prompt_editor.focus_handle(cx);
             window.focus(&focus_handle, cx);
-            return;
+            return Some(prompt_editor);
         }
 
         // Dismiss overlays that have no comments for their hunks
@@ -703,7 +791,7 @@ impl Editor {
         // Register the Newline action on the prompt editor to submit the review
         let parent_editor = cx.entity().downgrade();
         let subscription = prompt_editor.update(cx, |prompt_editor, _cx| {
-            prompt_editor.register_action({
+            let store = prompt_editor.register_action({
                 let parent_editor = parent_editor.clone();
                 move |_: &crate::actions::Newline, window, cx| {
                     if let Some(editor) = parent_editor.upgrade() {
@@ -712,7 +800,19 @@ impl Editor {
                         });
                     }
                 }
-            })
+            });
+            let send_now = prompt_editor.register_action({
+                let parent_editor = parent_editor.clone();
+                move |_: &SendDiffReviewCommentNow, window, cx| {
+                    if let Some(editor) = parent_editor.upgrade() {
+                        editor.update(cx, |editor, cx| {
+                            editor.submit_diff_review_comment(window, cx);
+                        });
+                        window.dispatch_action(Box::new(SendReviewToAgent), cx);
+                    }
+                }
+            });
+            Subscription::join(store, send_now)
         });
 
         // Calculate initial height based on existing comments for this hunk
@@ -740,7 +840,7 @@ impl Editor {
         let block_ids = self.insert_blocks([block], None, cx);
         let Some(block_id) = block_ids.into_iter().next() else {
             log::error!("Failed to insert diff review overlay block");
-            return;
+            return None;
         };
 
         self.diff_review_overlays.push(DiffReviewOverlay {
@@ -760,6 +860,7 @@ impl Editor {
         window.focus(&focus_handle, cx);
 
         cx.notify();
+        Some(prompt_editor)
     }
 
     /// Stores the diff review comment locally.
@@ -2664,6 +2765,7 @@ impl Editor {
 
         v_flex()
             .w_full()
+            .key_context("ReviewComment")
             .bg(colors.editor_background)
             .border_b_1()
             .border_color(colors.border)

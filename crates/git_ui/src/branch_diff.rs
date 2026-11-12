@@ -14,7 +14,7 @@ use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
 use editor::{
     Addon, Editor, EditorEvent, HiddenDiffHunkRenderer, SplittableEditor,
-    actions::SendReviewToAgent,
+    actions::{SendReviewToAgent, ToggleCommentMode},
 };
 use git::{repository::DiffType, status::FileStatus};
 use gpui::{
@@ -494,6 +494,7 @@ impl BranchDiff {
                     editor.set_diff_hunk_renderer(Some(Arc::new(HiddenDiffHunkRenderer)), cx);
                     editor.rhs_editor().update(cx, move |rhs_editor, cx| {
                         rhs_editor.set_read_only(false);
+                        rhs_editor.set_comment_mode(true, cx);
                         let multibuffer = rhs_editor.buffer().downgrade();
                         rhs_editor.register_addon(BranchDiffAddon {
                             branch_diff: branch_diff_for_addon,
@@ -908,6 +909,8 @@ impl Render for BranchDiff {
             .size_full()
             .key_context("ChangesView")
             .on_action(cx.listener(Self::review_diff))
+            // The editor toggles the mode; this only redraws the toolbar's toggle.
+            .capture_action(cx.listener(|_, _: &ToggleCommentMode, _, cx| cx.notify()))
             .on_action(cx.listener(Self::toggle_file_seen))
             .on_action(cx.listener(Self::mark_all_files_seen))
             .on_action(cx.listener(|this, _: &GoToNextChangedFile, window, cx| {
@@ -1087,6 +1090,7 @@ impl Render for BranchDiffToolbar {
                 .children(render_seen_progress(&branch_diff, cx))
                 .child(Divider::vertical().ml_1())
                 .child(compare_menu)
+                .child(render_comment_mode_toggle(&branch_diff, cx))
                 .when(review_count > 0, |this| {
                     this.child(Divider::vertical()).child(
                         render_send_review_to_agent_button(review_count, &focus_handle).on_click(
@@ -1140,6 +1144,7 @@ impl Render for BranchDiffToolbar {
             .children(render_seen_progress(&branch_diff, cx))
             .child(Divider::vertical().ml_1())
             .child(compare_menu)
+            .child(render_comment_mode_toggle(&branch_diff, cx))
             .child(
                 PopoverMenu::new("branch-diff-base-branch-picker")
                     .menu(move |window, cx| {
@@ -1236,6 +1241,28 @@ impl Render for BranchDiffToolbar {
 
 /// The comparison picker of the Changes view: against the branch base, the
 /// last commit, or the working tree when the last agent turn started.
+fn render_comment_mode_toggle(branch_diff: &Entity<BranchDiff>, cx: &App) -> impl IntoElement {
+    let editor = branch_diff.read(cx).rhs_editor(cx);
+    let comment_mode = editor.read(cx).comment_mode();
+    IconButton::new("comment-mode", IconName::Chat)
+        .icon_size(IconSize::Small)
+        .toggle_state(comment_mode)
+        .tooltip(Tooltip::for_action_title(
+            if comment_mode {
+                "Comment Mode: typing starts a comment"
+            } else {
+                "Edit Mode: typing edits the file"
+            },
+            &ToggleCommentMode,
+        ))
+        .on_click(move |_, _, cx| {
+            editor.update(cx, |editor, cx| {
+                let comment_mode = editor.comment_mode();
+                editor.set_comment_mode(!comment_mode, cx);
+            });
+        })
+}
+
 fn render_seen_progress(branch_diff: &Entity<BranchDiff>, cx: &App) -> Option<AnyElement> {
     let (seen, total) = branch_diff.read(cx).seen_progress(cx);
     if total == 0 {
@@ -1363,6 +1390,7 @@ mod tests {
     use settings::{DiffViewStyle, SettingsStore};
     use std::path::Path;
     use std::sync::Arc;
+    use std::{cell::Cell, rc::Rc};
     use unindent::Unindent as _;
     use util::{
         path,
@@ -2128,5 +2156,111 @@ mod tests {
                 |_, _| toolbar.clone().into_any_element(),
             );
         }
+    }
+
+    #[gpui::test]
+    async fn test_comment_mode_in_changes_view(cx: &mut TestAppContext) {
+        init_test(cx);
+        bind_default_keymap(cx);
+        let (send_now, comment_on_selection, toggle_comment_mode) = if cfg!(target_os = "macos") {
+            ("cmd-enter", "cmd-alt-m", "cmd-alt-c")
+        } else {
+            ("ctrl-enter", "ctrl-alt-m", "ctrl-alt-c")
+        };
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "one\ntwo\nthree\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "one\n".into())],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "one\n".into())],
+        );
+        cx.run_until_parked();
+
+        let sent_reviews = Rc::new(Cell::new(0));
+        workspace.update(cx, |workspace, _| {
+            let sent_reviews = sent_reviews.clone();
+            workspace.register_action(move |_, _: &SendReviewToAgent, _, _| {
+                sent_reviews.set(sent_reviews.get() + 1);
+            });
+        });
+
+        cx.focus(&workspace);
+        cx.simulate_keystrokes("alt-shift-d");
+        cx.run_until_parked();
+        let diff = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_item_as::<BranchDiff>(cx)
+            })
+            .unwrap();
+        let editor = diff.read_with(cx, |diff, cx| diff.rhs_editor(cx));
+        diff.update_in(cx, |diff, window, cx| {
+            diff.focus_handle(cx).focus(window, cx);
+            diff.diff
+                .update(cx, |diff, cx| diff.move_to_beginning(window, cx));
+        });
+        cx.run_until_parked();
+        let file_text =
+            |cx: &mut VisualTestContext| editor.read_with(cx, |editor, cx| editor.text(cx));
+        let original_text = file_text(cx);
+        assert!(editor.read_with(cx, |editor, _| editor.comment_mode()));
+
+        // Typing on code starts a comment and leaves the file alone.
+        cx.simulate_input("why?");
+        cx.run_until_parked();
+        assert_eq!(file_text(cx), original_text);
+        let prompt = editor
+            .read_with(cx, |editor, _| editor.diff_review_prompt_editor().cloned())
+            .expect("typing in comment mode should open a comment");
+        assert_eq!(prompt.read_with(cx, |prompt, cx| prompt.text(cx)), "why?");
+
+        // Sending stores the comment and hands it to the agent straight away.
+        cx.simulate_keystrokes(send_now);
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.total_review_comment_count()),
+            1
+        );
+        assert_eq!(sent_reviews.get(), 1);
+        assert_eq!(file_text(cx), original_text);
+
+        // Out of comment mode, typing edits the file again.
+        editor.update_in(cx, |editor, window, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+        });
+        cx.simulate_keystrokes(toggle_comment_mode);
+        cx.run_until_parked();
+        assert!(!editor.read_with(cx, |editor, _| editor.comment_mode()));
+        cx.simulate_input("x");
+        cx.run_until_parked();
+        assert_ne!(file_text(cx), original_text);
+
+        // The shortcut comments on the selection in either mode.
+        cx.simulate_keystrokes(comment_on_selection);
+        cx.run_until_parked();
+        // The edit above moved the lines, so this may be a new comment box.
+        let focused_contexts = cx.update(|window, _| window.context_stack());
+        assert!(
+            focused_contexts
+                .iter()
+                .any(|context| context.contains("ReviewComment")),
+            "{focused_contexts:?}"
+        );
     }
 }
