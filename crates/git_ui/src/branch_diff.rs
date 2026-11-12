@@ -538,6 +538,7 @@ impl BranchDiff {
                     let buffer_id = buffer.read(cx).remote_id();
                     let editor = this.rhs_editor(cx);
                     let list = this.diff.read(cx).branch_diff().clone();
+                    seen_files::load(&list, cx);
                     let is_seen = seen_files::is_seen(
                         list.read(cx),
                         editor.read(cx).buffer().read(cx),
@@ -1402,6 +1403,8 @@ mod tests {
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
+            // Seen marks are saved to the database: keep each test's own.
+            cx.set_global(db::AppDatabase::test_new());
             let store = SettingsStore::test(cx);
             cx.set_global(store);
             cx.update_global::<SettingsStore, _>(|store, cx| {
@@ -1889,6 +1892,25 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(progress(cx), (3, 3));
+
+        // After a restart the marks come back from the database, and the
+        // files they cover start folded.
+        cx.update(|_, cx| cx.set_global(seen_files::SeenFiles::default()));
+        assert_eq!(progress(cx), (0, 3));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let reopened = cx
+            .update(|window, cx| {
+                BranchDiff::new_with_default_branch(project.clone(), workspace, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            reopened.read_with(cx, |diff, cx| diff.seen_progress(cx)),
+            (3, 3)
+        );
+        let reopened_editor = reopened.read_with(cx, |diff, cx| diff.rhs_editor(cx));
+        assert!(reopened_editor.read_with(cx, |editor, cx| editor.is_buffer_folded(first, cx)));
     }
 
     #[allow(clippy::disallowed_methods)]

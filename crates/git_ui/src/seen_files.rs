@@ -5,13 +5,15 @@ use std::{
     sync::Arc,
 };
 
-use collections::HashMap;
+use collections::{HashMap, HashSet};
+use db::kvp::KeyValueStore;
 use editor::Editor;
 use git::repository::RepoPath;
 use gpui::{App, Entity, Global, SharedString, actions};
 use language::BufferId;
 use multi_buffer::MultiBuffer;
 use project::git_store::diff_buffer_list::{DiffBase, DiffBufferList};
+use util::ResultExt as _;
 
 actions!(
     git,
@@ -47,6 +49,8 @@ struct FingerprintKey {
 #[derive(Default)]
 pub(crate) struct SeenFiles {
     marks: HashMap<SeenScope, HashMap<RepoPath, u64>>,
+    /// Scopes whose saved marks were already read from the database.
+    loaded: HashSet<SeenScope>,
     fingerprints: RefCell<HashMap<BufferId, (FingerprintKey, u64)>>,
 }
 
@@ -71,6 +75,69 @@ fn scope(list: &DiffBufferList, cx: &App) -> Option<SeenScope> {
         work_directory,
         comparison,
     })
+}
+
+/// The database key a scope's marks are saved under. Marks against a turn
+/// snapshot are not saved: the snapshot is replaced by the next message.
+fn storage_key(scope: &SeenScope) -> Option<String> {
+    let is_commit_id =
+        scope.comparison.len() == 40 && scope.comparison.chars().all(|c| c.is_ascii_hexdigit());
+    (!is_commit_id).then(|| {
+        format!(
+            "changes_view_seen:{}:{}",
+            scope.work_directory.display(),
+            scope.comparison
+        )
+    })
+}
+
+/// Reads the marks saved for this Changes view, once per comparison.
+pub(crate) fn load(list: &Entity<DiffBufferList>, cx: &mut App) {
+    let Some(scope) = scope(list.read(cx), cx) else {
+        return;
+    };
+    if cx
+        .try_global::<SeenFiles>()
+        .is_some_and(|seen_files| seen_files.loaded.contains(&scope))
+    {
+        return;
+    }
+    let saved = storage_key(&scope)
+        .and_then(|key| KeyValueStore::global(cx).read_kvp(&key).log_err().flatten())
+        .and_then(|json| serde_json::from_str::<HashMap<String, u64>>(&json).log_err())
+        .unwrap_or_default();
+    let seen_files = cx.default_global::<SeenFiles>();
+    seen_files.loaded.insert(scope.clone());
+    let marks = seen_files.marks.entry(scope).or_default();
+    for (path, fingerprint) in saved {
+        if let Some(repo_path) = RepoPath::new(&path).log_err() {
+            marks.entry(repo_path).or_insert(fingerprint);
+        }
+    }
+}
+
+fn save(scope: &SeenScope, cx: &mut App) {
+    let Some(key) = storage_key(scope) else {
+        return;
+    };
+    let marks: HashMap<String, u64> = cx
+        .try_global::<SeenFiles>()
+        .and_then(|seen_files| seen_files.marks.get(scope))
+        .map(|marks| {
+            marks
+                .iter()
+                .map(|(path, fingerprint)| (path.as_unix_str().to_string(), *fingerprint))
+                .collect()
+        })
+        .unwrap_or_default();
+    let store = KeyValueStore::global(cx);
+    db::write_and_log(cx, move || async move {
+        if marks.is_empty() {
+            store.delete_kvp(key).await
+        } else {
+            store.write_kvp(key, serde_json::to_string(&marks)?).await
+        }
+    });
 }
 
 fn hash_chunks<'a>(hasher: &mut DefaultHasher, chunks: impl Iterator<Item = &'a str>) {
@@ -222,9 +289,11 @@ pub(crate) fn set_seen(
             Some((*buffer_id, file))
         })
         .collect::<Vec<_>>();
-    if files.is_empty() {
+    let Some((_, first)) = files.first() else {
         return;
-    }
+    };
+    let scope = first.scope.clone();
+    load(list, cx);
     let seen_files = cx.default_global::<SeenFiles>();
     for (_, file) in &files {
         let marks = seen_files.marks.entry(file.scope.clone()).or_default();
@@ -234,6 +303,7 @@ pub(crate) fn set_seen(
             marks.remove(&file.repo_path);
         }
     }
+    save(&scope, cx);
     let buffer_ids = files.into_iter().map(|(buffer_id, _)| buffer_id);
     editor.update(cx, |editor, cx| {
         if seen {
@@ -253,6 +323,7 @@ pub(crate) fn clear_stale_marks(
     editor: &Entity<Editor>,
     cx: &mut App,
 ) {
+    load(list, cx);
     let Some(seen_files) = cx.try_global::<SeenFiles>() else {
         return;
     };
