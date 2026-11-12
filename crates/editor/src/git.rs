@@ -179,6 +179,56 @@ pub(super) struct StoredReviewComment {
     pub(super) is_editing: bool,
     /// The agent's answer to this comment, once sent.
     pub(super) agent_reply: AgentReply,
+    /// The code this comment was written on has changed since (found when
+    /// restoring it after a restart).
+    pub(super) outdated: bool,
+}
+
+/// A review comment as saved between sessions.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SavedReviewComment {
+    /// Path of the file, relative to its worktree.
+    pub file_path: String,
+    /// Rows of the commented lines in the file, both inclusive.
+    pub start_row: u32,
+    pub end_row: u32,
+    /// The commented lines, for finding them again after the file changed.
+    pub code: String,
+    pub comment: String,
+    /// The agent's answer, if it gave one.
+    pub answer: Option<String>,
+    #[serde(default)]
+    pub outdated: bool,
+}
+
+fn lines_text(buffer: &language::BufferSnapshot, start_row: u32, end_row: u32) -> String {
+    let end_row = end_row.min(buffer.max_point().row);
+    let start = Point::new(start_row.min(end_row), 0);
+    let end = Point::new(end_row, buffer.line_len(end_row));
+    buffer.text_for_range(start..end).collect()
+}
+
+/// Where a saved comment belongs in the file now: its rows, and whether the
+/// commented code is gone (the comment is outdated).
+fn locate_saved_comment(
+    saved: &SavedReviewComment,
+    buffer: &language::BufferSnapshot,
+) -> (u32, u32, bool) {
+    let max_row = buffer.max_point().row;
+    let line_count = saved.end_row.saturating_sub(saved.start_row);
+    if saved.end_row <= max_row && lines_text(buffer, saved.start_row, saved.end_row) == saved.code
+    {
+        return (saved.start_row, saved.end_row, false);
+    }
+    // The lines moved: take the occurrence nearest to where they were.
+    let moved = (0..=max_row.saturating_sub(line_count))
+        .filter(|row| lines_text(buffer, *row, row + line_count) == saved.code)
+        .min_by_key(|row| row.abs_diff(saved.start_row));
+    if let Some(row) = moved {
+        return (row, row + line_count, false);
+    }
+    let start_row = saved.start_row.min(max_row);
+    (start_row, (start_row + line_count).min(max_row), true)
 }
 
 /// Answers longer than this scroll inside their comment.
@@ -294,6 +344,7 @@ impl StoredReviewComment {
             range: anchor_range,
             is_editing: false,
             agent_reply: AgentReply::NotSent,
+            outdated: false,
         }
     }
 }
@@ -633,7 +684,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_diff_review_overlay(display_range, window, cx);
+        self.open_diff_review_overlay(display_range, true, window, cx);
     }
 
     /// Whether typing on code starts a review comment instead of editing.
@@ -700,7 +751,8 @@ impl Editor {
             .to_display_point(&snapshot.display_snapshot)
             .row();
         let end_row = end.to_display_point(&snapshot.display_snapshot).row();
-        let Some(prompt_editor) = self.open_diff_review_overlay(start_row..end_row, window, cx)
+        let Some(prompt_editor) =
+            self.open_diff_review_overlay(start_row..end_row, true, window, cx)
         else {
             return;
         };
@@ -717,6 +769,7 @@ impl Editor {
     fn open_diff_review_overlay(
         &mut self,
         display_range: Range<DisplayRow>,
+        focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<Editor>> {
@@ -759,13 +812,19 @@ impl Editor {
         }) {
             // Just focus the existing overlay's prompt editor
             let prompt_editor = existing_overlay.prompt_editor.clone();
-            let focus_handle = prompt_editor.focus_handle(cx);
-            window.focus(&focus_handle, cx);
+            if focus {
+                let focus_handle = prompt_editor.focus_handle(cx);
+                window.focus(&focus_handle, cx);
+            }
             return Some(prompt_editor);
         }
 
-        // Dismiss overlays that have no comments for their hunks
-        self.dismiss_overlays_without_comments(cx);
+        // Dismiss overlays that have no comments for their hunks. Restoring
+        // saved comments opens each box before adding its comments, so those
+        // boxes must survive until then.
+        if focus {
+            self.dismiss_overlays_without_comments(cx);
+        }
 
         // Get the current user's avatar URI from the project's user_store
         let user_avatar_uri = self.project.as_ref().and_then(|project| {
@@ -858,12 +917,112 @@ impl Editor {
             _subscription: subscription,
         });
 
-        // Focus the prompt editor
-        let focus_handle = prompt_editor.focus_handle(cx);
-        window.focus(&focus_handle, cx);
+        if focus {
+            let focus_handle = prompt_editor.focus_handle(cx);
+            window.focus(&focus_handle, cx);
+        }
 
         cx.notify();
         Some(prompt_editor)
+    }
+
+    /// The review comments in a form that survives a restart: located by file
+    /// and lines rather than by anchors. Comments on removed lines, which
+    /// exist only in the diff, are left out.
+    pub fn saved_review_comments(&self, cx: &App) -> Vec<SavedReviewComment> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let mut saved = Vec::new();
+        for (hunk_key, comments) in &self.stored_review_comments {
+            for comment in comments {
+                let Some((buffer, range)) =
+                    snapshot.anchor_range_to_buffer_anchor_range(comment.range.clone())
+                else {
+                    continue;
+                };
+                let start_row = range.start.to_point(buffer).row;
+                let end_row = range.end.to_point(buffer).row;
+                saved.push(SavedReviewComment {
+                    file_path: hunk_key.file_path.as_unix_str().to_string(),
+                    start_row,
+                    end_row,
+                    code: lines_text(buffer, start_row, end_row),
+                    comment: comment.comment.clone(),
+                    answer: match &comment.agent_reply {
+                        AgentReply::Answered(answer) => Some(answer.clone()),
+                        AgentReply::NotSent | AgentReply::Waiting | AgentReply::Failed(_) => None,
+                    },
+                    outdated: comment.outdated,
+                });
+            }
+        }
+        saved
+    }
+
+    /// Puts saved comments back on their lines, in open review boxes. A
+    /// comment whose lines moved follows them; one whose lines changed stays
+    /// at its old position, marked outdated. Returns the comments whose file
+    /// is not in this editor.
+    pub fn restore_review_comments(
+        &mut self,
+        saved: Vec<SavedReviewComment>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<SavedReviewComment> {
+        let mut unplaced = Vec::new();
+        for mut saved_comment in saved {
+            let multibuffer = self.buffer.read(cx);
+            let buffer = multibuffer.all_buffers_iter().find(|buffer| {
+                buffer.read(cx).file().is_some_and(|file| {
+                    file.path().as_unix_str() == saved_comment.file_path.as_str()
+                })
+            });
+            let Some(buffer) = buffer else {
+                unplaced.push(saved_comment);
+                continue;
+            };
+            let buffer_snapshot = buffer.read(cx).snapshot();
+            let (start_row, end_row, outdated) =
+                locate_saved_comment(&saved_comment, &buffer_snapshot);
+            let anchors = multibuffer
+                .buffer_point_to_anchor(&buffer, Point::new(start_row, 0), cx)
+                .zip(multibuffer.buffer_point_to_anchor(&buffer, Point::new(end_row, 0), cx));
+            let Some((start, end)) = anchors else {
+                unplaced.push(saved_comment);
+                continue;
+            };
+            let snapshot = self.snapshot(window, cx);
+            let rows = start.to_display_point(&snapshot.display_snapshot).row()
+                ..end.to_display_point(&snapshot.display_snapshot).row();
+            let Some(prompt_editor) = self.open_diff_review_overlay(rows, false, window, cx) else {
+                unplaced.push(saved_comment);
+                continue;
+            };
+            let Some((hunk_key, anchor_range)) = self
+                .diff_review_overlays
+                .iter()
+                .find(|overlay| overlay.prompt_editor == prompt_editor)
+                .map(|overlay| (overlay.hunk_key.clone(), overlay.anchor_range.clone()))
+            else {
+                unplaced.push(saved_comment);
+                continue;
+            };
+            let id =
+                self.add_review_comment(hunk_key.clone(), saved_comment.comment, anchor_range, cx);
+            for (_, comments) in &mut self.stored_review_comments {
+                if let Some(comment) = comments.iter_mut().find(|comment| comment.id == id) {
+                    comment.outdated = outdated || saved_comment.outdated;
+                    if let Some(answer) = saved_comment.answer.take() {
+                        comment.agent_reply = AgentReply::Answered(answer);
+                    }
+                }
+            }
+            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        }
+        cx.emit(EditorEvent::ReviewCommentsChanged {
+            total_count: self.unsent_review_comment_count(),
+        });
+        cx.notify();
+        unplaced
     }
 
     /// Stores the diff review comment locally.
@@ -2988,10 +3147,18 @@ impl Editor {
                     .into_any_element()
             } else {
                 // Display mode: show the comment text
-                div()
+                h_flex()
                     .flex_1()
+                    .gap_1p5()
                     .text_sm()
                     .text_color(colors.text)
+                    .when(comment.outdated, |row| {
+                        row.child(
+                            Label::new("Outdated")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Warning),
+                        )
+                    })
                     .child(comment.comment)
                     .into_any_element()
             })

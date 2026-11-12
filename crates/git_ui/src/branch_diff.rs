@@ -12,8 +12,9 @@ use crate::{
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
+use db::kvp::KeyValueStore;
 use editor::{
-    Addon, Editor, EditorEvent, HiddenDiffHunkRenderer, SplittableEditor,
+    Addon, Editor, EditorEvent, HiddenDiffHunkRenderer, SavedReviewComment, SplittableEditor,
     actions::{SendReviewToAgent, ToggleCommentMode},
 };
 use git::{repository::DiffType, status::FileStatus};
@@ -36,6 +37,7 @@ use std::{
     sync::Arc,
 };
 use ui::{Checkbox, ContextMenu, DiffStat, Divider, PopoverMenu, Tooltip, prelude::*};
+use util::ResultExt as _;
 use workspace::{
     ItemHandle, ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation,
     ToolbarItemView, Workspace,
@@ -59,6 +61,9 @@ pub struct BranchDiff {
     diff: Entity<DiffMultibuffer>,
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
+    /// Saved review comments whose file is not (yet) in the view.
+    unplaced_comments: Vec<SavedReviewComment>,
+    comments_loaded: bool,
     _diff_event_subscription: Subscription,
     _seen_subscription: Subscription,
 }
@@ -509,22 +514,31 @@ impl BranchDiff {
                 cx,
             )
         });
-        Self::from_diff(diff, project, workspace, cx)
+        Self::from_diff(diff, project, workspace, window, cx)
     }
 
     fn from_diff(
         diff: Entity<DiffMultibuffer>,
         project: Entity<Project>,
         workspace: Entity<Workspace>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let diff_event_subscription = cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| {
             cx.emit(event.clone())
         });
         let multibuffer = diff.read(cx).multibuffer().clone();
-        let seen_subscription = cx.subscribe(
+        let rhs_editor = diff.read(cx).editor().read(cx).rhs_editor().clone();
+        let comments_subscription =
+            cx.subscribe(&rhs_editor, |this, _, event: &EditorEvent, cx| {
+                if let EditorEvent::ReviewCommentsChanged { .. } = event {
+                    this.save_comments(cx);
+                }
+            });
+        let seen_subscription = cx.subscribe_in(
             &multibuffer,
-            |this, _, event: &multi_buffer::Event, cx| match event {
+            window,
+            |this, _, event: &multi_buffer::Event, window, cx| match event {
                 multi_buffer::Event::BuffersEdited { .. }
                 | multi_buffer::Event::BufferDiffChanged
                 | multi_buffer::Event::Reloaded => {
@@ -548,6 +562,8 @@ impl BranchDiff {
                     if is_seen && !editor.read(cx).is_buffer_folded(buffer_id, cx) {
                         editor.update(cx, |editor, cx| editor.fold_buffer(buffer_id, cx));
                     }
+                    // After the editor has laid out the new file.
+                    cx.defer_in(window, |this, window, cx| this.restore_comments(window, cx));
                 }
                 _ => {}
             },
@@ -556,9 +572,71 @@ impl BranchDiff {
             diff,
             project,
             workspace: workspace.downgrade(),
+            unplaced_comments: Vec::new(),
+            comments_loaded: false,
             _diff_event_subscription: diff_event_subscription,
-            _seen_subscription: seen_subscription,
+            _seen_subscription: Subscription::join(seen_subscription, comments_subscription),
         }
+    }
+
+    /// The database key for this repository's review comments. Comments sit
+    /// on lines of the working tree, so every comparison shares them.
+    fn comments_key(&self, cx: &App) -> Option<String> {
+        let repository = self.repo(cx)?;
+        Some(format!(
+            "changes_view_comments:{}",
+            repository.read(cx).work_directory_abs_path.display()
+        ))
+    }
+
+    fn load_comments(&mut self, cx: &mut Context<Self>) {
+        if self.comments_loaded {
+            return;
+        }
+        let Some(key) = self.comments_key(cx) else {
+            return;
+        };
+        self.comments_loaded = true;
+        self.unplaced_comments = KeyValueStore::global(cx)
+            .read_kvp(&key)
+            .log_err()
+            .flatten()
+            .and_then(|json| serde_json::from_str(&json).log_err())
+            .unwrap_or_default();
+    }
+
+    /// Puts saved comments back on files that have appeared in the view.
+    fn restore_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.load_comments(cx);
+        if self.unplaced_comments.is_empty() {
+            return;
+        }
+        let saved = std::mem::take(&mut self.unplaced_comments);
+        let editor = self.rhs_editor(cx);
+        let unplaced = editor.update(cx, |editor, cx| {
+            editor.restore_review_comments(saved, window, cx)
+        });
+        // Restoring emits a change, which saves; keep what that save saw.
+        self.unplaced_comments.extend(unplaced);
+    }
+
+    fn save_comments(&mut self, cx: &mut Context<Self>) {
+        self.load_comments(cx);
+        let Some(key) = self.comments_key(cx) else {
+            return;
+        };
+        let mut comments = self.rhs_editor(cx).read(cx).saved_review_comments(cx);
+        comments.extend(self.unplaced_comments.iter().cloned());
+        let store = KeyValueStore::global(cx);
+        db::write_and_log(cx, move || async move {
+            if comments.is_empty() {
+                store.delete_kvp(key).await
+            } else {
+                store
+                    .write_kvp(key, serde_json::to_string(&comments)?)
+                    .await
+            }
+        });
     }
 
     fn rhs_editor(&self, cx: &App) -> Entity<Editor> {
@@ -2284,5 +2362,118 @@ mod tests {
                 .any(|context| context.contains("ReviewComment")),
             "{focused_contexts:?}"
         );
+    }
+
+    #[gpui::test]
+    async fn test_review_comments_survive_a_restart(cx: &mut TestAppContext) {
+        init_test(cx);
+        bind_default_keymap(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "one\ntwo\nthree\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "one\n".into())],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "one\n".into())],
+        );
+        cx.run_until_parked();
+
+        cx.focus(&workspace);
+        cx.simulate_keystrokes("alt-shift-d");
+        cx.run_until_parked();
+        let diff = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_item_as::<BranchDiff>(cx)
+            })
+            .unwrap();
+        let editor = diff.read_with(cx, |diff, cx| diff.rhs_editor(cx));
+        diff.update_in(cx, |diff, window, cx| {
+            diff.focus_handle(cx).focus(window, cx);
+            diff.diff
+                .update(cx, |diff, cx| diff.move_to_beginning(window, cx));
+        });
+        cx.run_until_parked();
+
+        cx.simulate_input("why?");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        editor.update_in(cx, |editor, window, cx| {
+            let sent = editor.send_review_comments_to_agent(window, cx);
+            assert_eq!(sent.len(), 1);
+            editor.set_review_comment_replies(
+                vec![(sent[0].id, editor::AgentReply::Answered("Because.".into()))],
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let saved = editor.read_with(cx, |editor, cx| editor.saved_review_comments(cx));
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].file_path, "a.txt");
+        assert_eq!(saved[0].comment, "why?");
+        assert_eq!(saved[0].answer.as_deref(), Some("Because."));
+        assert!(!saved[0].outdated);
+
+        // A new view, as after a restart, shows the comment with its answer.
+        let reopen = |cx: &mut VisualTestContext| {
+            let workspace = workspace.clone();
+            let project = project.clone();
+            cx.update(|window, cx| {
+                BranchDiff::new_with_default_branch(project, workspace, window, cx)
+            })
+        };
+        let reopened = reopen(cx).await.unwrap();
+        cx.run_until_parked();
+        let reopened_editor = reopened.read_with(cx, |diff, cx| diff.rhs_editor(cx));
+        assert_eq!(
+            reopened_editor.read_with(cx, |editor, cx| editor.saved_review_comments(cx)),
+            saved
+        );
+        assert_eq!(
+            reopened_editor.read_with(cx, |editor, _| editor.unsent_review_comment_count()),
+            0
+        );
+
+        // Once the commented line has changed, the comment is kept but marked
+        // outdated.
+        let commented_row = saved[0].start_row;
+        let buffer = editor.read_with(cx, |editor, cx| {
+            editor
+                .buffer()
+                .read(cx)
+                .all_buffers()
+                .into_iter()
+                .next()
+                .unwrap()
+        });
+        buffer.update(cx, |buffer, cx| {
+            let start = buffer.point_to_offset(language::Point::new(commented_row, 0));
+            buffer.edit([(start..start + 1, "X")], None, cx);
+        });
+        cx.run_until_parked();
+        let reopened = reopen(cx).await.unwrap();
+        cx.run_until_parked();
+        let outdated = reopened.read_with(cx, |diff, cx| {
+            diff.rhs_editor(cx).read(cx).saved_review_comments(cx)
+        });
+        assert_eq!(outdated.len(), 1);
+        assert!(outdated[0].outdated);
+        assert_eq!(outdated[0].comment, "why?");
     }
 }
