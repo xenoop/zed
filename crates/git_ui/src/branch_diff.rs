@@ -1862,4 +1862,271 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(progress(cx), (3, 3));
     }
+
+    #[allow(clippy::disallowed_methods)]
+    fn run_git(work_directory: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(work_directory)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The files shown in a Changes view, with each file's base text.
+    fn shown_files(
+        diff: &Entity<BranchDiff>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<(String, Option<String>)> {
+        diff.read_with(cx, |diff, cx| {
+            let multibuffer = diff.diff.read(cx).multibuffer().read(cx);
+            let mut files = multibuffer
+                .all_buffers()
+                .into_iter()
+                .map(|buffer| {
+                    let buffer = buffer.read(cx);
+                    let path = buffer.file().unwrap().path().as_unix_str().to_string();
+                    let base_text = multibuffer
+                        .diff_for(buffer.remote_id())
+                        .and_then(|diff| diff.read(cx).base_text_string(cx));
+                    (path, base_text)
+                })
+                .collect::<Vec<_>>();
+            files.sort();
+            files
+        })
+    }
+
+    /// Real git and a real file system notify asynchronously, so poll rather
+    /// than rely on `run_until_parked` alone.
+    #[allow(clippy::disallowed_methods)]
+    fn wait_for<T: PartialEq + std::fmt::Debug>(
+        cx: &mut VisualTestContext,
+        expected: T,
+        mut actual: impl FnMut(&mut VisualTestContext) -> T,
+    ) {
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if actual(cx) == expected {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(actual(cx), expected);
+    }
+
+    #[gpui::test]
+    async fn test_last_turn_and_last_commit_against_real_git(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+
+        let directory = util::test::TempTree::new(json!({
+            "project": {
+                "a.txt": "one\n",
+                "b.txt": "two\n",
+            },
+        }));
+        let root = directory.path().join("project");
+        run_git(&root, &["init", "-b", "main"]);
+        run_git(&root, &["add", "."]);
+        run_git(&root, &["commit", "-m", "initial"]);
+        // An uncommitted edit made before the turn starts: part of "Last
+        // Commit", but not of "Last Turn".
+        std::fs::write(root.join("a.txt"), "one edited before the turn\n").unwrap();
+
+        let project =
+            Project::test(fs::RealFs::new(None, cx.executor()), [root.as_path()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        wait_for(cx, true, |cx| {
+            project.read_with(cx, |project, cx| project.active_repository(cx).is_some())
+        });
+        let repository = project
+            .read_with(cx, |project, cx| project.active_repository(cx))
+            .unwrap();
+
+        let (_staged, turn_snapshot) = repository
+            .update(cx, |repository, _| repository.create_archive_checkpoint())
+            .await
+            .unwrap()
+            .unwrap();
+
+        std::fs::write(root.join("b.txt"), "two changed in the turn\n").unwrap();
+        std::fs::write(root.join("new.txt"), "created in the turn\n").unwrap();
+        let worktree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
+        worktree::WorktreeModelHandle::flush_fs_events(&worktree, cx).await;
+
+        let open = |commit: SharedString, label: &'static str, cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                BranchDiff::deploy_snapshot_diff(
+                    workspace,
+                    repository.clone(),
+                    commit,
+                    label.into(),
+                    window,
+                    cx,
+                );
+                workspace.active_item_as::<BranchDiff>(cx).unwrap()
+            })
+        };
+
+        let last_turn = open(turn_snapshot.into(), LAST_TURN_LABEL, cx);
+        wait_for(
+            cx,
+            vec![
+                ("b.txt".to_string(), Some("two\n".to_string())),
+                ("new.txt".to_string(), None),
+            ],
+            |cx| shown_files(&last_turn, cx),
+        );
+
+        let last_commit = open("HEAD".into(), LAST_COMMIT_LABEL, cx);
+        wait_for(
+            cx,
+            vec![
+                ("a.txt".to_string(), Some("one\n".to_string())),
+                ("b.txt".to_string(), Some("two\n".to_string())),
+                ("new.txt".to_string(), None),
+            ],
+            |cx| shown_files(&last_commit, cx),
+        );
+    }
+
+    fn bind_default_keymap(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let asset = if cfg!(target_os = "macos") {
+                "keymaps/default-macos.json"
+            } else if cfg!(target_os = "windows") {
+                "keymaps/default-windows.json"
+            } else {
+                "keymaps/default-linux.json"
+            };
+            let bindings =
+                settings::KeymapFile::load_asset_allow_partial_failure(asset, cx).unwrap();
+            cx.bind_keys(bindings);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_changes_view_default_keybindings(cx: &mut TestAppContext) {
+        init_test(cx);
+        bind_default_keymap(cx);
+        let (toggle_seen, mark_all_seen) = if cfg!(target_os = "macos") {
+            ("cmd-alt-y", "cmd-shift-y")
+        } else {
+            ("ctrl-alt-y", "ctrl-shift-y")
+        };
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "C",
+                "b.txt": "new",
+                "d.txt": "created-in-head",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "B".into()), ("d.txt", "created-in-head".into())],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "A".into())],
+        );
+        cx.run_until_parked();
+
+        // The agent panel's shortcut opens the Changes view from anywhere in the workspace.
+        cx.focus(&workspace);
+        cx.simulate_keystrokes("alt-shift-d");
+        cx.run_until_parked();
+        let diff = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_item_as::<BranchDiff>(cx)
+            })
+            .expect("alt-shift-d should open the Changes view");
+        let editor = diff.read_with(cx, |diff, cx| diff.rhs_editor(cx));
+        let files = editor.read_with(cx, |editor, cx| {
+            seen_files::ordered_buffer_ids(editor.buffer().read(cx), cx)
+        });
+        assert_eq!(files.len(), 3);
+        let current_file = |cx: &mut VisualTestContext| {
+            editor.read_with(cx, |editor, cx| {
+                editor
+                    .active_buffer(cx)
+                    .map(|buffer| buffer.read(cx).remote_id())
+            })
+        };
+        let progress =
+            |cx: &mut VisualTestContext| diff.read_with(cx, |diff, cx| diff.seen_progress(cx));
+
+        diff.update_in(cx, |diff, window, cx| {
+            diff.focus_handle(cx).focus(window, cx);
+            diff.diff
+                .update(cx, |diff, cx| diff.move_to_beginning(window, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(current_file(cx), Some(files[0]));
+
+        cx.simulate_keystrokes("alt-]");
+        cx.run_until_parked();
+        assert_eq!(current_file(cx), Some(files[1]));
+        cx.simulate_keystrokes("alt-[");
+        cx.run_until_parked();
+        assert_eq!(current_file(cx), Some(files[0]));
+
+        // Marking the file seen folds it and moves on to the next one.
+        cx.simulate_keystrokes(toggle_seen);
+        cx.run_until_parked();
+        assert_eq!(progress(cx), (1, 3));
+        assert!(editor.read_with(cx, |editor, cx| editor.is_buffer_folded(files[0], cx)));
+        assert_eq!(current_file(cx), Some(files[1]));
+
+        cx.simulate_keystrokes(mark_all_seen);
+        cx.run_until_parked();
+        assert_eq!(progress(cx), (3, 3));
+
+        // The toolbar draws for the branch comparison and for a snapshot one.
+        let repository = project
+            .read_with(cx, |project, cx| project.active_repository(cx))
+            .unwrap();
+        let last_commit = workspace.update_in(cx, |workspace, window, cx| {
+            BranchDiff::deploy_snapshot_diff(
+                workspace,
+                repository,
+                "HEAD".into(),
+                LAST_COMMIT_LABEL.into(),
+                window,
+                cx,
+            );
+            workspace.active_item_as::<BranchDiff>(cx).unwrap()
+        });
+        cx.run_until_parked();
+        let toolbar = cx.new(|cx| BranchDiffToolbar::new(cx));
+        for item in [diff, last_commit] {
+            toolbar.update_in(cx, |toolbar, window, cx| {
+                let location = toolbar.set_active_pane_item(Some(&item), window, cx);
+                assert_eq!(location, ToolbarItemLocation::PrimaryRight);
+            });
+            cx.draw(
+                gpui::point(gpui::px(0.), gpui::px(0.)),
+                gpui::size(gpui::px(1200.), gpui::px(40.)),
+                |_, _| toolbar.clone().into_any_element(),
+            );
+        }
+    }
 }

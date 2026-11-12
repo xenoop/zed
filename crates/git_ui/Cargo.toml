@@ -95,6 +95,7 @@ task.workspace = true
 tree-sitter-md.workspace = true
 unindent.workspace = true
 workspace = { workspace = true, features = ["test-support"] }
+worktree = { workspace = true, features = ["test-support"] }
 zlog.workspace = true
 
 [package.metadata.cargo-shear]

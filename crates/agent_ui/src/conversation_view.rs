@@ -6705,6 +6705,56 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_sending_a_message_records_the_last_turn_snapshot(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            serde_json::json!({ ".git": {}, "a.txt": "one" }),
+        )
+        .await;
+        let project = Project::test(fs, [std::path::Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) = setup_conversation_view_in_project(
+            StubAgentServer::new(connection.clone()),
+            project.clone(),
+            None,
+            cx,
+        )
+        .await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+        let last_turn_snapshot = |cx: &mut VisualTestContext| {
+            project.read_with(cx, |project, cx| {
+                let repository = project.active_repository(cx)?;
+                project
+                    .git_store()
+                    .read(cx)
+                    .last_turn_snapshot(repository.read(cx).id)
+            })
+        };
+        assert_eq!(last_turn_snapshot(cx), None);
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        let first = last_turn_snapshot(cx).expect("sending should snapshot the working tree");
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("second", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        let second = last_turn_snapshot(cx).expect("each send should snapshot again");
+        assert_ne!(first, second);
+    }
+
+    #[gpui::test]
     async fn test_stale_send_result_preserves_new_prompt(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -10125,6 +10175,15 @@ pub(crate) mod tests {
     ) -> (Entity<ConversationView>, &mut VisualTestContext) {
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
+        setup_conversation_view_in_project(agent, project, initial_content, cx).await
+    }
+
+    async fn setup_conversation_view_in_project(
+        agent: impl AgentServer + 'static,
+        project: Entity<Project>,
+        initial_content: Option<AgentInitialContent>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<ConversationView>, &mut VisualTestContext) {
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());

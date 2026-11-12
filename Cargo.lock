@@ -7104,6 +7104,7 @@ dependencies = [
  "util",
  "watch",
  "workspace",
+ "worktree",
  "zed_actions",
  "zlog",
  "ztracing",
