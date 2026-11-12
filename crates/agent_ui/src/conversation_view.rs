@@ -4415,10 +4415,21 @@ pub(crate) fn review_question(comments: &[ReviewCommentForAgent], cx: &App) -> S
             }
         };
         question.push_str(&format!(
-            "\n{}: {location}\n{code}\n{}\n",
+            "\n{}: {location}\n{code}\n",
             review_comment_label(comment.id),
-            comment.comment
         ));
+        if !comment.earlier_exchange.is_empty() {
+            question.push_str("Earlier on these lines:\n");
+            for (earlier_comment, answer) in &comment.earlier_exchange {
+                question.push_str(&format!(
+                    "> Me: {}\n> You: {}\n",
+                    earlier_comment.replace('\n', "\n> "),
+                    answer.replace('\n', "\n> ")
+                ));
+            }
+            question.push_str("My reply:\n");
+        }
+        question.push_str(&format!("{}\n", comment.comment));
     }
     question
 }
@@ -16135,6 +16146,7 @@ pub(crate) mod tests {
                 file_path: util::rel_path::rel_path("src/a.rs").into_arc(),
                 code: ReviewCommentCode::Buffer { buffer, range },
                 comment: "Use a constant".to_string(),
+                earlier_exchange: Vec::new(),
             },
             ReviewCommentForAgent {
                 id: 4,
@@ -16145,6 +16157,10 @@ pub(crate) mod tests {
                     starts_on_removed_line: true,
                 },
                 comment: "Why was this removed?".to_string(),
+                earlier_exchange: vec![(
+                    "Is this dead code?".to_string(),
+                    "Yes.\nNothing calls it.".to_string(),
+                )],
             },
         ];
         let question = cx.update(|cx| review_question(&comments, cx));
@@ -16155,7 +16171,9 @@ pub(crate) mod tests {
         );
         assert!(question.contains(
             "R5: `src/b.rs`, diff from line 3 of the old file (removed lines start with -)\n\
-             ```diff\n-old\n```\nWhy was this removed?\n"
+             ```diff\n-old\n```\nEarlier on these lines:\n\
+             > Me: Is this dead code?\n> You: Yes.\n> Nothing calls it.\nMy reply:\n\
+             Why was this removed?\n"
         ));
     }
 

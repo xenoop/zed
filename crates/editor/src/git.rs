@@ -263,6 +263,9 @@ pub struct ReviewCommentForAgent {
     pub file_path: Arc<util::rel_path::RelPath>,
     pub code: ReviewCommentCode,
     pub comment: String,
+    /// Earlier comments on the same lines with the agent's answers, oldest
+    /// first: this comment is a reply in that exchange.
+    pub earlier_exchange: Vec<(String, String)>,
 }
 
 /// The code a review comment was left on.
@@ -784,7 +787,7 @@ impl Editor {
         // Create the prompt editor for the review input
         let prompt_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Add a review comment...", window, cx);
+            editor.set_placeholder_text("Add a review comment or reply...", window, cx);
             editor
         });
 
@@ -3184,10 +3187,19 @@ impl Editor {
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let mut comments: Vec<(Point, ReviewCommentForAgent)> = Vec::new();
         for (hunk_key, hunk_comments) in &self.stored_review_comments {
-            for comment in hunk_comments {
+            for (index, comment) in hunk_comments.iter().enumerate() {
                 if !comment.agent_reply.needs_sending() {
                     continue;
                 }
+                let earlier_exchange = hunk_comments[..index]
+                    .iter()
+                    .filter_map(|earlier| match &earlier.agent_reply {
+                        AgentReply::Answered(answer) => {
+                            Some((earlier.comment.clone(), answer.clone()))
+                        }
+                        AgentReply::NotSent | AgentReply::Waiting | AgentReply::Failed(_) => None,
+                    })
+                    .collect();
                 let start = comment.range.start.to_point(&snapshot);
                 let end = comment.range.end.to_point(&snapshot);
                 let code = self.review_comment_code(&snapshot, &comment.range, start..end, cx);
@@ -3198,6 +3210,7 @@ impl Editor {
                         file_path: hunk_key.file_path.clone(),
                         code,
                         comment: comment.comment.clone(),
+                        earlier_exchange,
                     },
                 ));
             }

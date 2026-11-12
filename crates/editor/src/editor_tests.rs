@@ -47673,6 +47673,16 @@ fn test_review_comment_agent_replies(cx: &mut TestAppContext) {
             resent.iter().map(|c| c.id).collect::<Vec<_>>(),
             vec![second]
         );
+        // A later comment on the same lines is a reply: it carries the
+        // exchange so far.
+        assert_eq!(
+            resent[0].earlier_exchange,
+            vec![("Why?".to_string(), "Because.".to_string())]
+        );
+        assert!(
+            sent.iter()
+                .all(|comment| comment.earlier_exchange.is_empty())
+        );
 
         // Editing an answered comment makes it a new question.
         editor.update_review_comment(first, "Why exactly?".to_string(), cx);
