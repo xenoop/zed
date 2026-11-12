@@ -6738,12 +6738,20 @@ pub(crate) mod tests {
         };
         assert_eq!(last_turn_snapshot(cx), None);
 
+        let finish_first = connection.defer_next_prompt_response();
         message_editor.update_in(cx, |editor, window, cx| {
             editor.set_text("first", window, cx);
         });
         thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
         cx.run_until_parked();
         let first = last_turn_snapshot(cx).expect("sending should snapshot the working tree");
+        finish_first
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, cx| {
+            assert_eq!(view.thread.read(cx).status(), ThreadStatus::Idle);
+        });
 
         message_editor.update_in(cx, |editor, window, cx| {
             editor.set_text("second", window, cx);
