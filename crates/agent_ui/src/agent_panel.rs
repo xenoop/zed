@@ -6336,6 +6336,25 @@ impl AgentPanel {
                         .flex_none()
                         .gap_1()
                         .children(sandbox_status)
+                        .when(matches!(mode, ToolbarMode::ActiveThread), |this| {
+                            this.child(
+                                IconButton::new("thread-changes", IconName::Diff)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(|_, cx| {
+                                        Tooltip::for_action(
+                                            "Changes",
+                                            &zed_actions::agent::OpenThreadChanges,
+                                            cx,
+                                        )
+                                    })
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(
+                                            zed_actions::agent::OpenThreadChanges.boxed_clone(),
+                                            cx,
+                                        );
+                                    }),
+                            )
+                        })
                         .when(can_create_entries, |this| this.child(new_thread_menu))
                         .child(full_screen_button)
                         .child(self.render_panel_options_menu(window, cx)),

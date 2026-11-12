@@ -2415,10 +2415,14 @@ impl ThreadView {
 
         let side = crate::agent_sidebar_side(cx);
 
+        let snapshot_project = self.project.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
             let Some((contents, tracked_buffers)) = contents_task.await? else {
                 return Ok(());
             };
+            // Before the agent can edit anything, so the Changes view can show
+            // what this turn changed.
+            record_last_turn_snapshot(&snapshot_project, cx).await;
 
             let uses_reported_activity =
                 thread.read_with(cx, |thread, _| thread.uses_reported_activity())?;
@@ -7405,6 +7409,40 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
             .iter()
             .map(|domain| SandboxRow::domain(domain.clone()))
             .collect(),
+    }
+}
+
+/// Captures the working tree of the project's active repository as a detached
+/// commit (staged, unstaged and untracked files) and records it as the start
+/// of the latest turn. Failures only cost the "Last Turn" comparison.
+async fn record_last_turn_snapshot(
+    project: &WeakEntity<Project>,
+    cx: &mut gpui::AsyncWindowContext,
+) {
+    let snapshot = project.update(cx, |project, cx| {
+        let repository = project.active_repository(cx)?;
+        let repo_id = repository.read(cx).id;
+        let checkpoint =
+            repository.update(cx, |repository, _| repository.create_archive_checkpoint());
+        Some((repo_id, checkpoint))
+    });
+    let Ok(Some((repo_id, checkpoint))) = snapshot else {
+        return;
+    };
+    match checkpoint.await {
+        Ok(Ok((_staged, full))) => {
+            project
+                .update(cx, |project, cx| {
+                    project.git_store().update(cx, |git_store, _| {
+                        git_store.set_last_turn_snapshot(repo_id, full.into())
+                    })
+                })
+                .log_err();
+        }
+        Ok(Err(error)) => {
+            log::warn!("could not snapshot the working tree for this turn: {error:#}")
+        }
+        Err(_) => log::warn!("snapshotting the working tree for this turn was cancelled"),
     }
 }
 

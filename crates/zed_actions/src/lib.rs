@@ -602,6 +602,10 @@ pub mod agent {
             ResetAgentZoom,
             /// Pastes clipboard content without any formatting.
             PasteRaw,
+            /// Opens the Changes view of the active project: what the agent
+            /// thread changed, against the branch base, the last commit or
+            /// the start of the last turn.
+            OpenThreadChanges,
         ]
     );
 

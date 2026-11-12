@@ -108,6 +108,9 @@ pub struct GitStore {
     parked_repositories: Vec<ParkedRepository>,
     diff_base: GitDiffBaseSetting,
     display_diffs: HashMap<RepositoryId, DisplayDiff>,
+    /// The working tree when the latest agent turn started in each repository,
+    /// as a detached commit: the base of the "Last Turn" comparison.
+    last_turn_snapshots: HashMap<RepositoryId, SharedString>,
     worktree_ids: HashMap<RepositoryId, HashSet<WorktreeId>>,
     active_repo_id: Option<RepositoryId>,
     #[allow(clippy::type_complexity)]
@@ -1042,6 +1045,7 @@ impl GitStore {
             parked_repositories: Vec::new(),
             diff_base: diff_base_setting,
             display_diffs: HashMap::default(),
+            last_turn_snapshots: HashMap::default(),
             worktree_ids: HashMap::default(),
             active_repo_id: None,
             _subscriptions,
@@ -4663,7 +4667,11 @@ impl GitStore {
         mut cx: AsyncApp,
     ) -> Result<proto::GetTreeDiffResponse> {
         let repository_id = RepositoryId(request.payload.repository_id);
-        let diff_type = if request.payload.includes_worktree {
+        let diff_type = if request.payload.includes_worktree && !request.payload.is_merge {
+            DiffTreeType::SinceWithWorktree {
+                base: request.payload.base.into(),
+            }
+        } else if request.payload.includes_worktree {
             DiffTreeType::MergeBaseWithWorktree {
                 base: request.payload.base.into(),
             }
@@ -5031,6 +5039,16 @@ impl GitStore {
         repo.read(cx)
             .status_for_path(repo_path)
             .map(|entry| entry.status)
+    }
+
+    /// Records the commit capturing the working tree at the start of an agent
+    /// turn in `repo_id`.
+    pub fn set_last_turn_snapshot(&mut self, repo_id: RepositoryId, commit: SharedString) {
+        self.last_turn_snapshots.insert(repo_id, commit);
+    }
+
+    pub fn last_turn_snapshot(&self, repo_id: RepositoryId) -> Option<SharedString> {
+        self.last_turn_snapshots.get(&repo_id).cloned()
     }
 
     pub fn display_diff_for_repo(
@@ -9797,6 +9815,12 @@ impl Repository {
                             (true, true, base, "HEAD".into())
                         }
                         DiffTreeType::Since { base, head } => (false, false, base, head),
+                        // Older servers read this as `MergeBaseWithWorktree`:
+                        // changes since the merge base with the snapshot,
+                        // i.e. uncommitted changes.
+                        DiffTreeType::SinceWithWorktree { base } => {
+                            (false, true, base, "HEAD".into())
+                        }
                     };
                     let response = client
                         .request(proto::GetTreeDiff {

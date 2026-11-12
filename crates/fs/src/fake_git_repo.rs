@@ -329,20 +329,23 @@ impl GitRepository for FakeGitRepository {
     }
 
     fn diff_tree(&self, request: DiffTreeType) -> BoxFuture<'_, Result<TreeDiff>> {
-        let worktree_contents =
-            matches!(request, DiffTreeType::MergeBaseWithWorktree { .. }).then(|| {
-                let workdir_path = self.dot_git_path.parent().unwrap();
-                self.fs
-                    .files()
-                    .iter()
-                    .filter_map(|path| {
-                        let path_in_repo = path.strip_prefix(workdir_path).ok()?;
-                        let path_in_repo = RelPath::new(path_in_repo, PathStyle::local()).ok()?;
-                        let content = self.fs.read_file_sync(path).ok()?;
-                        Some((RepoPath::from_rel_path(&path_in_repo), content))
-                    })
-                    .collect::<HashMap<_, _>>()
-            });
+        let worktree_contents = matches!(
+            request,
+            DiffTreeType::MergeBaseWithWorktree { .. } | DiffTreeType::SinceWithWorktree { .. }
+        )
+        .then(|| {
+            let workdir_path = self.dot_git_path.parent().unwrap();
+            self.fs
+                .files()
+                .iter()
+                .filter_map(|path| {
+                    let path_in_repo = path.strip_prefix(workdir_path).ok()?;
+                    let path_in_repo = RelPath::new(path_in_repo, PathStyle::local()).ok()?;
+                    let content = self.fs.read_file_sync(path).ok()?;
+                    Some((RepoPath::from_rel_path(&path_in_repo), content))
+                })
+                .collect::<HashMap<_, _>>()
+        });
         self.with_state_async(false, move |state| {
             let contents = worktree_contents.as_ref().unwrap_or(&state.head_contents);
             let tracked_paths = state

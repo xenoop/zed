@@ -635,6 +635,8 @@
     "context": "Workspace",
     "bindings": {
       "alt-/": "which_key::ShowPendingBindings",
+      // The active project's Changes view (thread changes), as in Delta.
+      "alt-shift-d": "agent::OpenThreadChanges",
       // Move focus between the major regions of the window (editor, open
       // panels, status bar). Accessibility navigation; mirrors VS Code's
       // "Focus Next/Previous Part". `ctrl-f6` mirrors `f6` so region navigation
