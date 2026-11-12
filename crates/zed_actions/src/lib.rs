@@ -606,6 +606,10 @@ pub mod agent {
             /// thread changed, against the branch base, the last commit or
             /// the start of the last turn.
             OpenThreadChanges,
+            /// Starts a comment on the text selected in the agent's
+            /// messages: quotes the passage in the message editor, ready for
+            /// what you want to say about it.
+            CommentOnTranscriptSelection,
         ]
     );
 

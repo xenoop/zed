@@ -9174,12 +9174,24 @@ impl ThreadView {
                             })
                             .separator()
                         })
-                        .when_some(selected_text, |menu, selected_text| {
+                        .when_some(selected_text.clone(), |menu, selected_text| {
                             menu.entry("Copy", Some(Box::new(markdown::Copy)), move |_, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(
                                     selected_text.to_string(),
                                 ));
                             })
+                        })
+                        .when_some(selected_text, |menu, selected_text| {
+                            let entity = entity.clone();
+                            menu.entry(
+                                "Comment on Selection",
+                                Some(Box::new(zed_actions::agent::CommentOnTranscriptSelection)),
+                                move |window, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.comment_on_passage(&selected_text, window, cx);
+                                    });
+                                },
+                            )
                         })
                         .when_some(selected_markdown, |menu, selected_markdown| {
                             menu.entry(
@@ -9199,6 +9211,49 @@ impl ThreadView {
                 })
             })
             .into_any_element()
+    }
+
+    /// The text selected in one of the agent's messages, as markdown source.
+    fn selected_transcript_passage(&self, cx: &App) -> Option<String> {
+        self.thread.read(cx).entries().iter().find_map(|entry| {
+            let AgentThreadEntry::AssistantMessage(message) = entry else {
+                return None;
+            };
+            message.chunks.iter().find_map(|chunk| {
+                let (AssistantMessageChunk::Message { block, .. }
+                | AssistantMessageChunk::Thought { block, .. }) = chunk;
+                block.markdowns().find_map(|markdown| {
+                    let passage = markdown.read(cx).selected_source()?;
+                    (!passage.trim().is_empty()).then(|| passage.to_string())
+                })
+            })
+        })
+    }
+
+    /// Starts a comment on a passage of the transcript: the passage goes into
+    /// the message editor as a quote, with the cursor after it. Sending it is
+    /// an ordinary message, so the answer follows in the thread.
+    pub(crate) fn comment_on_passage(
+        &mut self,
+        passage: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut quote = String::new();
+        for line in passage.trim().lines() {
+            quote.push_str(if line.is_empty() { ">" } else { "> " });
+            quote.push_str(line);
+            quote.push('\n');
+        }
+        quote.push('\n');
+        self.message_editor.update(cx, |message_editor, cx| {
+            let needs_break = !message_editor.is_empty(cx);
+            if needs_break {
+                message_editor.insert_text("\n\n", window, cx);
+            }
+            message_editor.insert_text(&quote, window, cx);
+            message_editor.focus_handle(cx).focus(window, cx);
+        });
     }
 
     fn agent_message_copy_index(
@@ -14186,6 +14241,14 @@ impl Render for ThreadView {
         v_flex()
             .key_context("AcpThread")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(
+                |this, _: &zed_actions::agent::CommentOnTranscriptSelection, window, cx| {
+                    match this.selected_transcript_passage(cx) {
+                        Some(passage) => this.comment_on_passage(&passage, window, cx),
+                        None => cx.propagate(),
+                    }
+                },
+            ))
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
                 if this.parent_session_id.is_none() {
                     this.cancel_generation(cx);

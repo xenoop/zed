@@ -6774,6 +6774,42 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_comment_on_transcript_passage_quotes_it(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+
+        thread_view.update_in(cx, |view, window, cx| {
+            view.comment_on_passage("first line\n\nsecond line\n", window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "> first line\n>\n> second line\n\n"
+        );
+        assert!(message_editor.update_in(cx, |editor, window, cx| {
+            editor.focus_handle(cx).is_focused(window)
+        }));
+
+        // A second passage is added after what is already written.
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.insert_text("Why?", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| {
+            view.comment_on_passage("another", window, cx);
+        });
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "> first line\n>\n> second line\n\nWhy?\n\n> another\n\n"
+        );
+    }
+
+    #[gpui::test]
     async fn test_stale_send_result_preserves_new_prompt(cx: &mut TestAppContext) {
         init_test(cx);
 
