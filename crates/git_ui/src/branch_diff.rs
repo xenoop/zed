@@ -6,6 +6,9 @@ use crate::{
         self, CompareWithBranch, DeployBranchDiff, DiffSinceReviewed, ProjectDiff, ReviewDiff,
         render_send_review_to_agent_button,
     },
+    seen_files::{
+        self, GoToNextChangedFile, GoToPreviousChangedFile, MarkAllFilesSeen, ToggleFileSeen,
+    },
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
@@ -15,10 +18,11 @@ use editor::{
 };
 use git::{repository::DiffType, status::FileStatus};
 use gpui::{
-    Action, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
-    SharedString, Subscription, Task, WeakEntity,
+    Action, AnyElement, App, AppContext as _, ElementId, Entity, EventEmitter, FocusHandle,
+    Focusable, MouseButton, Render, SharedString, Subscription, Task, WeakEntity,
 };
 use language::{BufferId, Capability};
+use multi_buffer::{ExcerptBoundaryInfo, MultiBuffer};
 use project::{
     Project, ProjectPath,
     git_store::{
@@ -31,7 +35,7 @@ use std::{
     any::{Any, TypeId},
     sync::Arc,
 };
-use ui::{ContextMenu, DiffStat, Divider, PopoverMenu, Tooltip, prelude::*};
+use ui::{Checkbox, ContextMenu, DiffStat, Divider, PopoverMenu, Tooltip, prelude::*};
 use workspace::{
     ItemHandle, ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation,
     ToolbarItemView, Workspace,
@@ -56,10 +60,13 @@ pub struct BranchDiff {
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     _diff_event_subscription: Subscription,
+    _seen_subscription: Subscription,
 }
 
 struct BranchDiffAddon {
     branch_diff: Entity<diff_buffer_list::DiffBufferList>,
+    editor: WeakEntity<Editor>,
+    multibuffer: WeakEntity<MultiBuffer>,
 }
 
 impl Addon for BranchDiffAddon {
@@ -71,6 +78,58 @@ impl Addon for BranchDiffAddon {
         self.branch_diff
             .read(cx)
             .status_for_buffer_id(buffer_id, cx)
+    }
+
+    fn render_buffer_header_controls(
+        &self,
+        excerpt_info: &ExcerptBoundaryInfo,
+        _buffer: &language::BufferSnapshot,
+        _window: &Window,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let multibuffer = self.multibuffer.upgrade()?;
+        let buffer_id = excerpt_info.buffer_id();
+        let is_seen = seen_files::is_seen(
+            self.branch_diff.read(cx),
+            multibuffer.read(cx),
+            buffer_id,
+            cx,
+        );
+        let branch_diff = self.branch_diff.clone();
+        let editor = self.editor.clone();
+        let checkbox = Checkbox::new(
+            ElementId::NamedInteger("seen-file".into(), buffer_id.to_proto()),
+            is_seen.into(),
+        )
+        .label("Seen")
+        .label_size(LabelSize::Small)
+        .label_color(Color::Muted)
+        .tooltip(Tooltip::for_action_title(
+            if is_seen {
+                "Mark as Not Seen"
+            } else {
+                "Mark as Seen"
+            },
+            &ToggleFileSeen,
+        ))
+        .on_click(move |_, _, cx| {
+            if let Some(editor) = editor.upgrade() {
+                seen_files::set_seen(&branch_diff, &editor, &[buffer_id], !is_seen, cx);
+            }
+        });
+        Some(
+            h_flex()
+                .id(ElementId::NamedInteger(
+                    "seen-file-slot".into(),
+                    buffer_id.to_proto(),
+                ))
+                .child(checkbox)
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    // Keep the click from reaching the header, which would toggle the fold.
+                    cx.stop_propagation();
+                })
+                .into_any_element(),
+        )
     }
 }
 
@@ -433,10 +492,13 @@ impl BranchDiff {
                 "No changes",
                 move |editor, cx| {
                     editor.set_diff_hunk_renderer(Some(Arc::new(HiddenDiffHunkRenderer)), cx);
-                    editor.rhs_editor().update(cx, move |rhs_editor, _cx| {
+                    editor.rhs_editor().update(cx, move |rhs_editor, cx| {
                         rhs_editor.set_read_only(false);
+                        let multibuffer = rhs_editor.buffer().downgrade();
                         rhs_editor.register_addon(BranchDiffAddon {
                             branch_diff: branch_diff_for_addon,
+                            editor: cx.weak_entity(),
+                            multibuffer,
                         });
                     });
                 },
@@ -458,12 +520,110 @@ impl BranchDiff {
         let diff_event_subscription = cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| {
             cx.emit(event.clone())
         });
+        let multibuffer = diff.read(cx).multibuffer().clone();
+        let seen_subscription = cx.subscribe(
+            &multibuffer,
+            |this, _, event: &multi_buffer::Event, cx| match event {
+                multi_buffer::Event::BuffersEdited { .. }
+                | multi_buffer::Event::BufferDiffChanged
+                | multi_buffer::Event::Reloaded => {
+                    let list = this.diff.read(cx).branch_diff().clone();
+                    seen_files::clear_stale_marks(&list, &this.rhs_editor(cx), cx);
+                    cx.notify();
+                }
+                multi_buffer::Event::BufferRangesUpdated { buffer, .. } => {
+                    // A file that was marked seen earlier (in a closed tab, say)
+                    // starts folded.
+                    let buffer_id = buffer.read(cx).remote_id();
+                    let editor = this.rhs_editor(cx);
+                    let list = this.diff.read(cx).branch_diff().clone();
+                    let is_seen = seen_files::is_seen(
+                        list.read(cx),
+                        editor.read(cx).buffer().read(cx),
+                        buffer_id,
+                        cx,
+                    );
+                    if is_seen && !editor.read(cx).is_buffer_folded(buffer_id, cx) {
+                        editor.update(cx, |editor, cx| editor.fold_buffer(buffer_id, cx));
+                    }
+                }
+                _ => {}
+            },
+        );
         Self {
             diff,
             project,
             workspace: workspace.downgrade(),
             _diff_event_subscription: diff_event_subscription,
+            _seen_subscription: seen_subscription,
         }
+    }
+
+    fn rhs_editor(&self, cx: &App) -> Entity<Editor> {
+        self.diff.read(cx).editor().read(cx).rhs_editor().clone()
+    }
+
+    fn toggle_file_seen(
+        &mut self,
+        _: &ToggleFileSeen,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = self.rhs_editor(cx);
+        let Some(buffer) = editor.read(cx).active_buffer(cx) else {
+            return;
+        };
+        let buffer_id = buffer.read(cx).remote_id();
+        let list = self.diff.read(cx).branch_diff().clone();
+        let is_seen = seen_files::is_seen(
+            list.read(cx),
+            editor.read(cx).buffer().read(cx),
+            buffer_id,
+            cx,
+        );
+        seen_files::set_seen(&list, &editor, &[buffer_id], !is_seen, cx);
+        if !is_seen {
+            self.go_to_adjacent_file(true, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn mark_all_files_seen(
+        &mut self,
+        _: &MarkAllFilesSeen,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = self.rhs_editor(cx);
+        let list = self.diff.read(cx).branch_diff().clone();
+        let buffer_ids = seen_files::ordered_buffer_ids(editor.read(cx).buffer().read(cx), cx);
+        seen_files::set_seen(&list, &editor, &buffer_ids, true, cx);
+        cx.notify();
+    }
+
+    fn go_to_adjacent_file(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.rhs_editor(cx);
+        let Some(buffer_id) = seen_files::adjacent_buffer_id(editor.read(cx), forward, cx) else {
+            return;
+        };
+        let Some(path_key) = editor
+            .read(cx)
+            .buffer()
+            .read(cx)
+            .snapshot(cx)
+            .path_for_buffer(buffer_id)
+            .cloned()
+        else {
+            return;
+        };
+        self.diff
+            .update(cx, |diff, cx| diff.move_to_path(path_key, window, cx));
+    }
+
+    /// How many files are marked seen, out of how many.
+    fn seen_progress(&self, cx: &App) -> (usize, usize) {
+        let diff = self.diff.read(cx);
+        seen_files::progress(diff.branch_diff().read(cx), diff.multibuffer().read(cx), cx)
     }
 
     pub(crate) fn diff_base<'a>(&'a self, cx: &'a App) -> &'a DiffBase {
@@ -746,7 +906,18 @@ impl Render for BranchDiff {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
+            .key_context("ChangesView")
             .on_action(cx.listener(Self::review_diff))
+            .on_action(cx.listener(Self::toggle_file_seen))
+            .on_action(cx.listener(Self::mark_all_files_seen))
+            .on_action(cx.listener(|this, _: &GoToNextChangedFile, window, cx| {
+                this.go_to_adjacent_file(true, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &GoToPreviousChangedFile, window, cx| {
+                    this.go_to_adjacent_file(false, window, cx)
+                }),
+            )
             .child(self.diff.clone())
     }
 }
@@ -814,11 +985,17 @@ impl SerializableItem for BranchDiff {
 
 pub struct BranchDiffToolbar {
     branch_diff: Option<WeakEntity<BranchDiff>>,
+    _branch_diff_observation: Option<Subscription>,
+    _seen_observation: Subscription,
 }
 
 impl BranchDiffToolbar {
-    pub fn new(_cx: &mut Context<Self>) -> Self {
-        Self { branch_diff: None }
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            branch_diff: None,
+            _branch_diff_observation: None,
+            _seen_observation: cx.observe_global::<seen_files::SeenFiles>(|_, cx| cx.notify()),
+        }
     }
 
     fn branch_diff(&self, _: &App) -> Option<Entity<BranchDiff>> {
@@ -845,9 +1022,11 @@ impl ToolbarItemView for BranchDiffToolbar {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> ToolbarItemLocation {
-        self.branch_diff = active_pane_item
-            .and_then(|item| item.act_as::<BranchDiff>(cx))
-            .map(|entity| entity.downgrade());
+        let branch_diff = active_pane_item.and_then(|item| item.act_as::<BranchDiff>(cx));
+        self._branch_diff_observation = branch_diff
+            .as_ref()
+            .map(|branch_diff| cx.observe(branch_diff, |_, _, cx| cx.notify()));
+        self.branch_diff = branch_diff.map(|entity| entity.downgrade());
         if self.branch_diff.is_some() {
             ToolbarItemLocation::PrimaryRight
         } else {
@@ -905,6 +1084,7 @@ impl Render for BranchDiffToolbar {
                         ))
                     },
                 )
+                .children(render_seen_progress(&branch_diff, cx))
                 .child(Divider::vertical().ml_1())
                 .child(compare_menu)
                 .when(review_count > 0, |this| {
@@ -957,6 +1137,7 @@ impl Render for BranchDiffToolbar {
                     deletions as usize,
                 ))
             })
+            .children(render_seen_progress(&branch_diff, cx))
             .child(Divider::vertical().ml_1())
             .child(compare_menu)
             .child(
@@ -1055,6 +1236,23 @@ impl Render for BranchDiffToolbar {
 
 /// The comparison picker of the Changes view: against the branch base, the
 /// last commit, or the working tree when the last agent turn started.
+fn render_seen_progress(branch_diff: &Entity<BranchDiff>, cx: &App) -> Option<AnyElement> {
+    let (seen, total) = branch_diff.read(cx).seen_progress(cx);
+    if total == 0 {
+        return None;
+    }
+    Some(
+        Label::new(format!("Seen {seen}/{total}"))
+            .size(LabelSize::Small)
+            .color(if seen == total {
+                Color::Success
+            } else {
+                Color::Muted
+            })
+            .into_any_element(),
+    )
+}
+
 fn render_compare_menu(
     branch_diff: &Entity<BranchDiff>,
     diff_base: &DiffBase,
@@ -1159,7 +1357,7 @@ mod tests {
     use collections::HashMap;
     use editor::test::editor_test_context::assert_state_with_diff;
     use git::status::{FileStatus, TrackedStatus, UnmergedStatus, UnmergedStatusCode};
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, VisualTestContext};
     use project::FakeFs;
     use serde_json::json;
     use settings::{DiffViewStyle, SettingsStore};
@@ -1586,5 +1784,82 @@ mod tests {
             commits.sort();
             assert_eq!(commits, vec!["HEAD", "turn-sha"]);
         });
+    }
+
+    #[gpui::test]
+    async fn test_seen_marks_fold_files_and_clear_on_edit(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "C",
+                "b.txt": "new",
+                "c.txt": "in-merge-base-and-work-tree",
+                "d.txt": "created-in-head",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx
+            .update(|window, cx| {
+                BranchDiff::new_with_default_branch(project.clone(), workspace, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "B".into()), ("d.txt", "created-in-head".into())],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[
+                ("a.txt", "A".into()),
+                ("c.txt", "in-merge-base-and-work-tree".into()),
+            ],
+        );
+        cx.run_until_parked();
+
+        let (editor, list) = diff.read_with(cx, |diff, cx| {
+            (
+                diff.rhs_editor(cx),
+                diff.diff.read(cx).branch_diff().clone(),
+            )
+        });
+        let progress =
+            |cx: &mut VisualTestContext| diff.read_with(cx, |diff, cx| diff.seen_progress(cx));
+        assert_eq!(progress(cx), (0, 3));
+
+        let first = editor.read_with(cx, |editor, cx| {
+            seen_files::ordered_buffer_ids(editor.buffer().read(cx), cx)
+                .first()
+                .copied()
+                .unwrap()
+        });
+        cx.update(|_, cx| seen_files::set_seen(&list, &editor, &[first], true, cx));
+        cx.run_until_parked();
+        assert_eq!(progress(cx), (1, 3));
+        assert!(editor.read_with(cx, |editor, cx| editor.is_buffer_folded(first, cx)));
+
+        let buffer = editor.read_with(cx, |editor, cx| {
+            editor.buffer().read(cx).buffer(first).unwrap()
+        });
+        buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "edited ")], None, cx));
+        cx.run_until_parked();
+        assert_eq!(progress(cx), (0, 3));
+        assert!(!editor.read_with(cx, |editor, cx| editor.is_buffer_folded(first, cx)));
+
+        diff.update_in(cx, |diff, window, cx| {
+            diff.mark_all_files_seen(&MarkAllFilesSeen, window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(progress(cx), (3, 3));
     }
 }

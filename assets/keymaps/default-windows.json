@@ -1749,4 +1749,13 @@
       "escape": "tabular_data::ClearSelection",
     },
   },
+  {
+    "context": "ChangesView > Editor",
+    "bindings": {
+      "ctrl-alt-y": "git::ToggleFileSeen",
+      "ctrl-shift-y": "git::MarkAllFilesSeen",
+      "alt-]": "git::GoToNextChangedFile",
+      "alt-[": "git::GoToPreviousChangedFile",
+    },
+  },
 ]
