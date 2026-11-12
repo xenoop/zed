@@ -1184,6 +1184,7 @@ pub struct Editor {
     /// Counter for generating unique comment IDs.
     next_review_comment_id: usize,
     comment_mode: bool,
+    review_comments_hidden: bool,
     hovered_diff_hunk_row: Option<DisplayRow>,
     lsp_data_tasks: HashMap<BufferId, HashMap<LspDataKind, Shared<Task<()>>>>,
     offscreen_lsp_data_tasks: HashMap<LspDataKind, (BufferId, Task<()>)>,
@@ -2556,6 +2557,7 @@ impl Editor {
             stored_review_comments: Vec::new(),
             next_review_comment_id: 0,
             comment_mode: false,
+            review_comments_hidden: false,
             hovered_diff_hunk_row: None,
             _subscriptions: (!is_minimap)
                 .then(|| {

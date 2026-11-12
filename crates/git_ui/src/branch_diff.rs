@@ -15,7 +15,7 @@ use anyhow::{Context as _, Result, anyhow};
 use db::kvp::KeyValueStore;
 use editor::{
     Addon, Editor, EditorEvent, HiddenDiffHunkRenderer, SavedReviewComment, SplittableEditor,
-    actions::{SendReviewToAgent, ToggleCommentMode},
+    actions::{SendReviewToAgent, ToggleCommentMode, ToggleReviewCommentsHidden},
 };
 use git::{repository::DiffType, status::FileStatus};
 use gpui::{
@@ -990,6 +990,7 @@ impl Render for BranchDiff {
             .on_action(cx.listener(Self::review_diff))
             // The editor toggles the mode; this only redraws the toolbar's toggle.
             .capture_action(cx.listener(|_, _: &ToggleCommentMode, _, cx| cx.notify()))
+            .capture_action(cx.listener(|_, _: &ToggleReviewCommentsHidden, _, cx| cx.notify()))
             .on_action(cx.listener(Self::toggle_file_seen))
             .on_action(cx.listener(Self::mark_all_files_seen))
             .on_action(cx.listener(|this, _: &GoToNextChangedFile, window, cx| {
@@ -1170,6 +1171,7 @@ impl Render for BranchDiffToolbar {
                 .child(Divider::vertical().ml_1())
                 .child(compare_menu)
                 .child(render_comment_mode_toggle(&branch_diff, cx))
+                .child(render_comments_hidden_toggle(&branch_diff, cx))
                 .when(review_count > 0, |this| {
                     this.child(Divider::vertical()).child(
                         render_send_review_to_agent_button(review_count, &focus_handle).on_click(
@@ -1224,6 +1226,7 @@ impl Render for BranchDiffToolbar {
             .child(Divider::vertical().ml_1())
             .child(compare_menu)
             .child(render_comment_mode_toggle(&branch_diff, cx))
+            .child(render_comments_hidden_toggle(&branch_diff, cx))
             .child(
                 PopoverMenu::new("branch-diff-base-branch-picker")
                     .menu(move |window, cx| {
@@ -1340,6 +1343,34 @@ fn render_comment_mode_toggle(branch_diff: &Entity<BranchDiff>, cx: &App) -> imp
                 editor.set_comment_mode(!comment_mode, cx);
             });
         })
+}
+
+fn render_comments_hidden_toggle(branch_diff: &Entity<BranchDiff>, cx: &App) -> impl IntoElement {
+    let editor = branch_diff.read(cx).rhs_editor(cx);
+    let hidden = editor.read(cx).review_comments_hidden();
+    IconButton::new(
+        "comments-hidden",
+        if hidden {
+            IconName::EyeOff
+        } else {
+            IconName::Eye
+        },
+    )
+    .icon_size(IconSize::Small)
+    .tooltip(Tooltip::for_action_title(
+        if hidden {
+            "Show Comments"
+        } else {
+            "Hide Comments"
+        },
+        &ToggleReviewCommentsHidden,
+    ))
+    .on_click(move |_, window, cx| {
+        editor.update(cx, |editor, cx| {
+            let hidden = editor.review_comments_hidden();
+            editor.set_review_comments_hidden(!hidden, window, cx);
+        });
+    })
 }
 
 fn render_seen_progress(branch_diff: &Entity<BranchDiff>, cx: &App) -> Option<AnyElement> {
@@ -2429,6 +2460,34 @@ mod tests {
         assert_eq!(saved[0].comment, "why?");
         assert_eq!(saved[0].answer.as_deref(), Some("Because."));
         assert!(!saved[0].outdated);
+
+        // Hiding comments closes the boxes but keeps the comments, with a
+        // marker on the commented lines; showing brings the boxes back.
+        let toggle_hidden = if cfg!(target_os = "macos") {
+            "cmd-shift-m"
+        } else {
+            "ctrl-shift-m"
+        };
+        let box_count_and_markers = |cx: &mut VisualTestContext| {
+            editor.read_with(cx, |editor, cx| {
+                (
+                    editor.diff_review_prompt_editor().is_some(),
+                    editor.total_review_comment_count(),
+                    editor.review_comments_hidden(),
+                    editor.hidden_review_comment_marker_count(cx),
+                )
+            })
+        };
+        assert_eq!(box_count_and_markers(cx), (true, 1, false, 0));
+        cx.simulate_keystrokes(toggle_hidden);
+        cx.run_until_parked();
+        assert_eq!(box_count_and_markers(cx), (false, 1, true, 1));
+        editor.update_in(cx, |editor, window, cx| {
+            editor.focus_handle(cx).focus(window, cx);
+        });
+        cx.simulate_keystrokes(toggle_hidden);
+        cx.run_until_parked();
+        assert_eq!(box_count_and_markers(cx), (true, 1, false, 0));
 
         // A new view, as after a restart, shows the comment with its answer.
         let reopen = |cx: &mut VisualTestContext| {

@@ -184,6 +184,9 @@ pub(super) struct StoredReviewComment {
     pub(super) outdated: bool,
 }
 
+/// Marks the rows of commented code while the review boxes are hidden.
+enum HiddenReviewComments {}
+
 /// A review comment as saved between sessions.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SavedReviewComment {
@@ -728,6 +731,72 @@ impl Editor {
         self.start_review_comment(None, window, cx);
     }
 
+    pub(super) fn toggle_review_comments_hidden(
+        &mut self,
+        _: &ToggleReviewCommentsHidden,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.show_diff_review_button {
+            cx.propagate();
+            return;
+        }
+        self.set_review_comments_hidden(!self.review_comments_hidden, window, cx);
+    }
+
+    pub fn review_comments_hidden(&self) -> bool {
+        self.review_comments_hidden
+    }
+
+    /// How many commented ranges carry a marker while the boxes are hidden.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hidden_review_comment_marker_count(&self, cx: &App) -> usize {
+        self.highlighted_rows::<HiddenReviewComments>(cx).count()
+    }
+
+    /// Hides the review boxes, leaving a highlight on each commented range
+    /// as a marker, or opens a box for every range with comments again.
+    pub fn set_review_comments_hidden(
+        &mut self,
+        hidden: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.review_comments_hidden = hidden;
+        self.clear_row_highlights::<HiddenReviewComments>();
+        let ranges: Vec<Range<Anchor>> = self
+            .stored_review_comments
+            .iter()
+            .flat_map(|(_, comments)| comments.iter().map(|comment| comment.range.clone()))
+            .collect();
+        if hidden {
+            self.dismiss_all_diff_review_overlays(cx);
+            for range in ranges {
+                self.highlight_rows::<HiddenReviewComments>(
+                    range,
+                    |cx| {
+                        cx.theme()
+                            .colors()
+                            .editor_document_highlight_read_background
+                    },
+                    RowHighlightOptions::default(),
+                    cx,
+                );
+            }
+        } else {
+            for range in ranges {
+                let snapshot = self.snapshot(window, cx);
+                let rows = range
+                    .start
+                    .to_display_point(&snapshot.display_snapshot)
+                    .row()
+                    ..range.end.to_display_point(&snapshot.display_snapshot).row();
+                self.open_diff_review_overlay(rows, false, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
     /// Opens a review comment on the lines of the newest selection, with
     /// `text` (what the user typed in comment mode) already in it.
     pub fn start_review_comment(
@@ -738,6 +807,9 @@ impl Editor {
     ) {
         if !self.show_diff_review_button {
             return;
+        }
+        if self.review_comments_hidden {
+            self.set_review_comments_hidden(false, window, cx);
         }
         let snapshot = self.snapshot(window, cx);
         let selection = self.selections.newest::<Point>(&snapshot.display_snapshot);

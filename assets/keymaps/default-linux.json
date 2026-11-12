@@ -1743,6 +1743,7 @@
       "alt-[": "git::GoToPreviousChangedFile",
       "ctrl-alt-m": "editor::CommentOnSelection",
       "ctrl-alt-c": "editor::ToggleCommentMode",
+      "ctrl-shift-m": "editor::ToggleReviewCommentsHidden",
     },
   },
   {

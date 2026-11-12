@@ -941,6 +941,9 @@ actions!(
         SendDiffReviewCommentNow,
         /// Starts a review comment on the selected lines.
         CommentOnSelection,
+        /// Hides the review comment boxes, leaving a marker on commented lines,
+        /// or shows them again.
+        ToggleReviewCommentsHidden,
         /// Toggles comment mode, where typing on code starts a review comment
         /// instead of editing the file.
         ToggleCommentMode,
