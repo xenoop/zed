@@ -30,6 +30,7 @@ mod terminal_inline_assistant;
 pub mod terminal_thread_metadata_store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+mod thread_fork;
 mod thread_import;
 pub mod thread_metadata_store;
 pub mod thread_worktree_archive;
