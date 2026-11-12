@@ -217,6 +217,9 @@
   {
     "context": "AgentPanel",
     "bindings": {
+      "alt-shift-f": "agent::ForkThread",
+      "alt-shift-m": "agent::MergeIntoParent",
+      "alt-shift-p": "agent::PullFromFork",
       "ctrl-n": "agent::NewThread",
       "ctrl-alt-c": "agent::OpenSettings",
       "shift-alt-i": "agent::ToggleOptionsMenu",

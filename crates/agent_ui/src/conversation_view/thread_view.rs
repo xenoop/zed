@@ -2233,6 +2233,11 @@ impl ThreadView {
 
         let text = message_editor.read(cx).text(cx);
         let text = text.trim();
+        if let Some(action) = crate::thread_fork::slash_command_action(text) {
+            message_editor.update(cx, |editor, cx| editor.clear(window, cx));
+            window.dispatch_action(action, cx);
+            return;
+        }
         if text == "/login" || text == "/logout" {
             let connection = thread.read(cx).connection().clone();
             let can_login = connection
@@ -7450,6 +7455,19 @@ async fn record_last_turn_snapshot(
 /// review comments), or `None` for any other message.
 fn editor_question_summary(text: &str) -> Option<SharedString> {
     use super::{INLINE_QUESTION_PREFIX, INLINE_QUESTION_SUFFIX, REVIEW_QUESTION_PREFIX};
+    if let Some(rest) = text.strip_prefix(crate::thread_fork::FORK_CONTEXT_PREFIX) {
+        let title = rest
+            .trim_start()
+            .strip_prefix('"')
+            .and_then(|rest| rest.split_once("\". "))
+            .map(|(title, _)| title);
+        return Some(match title {
+            Some(title) => {
+                format!("Forked from \"{title}\", with its conversation as context").into()
+            }
+            None => "Forked, with the earlier conversation as context".into(),
+        });
+    }
     if text.starts_with(REVIEW_QUESTION_PREFIX) {
         let count = text
             .lines()

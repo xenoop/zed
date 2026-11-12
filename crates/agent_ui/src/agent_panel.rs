@@ -97,6 +97,7 @@ use ui::{
     PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*, utils::WithRemSize,
 };
 use util::ResultExt as _;
+use workspace::notifications::NotifyTaskExt as _;
 use workspace::{
     CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, PathList, SerializedPathList,
     ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
@@ -528,6 +529,37 @@ pub fn init(cx: &mut App) {
                         });
                     }
                 })
+                .register_action(
+                    |workspace, _: &zed_actions::agent::ForkThread, window, cx| {
+                        let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                            return;
+                        };
+                        let task = panel.update(cx, |panel, cx| {
+                            panel.fork_active_thread(crate::thread_fork::ForkKind::Fork, window, cx)
+                        });
+                        task.detach_and_notify_err(cx.weak_entity(), window, cx);
+                    },
+                )
+                .register_action(
+                    |workspace, _: &zed_actions::agent::MergeIntoParent, window, cx| {
+                        let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                            return;
+                        };
+                        let task =
+                            panel.update(cx, |panel, cx| panel.merge_into_parent(window, cx));
+                        task.detach_and_notify_err(cx.weak_entity(), window, cx);
+                    },
+                )
+                .register_action(
+                    |workspace, _: &zed_actions::agent::PullFromFork, window, cx| {
+                        let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                            return;
+                        };
+                        let task =
+                            panel.update(cx, |panel, cx| panel.pull_from_only_fork(window, cx));
+                        task.detach_and_notify_err(cx.weak_entity(), window, cx);
+                    },
+                )
                 .register_action(|workspace, action: &ReviewBranchDiff, window, cx| {
                     let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
                         return;
@@ -3279,6 +3311,266 @@ impl AgentPanel {
     /// switching the active view to it. Used by the `create_thread` agent tool,
     /// which passes an initial prompt, and optionally an agent and model
     /// override.
+    /// The directory of the active repository's working tree.
+    fn working_tree_path(&self, cx: &App) -> Option<String> {
+        let repository = self.project.read(cx).active_repository(cx)?;
+        Some(
+            repository
+                .read(cx)
+                .work_directory_abs_path
+                .to_string_lossy()
+                .to_string(),
+        )
+    }
+
+    /// Forks the active thread into a new git worktree: a copy of the
+    /// working tree as it is now (uncommitted and untracked files included),
+    /// opened as its own workspace, with a thread that receives this
+    /// thread's conversation as context.
+    pub(crate) fn fork_active_thread(
+        &mut self,
+        kind: crate::thread_fork::ForkKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        use crate::thread_fork::{self, ForkRecord};
+
+        let Some(parent_path) = self.working_tree_path(cx) else {
+            return Task::ready(Err(anyhow!("Forking a thread needs a git repository")));
+        };
+        let project = self.project.clone();
+        let thread = self.active_agent_thread(cx);
+        let parent_title = thread
+            .as_ref()
+            .and_then(|thread| thread.read(cx).title())
+            .map(|title| title.to_string());
+        let transcript = thread
+            .as_ref()
+            .map(|thread| thread.read(cx).to_markdown(cx))
+            .unwrap_or_default();
+        let agent = self.selected_agent.clone();
+        let workspace = self.workspace.clone();
+        let multi_workspace = window.window_handle().downcast::<MultiWorkspace>();
+
+        cx.spawn_in(window, async move |_, cx| {
+            thread_fork::ensure_room_for_fork(&project, &parent_path, cx).await?;
+            let base_sha = thread_fork::snapshot(&project, &parent_path, cx).await?;
+
+            let action = zed_actions::CreateWorktree {
+                worktree_name: None,
+                branch_target: zed_actions::NewWorktreeBranchTarget::ExistingBranch {
+                    name: base_sha.clone(),
+                },
+            };
+            let created = workspace
+                .update_in(cx, |workspace, window, cx| {
+                    git_ui_core::worktree_service::create_worktree_workspace(
+                        workspace, &action, window, None, cx,
+                    )
+                })?
+                .await
+                .context("could not create the fork's worktree")?;
+            let fork_workspace = created.workspace;
+            let fork_path = fork_workspace
+                .read_with(cx, |workspace, cx| {
+                    workspace
+                        .project()
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .next()
+                        .map(|worktree| worktree.read(cx).abs_path().to_string_lossy().to_string())
+                })
+                .context("the fork's workspace has no folder")?;
+            let record = ForkRecord {
+                fork_path,
+                parent_path,
+                base_sha,
+                merged_sha: None,
+                kind: kind.clone(),
+                parent_title: parent_title.clone(),
+                verdict: None,
+            };
+            cx.update(|_, cx| thread_fork::upsert_record(record, cx))?;
+
+            let panel = fork_workspace
+                .read_with(cx, |workspace, cx| workspace.panel::<AgentPanel>(cx))
+                .context("the fork's workspace has no agent panel")?;
+            let title = thread_fork::fork_thread_title(&kind, parent_title.as_deref());
+            let message = thread_fork::first_message(&kind, parent_title.as_deref(), &transcript);
+            let options = CreateThreadOptions {
+                title: Some(title.into()),
+                initial_content: Some(AgentInitialContent::ContentBlock {
+                    blocks: vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                        message,
+                    ))],
+                    auto_submit: true,
+                }),
+                agent: Some(agent),
+                model: None,
+                work_dirs: None,
+            };
+            panel.update_in(cx, |panel, window, cx| {
+                let thread_id = panel.create_thread_with_options(
+                    options,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                );
+                panel.activate_retained_thread(thread_id, true, window, cx);
+            })?;
+            if let Some(multi_workspace) = multi_workspace {
+                multi_workspace.update(cx, |multi_workspace, window, cx| {
+                    multi_workspace.activate(fork_workspace.clone(), None, window, cx);
+                })?;
+            }
+            Ok(())
+        })
+    }
+
+    /// In a fork's workspace: merges the fork's changes into the working
+    /// tree it was forked from.
+    pub(crate) fn merge_into_parent(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let record = self
+            .working_tree_path(cx)
+            .and_then(|path| crate::thread_fork::record_for_fork(&path, cx));
+        let Some(record) = record else {
+            return Task::ready(Err(anyhow!(
+                "This working tree is not a fork of another thread's"
+            )));
+        };
+        self.merge_fork(record, window, cx)
+    }
+
+    /// In a parent's workspace: merges the changes of its fork, when it has
+    /// exactly one.
+    pub(crate) fn pull_from_only_fork(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let mut records = self
+            .working_tree_path(cx)
+            .map(|path| crate::thread_fork::records_for_parent(&path, cx))
+            .unwrap_or_default();
+        match (records.pop(), records.is_empty()) {
+            (Some(record), true) => self.merge_fork(record, window, cx),
+            (Some(_), false) => Task::ready(Err(anyhow!(
+                "This working tree has several forks: pick one from the Forks menu"
+            ))),
+            (None, _) => Task::ready(Err(anyhow!("This working tree has no forks"))),
+        }
+    }
+
+    /// Merges a fork into its parent and reports what happened in a toast.
+    pub(crate) fn merge_fork(
+        &mut self,
+        record: crate::thread_fork::ForkRecord,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let project = self.project.clone();
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let name = record.display_name();
+            let (_, outcome) = crate::thread_fork::merge_into_parent(&project, record, cx).await?;
+            let message = crate::thread_fork::merge_summary(&name, &outcome);
+            workspace.update(cx, |workspace, cx| {
+                struct ForkMergedToast;
+                workspace.show_toast(
+                    workspace::Toast::new(
+                        workspace::notifications::NotificationId::unique::<ForkMergedToast>(),
+                        message,
+                    ),
+                    cx,
+                );
+            })?;
+            Ok(())
+        })
+    }
+
+    /// Removes a merged fork's worktree; one with unmerged changes is kept.
+    pub(crate) fn remove_fork(
+        &mut self,
+        record: crate::thread_fork::ForkRecord,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let project = self.project.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            crate::thread_fork::remove_fork(&project, &record, cx).await
+        })
+    }
+
+    fn render_forks_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel = cx.weak_entity();
+        let workspace = self.workspace.clone();
+        let working_tree_path = self.working_tree_path(cx);
+        PopoverMenu::new("thread-forks-menu")
+            .trigger_with_tooltip(
+                IconButton::new("thread-forks", IconName::GitBranch).icon_size(IconSize::Small),
+                Tooltip::text("Forks"),
+            )
+            .anchor(Anchor::TopRight)
+            .menu(move |window, cx| {
+                let panel = panel.clone();
+                let workspace = workspace.clone();
+                let own_record = working_tree_path
+                    .as_ref()
+                    .and_then(|path| crate::thread_fork::record_for_fork(path, cx));
+                let forks = working_tree_path
+                    .as_ref()
+                    .map(|path| crate::thread_fork::records_for_parent(path, cx))
+                    .unwrap_or_default();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    menu = menu.action("Fork Thread", Box::new(zed_actions::agent::ForkThread));
+                    if own_record.is_some() {
+                        menu = menu.action(
+                            "Merge into Parent",
+                            Box::new(zed_actions::agent::MergeIntoParent),
+                        );
+                    }
+                    if !forks.is_empty() {
+                        menu = menu.separator().header("Forks of This Working Tree");
+                    }
+                    for record in forks {
+                        let name = record.display_name();
+                        menu = menu.entry(format!("Pull Changes from {name}"), None, {
+                            let panel = panel.clone();
+                            let workspace = workspace.clone();
+                            let record = record.clone();
+                            move |window, cx| {
+                                if let Some(panel) = panel.upgrade() {
+                                    panel
+                                        .update(cx, |panel, cx| {
+                                            panel.merge_fork(record.clone(), window, cx)
+                                        })
+                                        .detach_and_notify_err(workspace.clone(), window, cx);
+                                }
+                            }
+                        });
+                        menu = menu.entry(format!("Remove {name} (if merged)"), None, {
+                            let panel = panel.clone();
+                            let workspace = workspace.clone();
+                            move |window, cx| {
+                                if let Some(panel) = panel.upgrade() {
+                                    panel
+                                        .update(cx, |panel, cx| {
+                                            panel.remove_fork(record.clone(), window, cx)
+                                        })
+                                        .detach_and_notify_err(workspace.clone(), window, cx);
+                                }
+                            }
+                        });
+                    }
+                    menu
+                }))
+            })
+    }
+
     pub fn create_thread_with_options(
         &mut self,
         options: CreateThreadOptions,
@@ -6354,6 +6646,9 @@ impl AgentPanel {
                                         );
                                     }),
                             )
+                        })
+                        .when(matches!(mode, ToolbarMode::ActiveThread), |this| {
+                            this.child(self.render_forks_menu(cx))
                         })
                         .when(can_create_entries, |this| this.child(new_thread_menu))
                         .child(full_screen_button)
@@ -15066,5 +15361,137 @@ mod tests {
                 "selected_agent should be restored to the original after an agent override"
             );
         });
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn run_git(directory: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(directory)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A panel over a real directory, once its git repository is known.
+    #[allow(clippy::disallowed_methods)]
+    async fn setup_panel_in_real_directory(
+        directory: &Path,
+        cx: &mut TestAppContext,
+    ) -> (Entity<AgentPanel>, VisualTestContext) {
+        let fs = fs::RealFs::new(None, cx.executor());
+        let project = Project::test(fs, [directory], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+            cx.new(|cx| AgentPanel::new(workspace, window, cx))
+        });
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if panel.read_with(&cx, |panel, cx| panel.working_tree_path(cx).is_some()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        (panel, cx)
+    }
+
+    #[gpui::test]
+    async fn test_fork_thread_then_merge_and_pull(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            cx.set_global(db::AppDatabase::test_new());
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            <dyn fs::Fs>::set_global(fs::RealFs::new(None, cx.background_executor().clone()), cx);
+        });
+        cx.executor().allow_parking();
+
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap().join("repo");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(parent.join("a.txt"), "one\n").unwrap();
+        run_git(&parent, &["init", "-b", "main"]);
+        run_git(&parent, &["add", "."]);
+        run_git(&parent, &["commit", "-m", "initial"]);
+        // Uncommitted work that the fork must start with.
+        std::fs::write(parent.join("a.txt"), "one\nuncommitted\n").unwrap();
+        let parent_path = parent.to_string_lossy().to_string();
+
+        let (panel, mut cx) = setup_panel_in_real_directory(&parent, cx).await;
+        let _stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        panel.update(&mut cx, |panel, _| panel.selected_agent = Agent::Stub);
+
+        let fork = panel.update_in(&mut cx, |panel, window, cx| {
+            panel.fork_active_thread(crate::thread_fork::ForkKind::Fork, window, cx)
+        });
+        // The test window has no panel registry, so the new workspace gets no
+        // agent panel: everything up to starting the fork's thread runs.
+        if let Err(error) = fork.await {
+            assert!(
+                error.to_string().contains("no agent panel"),
+                "unexpected fork failure: {error:#}"
+            );
+        }
+        cx.run_until_parked();
+
+        let records = cx.update(|_, cx| crate::thread_fork::records_for_parent(&parent_path, cx));
+        assert_eq!(records.len(), 1, "{records:?}");
+        let record = records[0].clone();
+        let fork_directory = PathBuf::from(&record.fork_path);
+        assert_ne!(fork_directory, parent);
+        assert_eq!(
+            std::fs::read_to_string(fork_directory.join("a.txt")).unwrap(),
+            "one\nuncommitted\n"
+        );
+        assert!(run_git(&parent, &["worktree", "list"]).contains(&record.fork_path));
+
+        // In the fork's workspace, Merge into Parent brings its work back.
+        std::fs::write(fork_directory.join("b.txt"), "from the fork\n").unwrap();
+        let (fork_panel, mut fork_cx) =
+            setup_panel_in_real_directory(&fork_directory, &mut cx).await;
+        fork_panel
+            .update_in(&mut fork_cx, |panel, window, cx| {
+                panel.merge_into_parent(window, cx)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(parent.join("b.txt")).unwrap(),
+            "from the fork\n"
+        );
+
+        // In the parent's workspace, Pull from Fork does the same later.
+        std::fs::write(fork_directory.join("b.txt"), "from the fork, again\n").unwrap();
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.pull_from_only_fork(window, cx)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(parent.join("b.txt")).unwrap(),
+            "from the fork, again\n"
+        );
+
+        // A working tree that is not a fork has nothing to merge into.
+        let error = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.merge_into_parent(window, cx)
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not a fork"), "{error:#}");
     }
 }

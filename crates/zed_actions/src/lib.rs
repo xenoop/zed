@@ -610,6 +610,16 @@ pub mod agent {
             /// messages: quotes the passage in the message editor, ready for
             /// what you want to say about it.
             CommentOnTranscriptSelection,
+            /// Forks the active thread: a new thread, with the conversation so
+            /// far as context, working on a copy of the working tree in its
+            /// own git worktree.
+            ForkThread,
+            /// In a fork, merges its changes into the working tree it was
+            /// forked from.
+            MergeIntoParent,
+            /// Merges the changes of this working tree's only fork into it.
+            /// With several forks, pick one from the Forks menu.
+            PullFromFork,
         ]
     );
 

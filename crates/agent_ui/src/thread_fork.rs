@@ -68,7 +68,17 @@ impl ForkRecord {
     }
 }
 
+/// The fork records, held in memory once read: the database write is
+/// asynchronous, so reading back from it right after a change could miss it.
+#[derive(Default)]
+struct ForkRecords(Vec<ForkRecord>);
+
+impl gpui::Global for ForkRecords {}
+
 pub(crate) fn load_records(cx: &App) -> Vec<ForkRecord> {
+    if let Some(records) = cx.try_global::<ForkRecords>() {
+        return records.0.clone();
+    }
     KeyValueStore::global(cx)
         .read_kvp(FORKS_KEY)
         .log_err()
@@ -77,7 +87,8 @@ pub(crate) fn load_records(cx: &App) -> Vec<ForkRecord> {
         .unwrap_or_default()
 }
 
-pub(crate) fn save_records(records: Vec<ForkRecord>, cx: &App) {
+pub(crate) fn save_records(records: Vec<ForkRecord>, cx: &mut App) {
+    cx.set_global(ForkRecords(records.clone()));
     let store = KeyValueStore::global(cx);
     db::write_and_log(cx, move || async move {
         store
@@ -87,7 +98,7 @@ pub(crate) fn save_records(records: Vec<ForkRecord>, cx: &App) {
 }
 
 /// Adds or replaces the record for a fork directory.
-pub(crate) fn upsert_record(record: ForkRecord, cx: &App) {
+pub(crate) fn upsert_record(record: ForkRecord, cx: &mut App) {
     let mut records = load_records(cx);
     records.retain(|existing| existing.fork_path != record.fork_path);
     records.push(record);
@@ -105,6 +116,97 @@ pub(crate) fn records_for_parent(parent_path: &str, cx: &App) -> Vec<ForkRecord>
         .into_iter()
         .filter(|record| record.parent_path == parent_path)
         .collect()
+}
+
+/// Starts the first message of a fork: the thread view shows such messages
+/// collapsed to one line.
+pub(crate) const FORK_CONTEXT_PREFIX: &str = "This thread is a fork of";
+
+/// How much of the parent's transcript a fork receives, counted from its end.
+const MAX_TRANSCRIPT_BYTES: usize = 60_000;
+
+/// The first message of a fork. Agents cannot import another thread's
+/// history, so the parent's transcript is passed as text.
+pub(crate) fn fork_context_message(parent_title: Option<&str>, transcript: &str) -> String {
+    let title = parent_title.unwrap_or("an earlier thread");
+    let mut start = transcript.len().saturating_sub(MAX_TRANSCRIPT_BYTES);
+    while !transcript.is_char_boundary(start) {
+        start += 1;
+    }
+    let truncated = if start > 0 {
+        "(earlier part omitted)\n"
+    } else {
+        ""
+    };
+    format!(
+        "{FORK_CONTEXT_PREFIX} \"{title}\". Its conversation so far is below, for context. \
+         You are working in a separate git worktree that started as a copy of that \
+         thread's working tree, including uncommitted changes; what you change here \
+         reaches the original only when I merge it. Do not act on the conversation \
+         yet: reply with one short line saying you are ready.\n\n\
+         <conversation>\n{truncated}{}\n</conversation>\n",
+        &transcript[start..]
+    )
+}
+
+pub(crate) fn fork_thread_title(kind: &ForkKind, parent_title: Option<&str>) -> String {
+    let label = match kind {
+        ForkKind::Fork => "Fork",
+        ForkKind::Review => "Review",
+        ForkKind::Land => "Land",
+    };
+    match parent_title {
+        Some(title) => format!("{label}: {title}"),
+        None => label.to_string(),
+    }
+}
+
+/// The message a fork's thread starts with, by kind.
+pub(crate) fn first_message(
+    kind: &ForkKind,
+    parent_title: Option<&str>,
+    transcript: &str,
+) -> String {
+    match kind {
+        ForkKind::Fork | ForkKind::Review | ForkKind::Land => {
+            fork_context_message(parent_title, transcript)
+        }
+    }
+}
+
+/// What a merge did, in a sentence for a notification.
+pub(crate) fn merge_summary(fork_name: &str, outcome: &MergeOutcome) -> String {
+    match outcome {
+        MergeOutcome::NothingToMerge => {
+            format!("{fork_name} has no changes that are not already merged")
+        }
+        MergeOutcome::Merged {
+            changed_files,
+            conflicted_files,
+        } => {
+            let files = match changed_files.len() {
+                1 => "1 file".to_string(),
+                count => format!("{count} files"),
+            };
+            if conflicted_files.is_empty() {
+                format!("Merged {files} from {fork_name}")
+            } else {
+                format!(
+                    "Merged {files} from {fork_name}. Resolve the conflict markers in: {}",
+                    conflicted_files.join(", ")
+                )
+            }
+        }
+    }
+}
+
+/// The panel action a message such as `/fork` stands for.
+pub(crate) fn slash_command_action(text: &str) -> Option<Box<dyn gpui::Action>> {
+    match text {
+        "/fork" => Some(Box::new(zed_actions::agent::ForkThread)),
+        "/merge" => Some(Box::new(zed_actions::agent::MergeIntoParent)),
+        _ => None,
+    }
 }
 
 fn quote(text: &str) -> String {
@@ -527,6 +629,40 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(parent.join("new.txt")).unwrap(),
             "made in fork\nand extended\n"
+        );
+    }
+
+    #[test]
+    fn test_fork_messages() {
+        let message = fork_context_message(Some("Fix the parser"), "## User\nhello\n");
+        assert!(message.starts_with(FORK_CONTEXT_PREFIX));
+        assert!(message.contains("\"Fix the parser\""));
+        assert!(message.contains("<conversation>\n## User\nhello\n\n</conversation>"));
+
+        // A long transcript keeps its end.
+        let long = format!("{}THE END", "x".repeat(MAX_TRANSCRIPT_BYTES * 2));
+        let message = fork_context_message(None, &long);
+        assert!(message.contains("(earlier part omitted)"));
+        assert!(message.contains("THE END"));
+        assert!(message.len() < MAX_TRANSCRIPT_BYTES + 2_000);
+
+        assert_eq!(
+            fork_thread_title(&ForkKind::Fork, Some("Fix the parser")),
+            "Fork: Fix the parser"
+        );
+        assert!(slash_command_action("/fork").is_some());
+        assert!(slash_command_action("/merge").is_some());
+        assert!(slash_command_action("/fork please").is_none());
+
+        assert_eq!(
+            merge_summary(
+                "worktrees/fork",
+                &MergeOutcome::Merged {
+                    changed_files: vec!["a".into(), "b".into()],
+                    conflicted_files: vec!["b".into()],
+                }
+            ),
+            "Merged 2 files from worktrees/fork. Resolve the conflict markers in: b"
         );
     }
 
