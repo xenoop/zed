@@ -757,7 +757,52 @@ impl Editor {
             cx.propagate();
             return;
         }
+        if self.review_comments_hidden && self.reopen_hidden_comment_at_cursor(window, cx) {
+            return;
+        }
         self.set_review_comments_hidden(!self.review_comments_hidden, window, cx);
+    }
+
+    /// While comments are hidden: opens the box of the comment whose marked
+    /// lines hold the cursor, leaving the others hidden. Returns whether it
+    /// opened one.
+    fn reopen_hidden_comment_at_cursor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let snapshot = self.snapshot(window, cx);
+        let cursor_row = self
+            .selections
+            .newest::<Point>(&snapshot.display_snapshot)
+            .head()
+            .row;
+        let buffer_snapshot = snapshot.buffer_snapshot();
+        let range = self
+            .stored_review_comments
+            .iter()
+            .flat_map(|(_, comments)| comments.iter().map(|comment| comment.range.clone()))
+            .find(|range| {
+                (range.start.to_point(buffer_snapshot).row
+                    ..=range.end.to_point(buffer_snapshot).row)
+                    .contains(&cursor_row)
+            });
+        let Some(range) = range else {
+            return false;
+        };
+        let open_boxes = self.diff_review_overlays.len();
+        let rows = range
+            .start
+            .to_display_point(&snapshot.display_snapshot)
+            .row()..range.end.to_display_point(&snapshot.display_snapshot).row();
+        self.open_diff_review_overlay(rows, false, window, cx);
+        if self.diff_review_overlays.len() == open_boxes {
+            // Its box is already open.
+            return false;
+        }
+        self.remove_highlighted_rows::<HiddenReviewComments>(vec![range], cx);
+        cx.notify();
+        true
     }
 
     pub fn review_comments_hidden(&self) -> bool {

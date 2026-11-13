@@ -2475,6 +2475,11 @@ mod tests {
         editor.update_in(cx, |editor, window, cx| {
             editor.focus_handle(cx).focus(window, cx);
         });
+        // On the marked line, the shortcut opens that comment alone and
+        // comments stay hidden otherwise; pressing it again shows them all.
+        cx.simulate_keystrokes(toggle_hidden);
+        cx.run_until_parked();
+        assert_eq!(box_count_and_markers(cx), (true, 1, true, 0));
         cx.simulate_keystrokes(toggle_hidden);
         cx.run_until_parked();
         assert_eq!(box_count_and_markers(cx), (true, 1, false, 0));
