@@ -1073,6 +1073,14 @@ fn thread_metadata_to_debug_json(
     })
 }
 
+/// Where "Send Last Reply To" delivers.
+pub(crate) enum ReplyTarget {
+    /// Another thread loaded in the same panel.
+    Thread(ThreadId),
+    /// The thread working in the working tree at this path.
+    WorkingTree(String),
+}
+
 /// Optional parameters for `AgentPanel::create_thread_with_options`. All
 /// fields default to the panel's current selection so the agent tool only
 /// needs to override what it actually cares about.
@@ -1274,8 +1282,6 @@ pub struct AgentPanel {
     last_created_entry_kind: AgentPanelEntryKind,
     draft_thread: Option<Entity<ConversationView>>,
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
-    /// For threads started to land another thread's changes: that thread.
-    land_parents: HashMap<ThreadId, ThreadId>,
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
     #[cfg(test)]
@@ -1697,7 +1703,6 @@ impl AgentPanel {
             draft_thread: None,
             persist_selected_agent_task: Task::ready(()),
             retained_threads: HashMap::default(),
-            land_parents: HashMap::default(),
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
             #[cfg(test)]
@@ -3724,9 +3729,9 @@ impl AgentPanel {
             .active_conversation_view()
             .map(|view| view.read(cx).thread_id);
         if let Some(parent_thread_id) =
-            active_thread_id.and_then(|thread_id| self.land_parents.get(&thread_id).copied())
+            active_thread_id.and_then(|thread_id| crate::thread_fork::land_parent(thread_id, cx))
         {
-            return Task::ready(self.deliver_message(Some(parent_thread_id), message, window, cx));
+            return Task::ready(self.send_to_thread(parent_thread_id, message, window, cx));
         }
         let record = self
             .working_tree_path(cx)
@@ -3741,6 +3746,67 @@ impl AgentPanel {
             window,
             cx,
         ))
+    }
+
+    /// Hands a message to a thread this panel has loaded. Unlike
+    /// [`Self::deliver_message`], a thread that is not loaded is an error
+    /// rather than a reason to use the thread on show.
+    fn send_to_thread(
+        &mut self,
+        thread_id: ThreadId,
+        message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.conversation_view_for_thread(thread_id, cx).is_some(),
+            "That thread is not open. Open it once from the sidebar, then send again."
+        );
+        self.deliver_message(Some(thread_id), message, window, cx)
+    }
+
+    /// Sends the agent's last reply in the active thread to another thread
+    /// of this panel, or to the thread working in another working tree,
+    /// and says so in a toast.
+    pub(crate) fn send_last_reply_to(
+        &mut self,
+        target: ReplyTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some((title, last_reply, _)) = self.active_thread_summary(cx) else {
+            return Task::ready(Err(anyhow!("There is no thread to send from")));
+        };
+        let message = crate::thread_fork::thread_message(title.as_deref(), &last_reply);
+        let (result, target_name) = match target {
+            ReplyTarget::Thread(thread_id) => {
+                let name = self
+                    .conversation_view_for_thread(thread_id, cx)
+                    .map(|view| view.read(cx).title(cx).to_string())
+                    .unwrap_or_else(|| "the other thread".to_string());
+                (self.send_to_thread(thread_id, message, window, cx), name)
+            }
+            ReplyTarget::WorkingTree(path) => (
+                self.deliver_to_working_tree(&path, None, message, window, cx),
+                path,
+            ),
+        };
+        if result.is_ok()
+            && let Some(workspace) = self.workspace.upgrade()
+        {
+            workspace.update(cx, |workspace, cx| {
+                struct ReplySentToast;
+                workspace.show_toast(
+                    workspace::Toast::new(
+                        workspace::notifications::NotificationId::unique::<ReplySentToast>(),
+                        format!("Sent the last reply to {target_name}"),
+                    )
+                    .autohide(),
+                    cx,
+                );
+            });
+        }
+        Task::ready(result)
     }
 
     /// Starts a thread, in this working tree, that lands the active
@@ -3790,7 +3856,7 @@ impl AgentPanel {
                     cx,
                 );
                 if let Some(parent_thread_id) = parent_thread_id {
-                    panel.land_parents.insert(thread_id, parent_thread_id);
+                    crate::thread_fork::set_land_parent(thread_id, parent_thread_id, cx);
                 }
                 panel.activate_retained_thread(thread_id, true, window, cx);
             })?;
@@ -3822,9 +3888,22 @@ impl AgentPanel {
                 .rev()
                 .find_map(|record| record.verdict)
         });
-        let is_land_thread = self
+        let is_land_thread = self.active_conversation_view().is_some_and(|view| {
+            crate::thread_fork::land_parent(view.read(cx).thread_id, cx).is_some()
+        });
+        // The other threads this panel has loaded, as places to send a
+        // reply to.
+        let active_thread_id = self
             .active_conversation_view()
-            .is_some_and(|view| self.land_parents.contains_key(&view.read(cx).thread_id));
+            .map(|view| view.read(cx).thread_id);
+        let other_threads: Vec<(ThreadId, SharedString)> = self
+            .retained_threads
+            .iter()
+            .filter(|(thread_id, _)| Some(**thread_id) != active_thread_id)
+            .map(|(thread_id, view)| (*thread_id, view.read(cx).title(cx)))
+            .sorted_by(|left, right| left.1.cmp(&right.1))
+            .collect();
+        let has_active_thread = active_thread_id.is_some();
         PopoverMenu::new("thread-forks-menu")
             .trigger_with_tooltip(
                 IconButton::new("thread-forks", IconName::GitBranch)
@@ -3848,6 +3927,7 @@ impl AgentPanel {
             .menu(move |window, cx| {
                 let panel = panel.clone();
                 let workspace = workspace.clone();
+                let other_threads = other_threads.clone();
                 let own_record = working_tree_path
                     .as_ref()
                     .and_then(|path| crate::thread_fork::record_for_fork(path, cx));
@@ -3883,6 +3963,49 @@ impl AgentPanel {
                             "Send Last Reply to Parent Thread",
                             Box::new(zed_actions::agent::SendToParentThread),
                         );
+                    }
+                    if has_active_thread && (!other_threads.is_empty() || !forks.is_empty()) {
+                        menu = menu.separator().header("Send Last Reply To");
+                        for (thread_id, title) in other_threads.clone() {
+                            menu = menu.entry(title, None, {
+                                let panel = panel.clone();
+                                let workspace = workspace.clone();
+                                move |window, cx| {
+                                    if let Some(panel) = panel.upgrade() {
+                                        panel
+                                            .update(cx, |panel, cx| {
+                                                panel.send_last_reply_to(
+                                                    ReplyTarget::Thread(thread_id),
+                                                    window,
+                                                    cx,
+                                                )
+                                            })
+                                            .detach_and_notify_err(workspace.clone(), window, cx);
+                                    }
+                                }
+                            });
+                        }
+                        for record in forks.clone() {
+                            menu = menu.entry(format!("Fork {}", record.display_name()), None, {
+                                let panel = panel.clone();
+                                let workspace = workspace.clone();
+                                move |window, cx| {
+                                    if let Some(panel) = panel.upgrade() {
+                                        panel
+                                            .update(cx, |panel, cx| {
+                                                panel.send_last_reply_to(
+                                                    ReplyTarget::WorkingTree(
+                                                        record.fork_path.clone(),
+                                                    ),
+                                                    window,
+                                                    cx,
+                                                )
+                                            })
+                                            .detach_and_notify_err(workspace.clone(), window, cx);
+                                    }
+                                }
+                            });
+                        }
                     }
                     if !forks.is_empty() {
                         menu = menu.separator().header("Forks of This Working Tree");
@@ -16024,6 +16147,7 @@ mod tests {
         assert!(land_messages[0].contains("Push the branch"));
 
         // Its report goes back to the thread whose changes it landed.
+        let finish_report_turn = parent_connection.defer_next_prompt_response();
         panel
             .update_in(&mut cx, |panel, window, cx| {
                 panel.send_last_reply_to_parent(window, cx)
@@ -16037,5 +16161,29 @@ mod tests {
             parent_messages[1].starts_with(crate::thread_fork::THREAD_MESSAGE_PREFIX),
             "{parent_messages:?}"
         );
+
+        finish_report_turn
+            .send(Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
+
+        // A reply can also be sent to any other thread the panel has loaded;
+        // one that is not loaded is refused rather than sent elsewhere.
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.send_last_reply_to(ReplyTarget::Thread(parent_thread_id), window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        let parent_messages = cx.update(|_, cx| thread_user_message_texts(&parent_thread, cx));
+        assert_eq!(parent_messages.len(), 3, "{parent_messages:?}");
+        let error = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.send_last_reply_to(ReplyTarget::Thread(ThreadId::new()), window, cx)
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not open"), "{error:#}");
     }
 }

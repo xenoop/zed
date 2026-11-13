@@ -72,6 +72,53 @@ impl ForkRecord {
     }
 }
 
+const LAND_PARENTS_KEY: &str = "agent_land_thread_parents";
+
+type ThreadId = crate::thread_metadata_store::ThreadId;
+
+/// For threads started to land another thread's changes: that thread. Held
+/// in memory once read, like the fork records.
+#[derive(Default)]
+struct LandParents(Vec<(ThreadId, ThreadId)>);
+
+impl gpui::Global for LandParents {}
+
+fn load_land_parents(cx: &App) -> Vec<(ThreadId, ThreadId)> {
+    if let Some(parents) = cx.try_global::<LandParents>() {
+        return parents.0.clone();
+    }
+    KeyValueStore::global(cx)
+        .read_kvp(LAND_PARENTS_KEY)
+        .log_err()
+        .flatten()
+        .and_then(|json| serde_json::from_str(&json).log_err())
+        .unwrap_or_default()
+}
+
+/// The thread whose changes `land_thread` was started to land.
+pub(crate) fn land_parent(land_thread: ThreadId, cx: &App) -> Option<ThreadId> {
+    load_land_parents(cx)
+        .into_iter()
+        .find(|(thread, _)| *thread == land_thread)
+        .map(|(_, parent)| parent)
+}
+
+pub(crate) fn set_land_parent(land_thread: ThreadId, parent: ThreadId, cx: &mut App) {
+    let mut parents = load_land_parents(cx);
+    parents.retain(|(thread, _)| *thread != land_thread);
+    parents.push((land_thread, parent));
+    cx.set_global(LandParents(parents.clone()));
+    let store = KeyValueStore::global(cx);
+    db::write_and_log(cx, move || async move {
+        store
+            .write_kvp(
+                LAND_PARENTS_KEY.to_string(),
+                serde_json::to_string(&parents)?,
+            )
+            .await
+    });
+}
+
 /// How a fork's working tree relates to the one it was made from, for views
 /// that list threads.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -323,7 +370,17 @@ pub(crate) fn verdict_message(
 
 /// The message another thread's reply is passed on with.
 pub(crate) fn thread_message(sender_title: Option<&str>, text: &str) -> String {
-    let title = sender_title.unwrap_or("another thread");
+    // A title can be a thread's whole first message: keep its first line,
+    // shortened, and without quotes that would end the quoted title early.
+    let title: String = sender_title
+        .unwrap_or("another thread")
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| *c != '"')
+        .take(60)
+        .collect();
     format!(
         "{THREAD_MESSAGE_PREFIX} \"{title}\":\n\n{}\n",
         clipped(text.trim())
@@ -938,6 +995,14 @@ mod tests {
         let custom = land_message(None, Some("1. make ship\n"));
         assert!(custom.contains("1. make ship") && !custom.contains("Push the branch"));
 
+        let long_title = format!("Land the changes of thread \"Hello\". {}", "x".repeat(200));
+        let from_long = thread_message(Some(&long_title), "done");
+        assert_eq!(
+            delivered_message_summary(&from_long).as_deref(),
+            Some(
+                "Message from thread \"Land the changes of thread Hello. xxxxxxxxxxxxxxxxxxxxxxxxxx\""
+            )
+        );
         assert!(delivered_message_summary("An ordinary message").is_none());
         for command in ["/review", "/land", "/send-to-parent"] {
             assert!(slash_command_action(command).is_some(), "{command}");
@@ -1017,6 +1082,25 @@ mod tests {
                 "orphan fork",
             ]
         );
+    }
+
+    #[gpui::test]
+    async fn test_land_parent_survives_a_restart(cx: &mut TestAppContext) {
+        init_test(cx);
+        let land_thread = ThreadId::new();
+        let parent = ThreadId::new();
+        assert_eq!(cx.update(|cx| land_parent(land_thread, cx)), None);
+        cx.update(|cx| set_land_parent(land_thread, parent, cx));
+        assert_eq!(cx.update(|cx| land_parent(land_thread, cx)), Some(parent));
+
+        // After a restart nothing is in memory: the link comes from the
+        // database.
+        cx.run_until_parked();
+        cx.update(|cx| {
+            cx.remove_global::<LandParents>();
+        });
+        assert_eq!(cx.update(|cx| land_parent(land_thread, cx)), Some(parent));
+        assert_eq!(cx.update(|cx| land_parent(parent, cx)), None);
     }
 
     #[gpui::test]
