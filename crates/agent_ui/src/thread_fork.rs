@@ -72,6 +72,91 @@ impl ForkRecord {
     }
 }
 
+/// How a fork's working tree relates to the one it was made from, for views
+/// that list threads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForkLink {
+    pub fork_path: std::path::PathBuf,
+    pub parent_path: std::path::PathBuf,
+    pub parent_thread_id: Option<crate::thread_metadata_store::ThreadId>,
+}
+
+/// Every known fork, with its parent.
+pub fn fork_links(cx: &App) -> Vec<ForkLink> {
+    load_records(cx)
+        .into_iter()
+        .map(|record| ForkLink {
+            fork_path: record.fork_path.into(),
+            parent_path: record.parent_path.into(),
+            parent_thread_id: record.parent_thread_id,
+        })
+        .collect()
+}
+
+/// What a thread list needs to know about one of its thread rows to place
+/// forks under their parents.
+pub struct ForkListRow {
+    pub thread_id: crate::thread_metadata_store::ThreadId,
+    /// The folders the thread works in.
+    pub folder_paths: Vec<std::path::PathBuf>,
+    /// Set when the thread works in a fork.
+    pub fork_parent: Option<ForkLink>,
+}
+
+/// Moves each row of a thread that works in a fork to just below the thread
+/// it was forked from: the recorded thread, or failing that the first
+/// listed thread of the parent working tree. A fork whose parent is not in
+/// the list stays where it is. `describe` returns `None` for rows that are
+/// not threads.
+pub fn nest_forks_under_parents<T>(
+    mut rows: Vec<T>,
+    describe: impl Fn(&T) -> Option<ForkListRow>,
+) -> Vec<T> {
+    let forks: Vec<(crate::thread_metadata_store::ThreadId, ForkLink)> = rows
+        .iter()
+        .filter_map(|row| {
+            let row = describe(row)?;
+            Some((row.thread_id, row.fork_parent?))
+        })
+        .collect();
+    for (fork_id, link) in forks {
+        let position = |rows: &[T], matches: &dyn Fn(&ForkListRow) -> bool| {
+            rows.iter()
+                .position(|row| describe(row).is_some_and(|row| matches(&row)))
+        };
+        let parent_index = position(&rows, &|row| {
+            row.thread_id != fork_id && Some(row.thread_id) == link.parent_thread_id
+        })
+        .or_else(|| {
+            position(&rows, &|row| {
+                row.thread_id != fork_id && row.folder_paths.contains(&link.parent_path)
+            })
+        });
+        let fork_index = position(&rows, &|row| row.thread_id == fork_id);
+        let (Some(parent_index), Some(fork_index)) = (parent_index, fork_index) else {
+            continue;
+        };
+        let fork_row = rows.remove(fork_index);
+        let parent_index = if fork_index < parent_index {
+            parent_index - 1
+        } else {
+            parent_index
+        };
+        // After the forks already placed under this parent, so siblings
+        // keep their order.
+        let mut insert_at = parent_index + 1;
+        while rows.get(insert_at).is_some_and(|row| {
+            describe(row)
+                .and_then(|row| row.fork_parent)
+                .is_some_and(|other| other.parent_path == link.parent_path)
+        }) {
+            insert_at += 1;
+        }
+        rows.insert(insert_at, fork_row);
+    }
+    rows
+}
+
 /// The fork records, held in memory once read: the database write is
 /// asynchronous, so reading back from it right after a change could miss it.
 #[derive(Default)]
@@ -857,6 +942,81 @@ mod tests {
         for command in ["/review", "/land", "/send-to-parent"] {
             assert!(slash_command_action(command).is_some(), "{command}");
         }
+    }
+
+    #[test]
+    fn test_forks_are_listed_under_their_parent_thread() {
+        use crate::thread_metadata_store::ThreadId;
+        use std::path::PathBuf;
+
+        struct Row {
+            title: &'static str,
+            thread_id: ThreadId,
+            path: &'static str,
+            fork_parent: Option<ForkLink>,
+        }
+        let row = |title, path, fork_parent| Row {
+            title,
+            thread_id: ThreadId::new(),
+            path,
+            fork_parent,
+        };
+        let link = |fork_path: &str, parent_path: &str, parent_thread_id| ForkLink {
+            fork_path: PathBuf::from(fork_path),
+            parent_path: PathBuf::from(parent_path),
+            parent_thread_id,
+        };
+        let older_parent = row("older parent", "/repo", None);
+        // As a thread list sorts them: most recent first.
+        let rows = vec![
+            row(
+                "fork two",
+                "/worktrees/two",
+                Some(link("/worktrees/two", "/repo", None)),
+            ),
+            row("unrelated", "/other", None),
+            row("recent parent", "/repo", None),
+            row(
+                "fork one",
+                "/worktrees/one",
+                Some(link(
+                    "/worktrees/one",
+                    "/repo",
+                    Some(older_parent.thread_id),
+                )),
+            ),
+            older_parent,
+            row(
+                "orphan fork",
+                "/worktrees/orphan",
+                Some(link("/worktrees/orphan", "/gone", None)),
+            ),
+        ];
+        let titles: Vec<&str> = nest_forks_under_parents(rows, |row| {
+            Some(ForkListRow {
+                thread_id: row.thread_id,
+                folder_paths: vec![PathBuf::from(row.path)],
+                fork_parent: row.fork_parent.clone(),
+            })
+        })
+        .iter()
+        .map(|row| row.title)
+        .collect();
+        assert_eq!(
+            titles,
+            vec![
+                "unrelated",
+                // Without a recorded thread, the fork follows the first
+                // listed thread of its parent working tree.
+                "recent parent",
+                "fork two",
+                // With one, it follows that thread.
+                "older parent",
+                "fork one",
+                // A fork whose parent is not listed stays in place.
+                "orphan fork",
+            ]
+        );
     }
 
     #[gpui::test]

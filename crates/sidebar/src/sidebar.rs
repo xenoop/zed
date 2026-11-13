@@ -363,6 +363,9 @@ struct ThreadEntry {
     highlight_positions: Vec<usize>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     diff_stats: DiffStats,
+    /// Set when this thread works in a fork of another thread's working
+    /// tree: it is listed, indented, under that thread.
+    fork_parent: Option<agent_ui::ForkLink>,
 }
 
 #[derive(Clone)]
@@ -1415,6 +1418,7 @@ impl Sidebar {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
         };
+        let fork_links = agent_ui::fork_links(cx);
         let mw = multi_workspace.read(cx);
         let workspaces: Vec<_> = mw.workspaces().cloned().collect();
         let active_workspace = Some(mw.workspace().clone());
@@ -1635,6 +1639,15 @@ impl Sidebar {
                 let make_thread_entry =
                     |row: ThreadMetadata, workspace: ThreadEntryWorkspace| -> Arc<ThreadEntry> {
                         let (icon, icon_from_external_svg) = resolve_agent_icon(&row.agent_id);
+                        let fork_parent = fork_links
+                            .iter()
+                            .find(|link| {
+                                row.worktree_paths
+                                    .folder_path_list()
+                                    .paths()
+                                    .contains(&link.fork_path)
+                            })
+                            .cloned();
                         let worktrees =
                             worktree_info_from_thread_paths(&row.worktree_paths, &branch_by_path);
                         // Start drafts as `WithContent`; the post-processing
@@ -1654,6 +1667,7 @@ impl Sidebar {
                             highlight_positions: Vec::new(),
                             worktrees,
                             diff_stats: DiffStats::default(),
+                            fork_parent,
                         })
                     };
 
@@ -5848,7 +5862,7 @@ impl Sidebar {
             .chain(threads.into_iter().map(ListEntry::Thread))
             .sorted_by_key(|right| std::cmp::Reverse(display_time(right)));
 
-        for entry in row_entries {
+        for entry in Self::nest_forks_under_parents(row_entries.collect()) {
             if let ListEntry::Thread(thread) = &entry {
                 if let Some(session_id) = &thread.metadata.session_id {
                     current_session_ids.insert(session_id.clone());
@@ -5857,6 +5871,26 @@ impl Sidebar {
             }
             entries.push(entry);
         }
+    }
+
+    /// Moves each thread that works in a fork to just below the thread it
+    /// was forked from (the recorded thread, or failing that the most recent
+    /// thread of the parent working tree). A fork whose parent is not in the
+    /// list stays where its time puts it.
+    fn nest_forks_under_parents(rows: Vec<ListEntry>) -> Vec<ListEntry> {
+        agent_ui::nest_forks_under_parents(rows, |row| match row {
+            ListEntry::Thread(thread) => Some(agent_ui::ForkListRow {
+                thread_id: thread.metadata.thread_id,
+                folder_paths: thread
+                    .metadata
+                    .worktree_paths
+                    .folder_path_list()
+                    .paths()
+                    .to_vec(),
+                fork_parent: thread.fork_parent.clone(),
+            }),
+            ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => None,
+        })
     }
 
     /// The sort order used by the ctrl-tab switcher
@@ -6466,6 +6500,12 @@ impl Sidebar {
                     }
                 })
             });
+
+        // A thread working in a fork sits, indented, under the thread it
+        // was forked from.
+        let thread_item = div()
+            .when(thread.fork_parent.is_some(), |this| this.pl_4())
+            .child(thread_item);
 
         if is_draft || thread.metadata.session_id.is_none() {
             return thread_item.into_any_element();

@@ -83,6 +83,7 @@ pub use crate::agent_panel::{
 use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
 pub use crate::message_editor::MessageEditorEvent;
+pub use crate::thread_fork::{ForkLink, ForkListRow, fork_links, nest_forks_under_parents};
 pub use crate::thread_metadata_store::ThreadId;
 pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
 pub use conversation_view::open_markdown_in_workspace;

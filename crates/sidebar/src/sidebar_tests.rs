@@ -1545,6 +1545,7 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
             highlight_positions: Vec::new(),
             worktrees: Vec::new(),
             diff_stats: DiffStats::default(),
+            fork_parent: None,
         }))
     };
 
@@ -1637,6 +1638,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                fork_parent: None,
             })),
             // Active thread with Running status
             ListEntry::Thread(Arc::new(ThreadEntry {
@@ -1664,6 +1666,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                fork_parent: None,
             })),
             // Active thread with Error status
             ListEntry::Thread(Arc::new(ThreadEntry {
@@ -1691,6 +1694,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                fork_parent: None,
             })),
             // Thread with WaitingForConfirmation status, not active
             // remote_connection: None,
@@ -1719,6 +1723,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                fork_parent: None,
             })),
             // Background thread that completed (should show notification)
             // remote_connection: None,
@@ -1747,6 +1752,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                fork_parent: None,
             })),
             // Collapsed project header
             ListEntry::ProjectHeader {
