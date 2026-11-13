@@ -55,6 +55,7 @@ pub mod picker_prompt;
 pub mod project_diff;
 pub(crate) mod remote_output;
 pub mod repository_selector;
+mod review_comment_store;
 mod seen_files;
 pub mod solo_diff_view;
 pub mod staged_diff;
@@ -104,8 +105,9 @@ pub fn init(cx: &mut App) {
         cx,
     );
 
-    cx.observe_new(|editor: &mut Editor, _, cx| {
+    cx.observe_new(|editor: &mut Editor, window, cx| {
         conflict_view::register_editor(editor, editor.buffer().clone(), cx);
+        review_comment_store::register_file_editor(editor, window, cx);
     })
     .detach();
 

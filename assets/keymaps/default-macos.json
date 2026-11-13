@@ -1848,4 +1848,11 @@
       "cmd-enter": "editor::SendDiffReviewCommentNow",
     },
   },
+  {
+    "context": "Editor && mode == full",
+    "bindings": {
+      "cmd-alt-m": "editor::CommentOnSelection",
+      "cmd-alt-c": "editor::ToggleCommentMode",
+    },
+  },
 ]

@@ -6,13 +6,13 @@ use crate::{
         self, CompareWithBranch, DeployBranchDiff, DiffSinceReviewed, ProjectDiff, ReviewDiff,
         render_send_review_to_agent_button,
     },
+    review_comment_store,
     seen_files::{
         self, GoToNextChangedFile, GoToPreviousChangedFile, MarkAllFilesSeen, ToggleFileSeen,
     },
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
-use db::kvp::KeyValueStore;
 use editor::{
     Addon, Editor, EditorEvent, HiddenDiffHunkRenderer, SavedReviewComment, SplittableEditor,
     actions::{SendReviewToAgent, ToggleCommentMode, ToggleReviewCommentsHidden},
@@ -37,7 +37,6 @@ use std::{
     sync::Arc,
 };
 use ui::{Checkbox, ContextMenu, DiffStat, Divider, PopoverMenu, Tooltip, prelude::*};
-use util::ResultExt as _;
 use workspace::{
     ItemHandle, ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation,
     ToolbarItemView, Workspace,
@@ -579,14 +578,9 @@ impl BranchDiff {
         }
     }
 
-    /// The database key for this repository's review comments. Comments sit
-    /// on lines of the working tree, so every comparison shares them.
     fn comments_key(&self, cx: &App) -> Option<String> {
         let repository = self.repo(cx)?;
-        Some(format!(
-            "changes_view_comments:{}",
-            repository.read(cx).work_directory_abs_path.display()
-        ))
+        Some(review_comment_store::key_for_repository(&repository, cx))
     }
 
     fn load_comments(&mut self, cx: &mut Context<Self>) {
@@ -597,12 +591,7 @@ impl BranchDiff {
             return;
         };
         self.comments_loaded = true;
-        self.unplaced_comments = KeyValueStore::global(cx)
-            .read_kvp(&key)
-            .log_err()
-            .flatten()
-            .and_then(|json| serde_json::from_str(&json).log_err())
-            .unwrap_or_default();
+        self.unplaced_comments = review_comment_store::load(&key, cx);
     }
 
     /// Puts saved comments back on files that have appeared in the view.
@@ -620,23 +609,24 @@ impl BranchDiff {
         self.unplaced_comments.extend(unplaced);
     }
 
+    /// Saves the comments of the files this view shows; the comments of
+    /// other files (made in file tabs, say) stay as they are.
     fn save_comments(&mut self, cx: &mut Context<Self>) {
         self.load_comments(cx);
         let Some(key) = self.comments_key(cx) else {
             return;
         };
-        let mut comments = self.rhs_editor(cx).read(cx).saved_review_comments(cx);
-        comments.extend(self.unplaced_comments.iter().cloned());
-        let store = KeyValueStore::global(cx);
-        db::write_and_log(cx, move || async move {
-            if comments.is_empty() {
-                store.delete_kvp(key).await
-            } else {
-                store
-                    .write_kvp(key, serde_json::to_string(&comments)?)
-                    .await
-            }
-        });
+        let editor = self.rhs_editor(cx);
+        let comments = editor.read(cx).saved_review_comments(cx);
+        let files: collections::HashSet<String> = editor
+            .read(cx)
+            .buffer()
+            .read(cx)
+            .all_buffers()
+            .into_iter()
+            .filter_map(|buffer| Some(buffer.read(cx).file()?.path().as_unix_str().to_string()))
+            .collect();
+        review_comment_store::save_for_files(key, &files, comments, cx);
     }
 
     fn rhs_editor(&self, cx: &App) -> Entity<Editor> {
@@ -2534,5 +2524,92 @@ mod tests {
         assert_eq!(outdated.len(), 1);
         assert!(outdated[0].outdated);
         assert_eq!(outdated[0].comment, "why?");
+    }
+
+    #[gpui::test]
+    async fn test_comment_mode_in_a_file_tab(cx: &mut TestAppContext) {
+        init_test(cx);
+        bind_default_keymap(cx);
+        let toggle_comment_mode = if cfg!(target_os = "macos") {
+            "cmd-alt-c"
+        } else {
+            "ctrl-alt-c"
+        };
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "one\ntwo\nthree\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let open_file = |cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.open_path((worktree_id, rel_path("a.txt")), None, true, window, cx)
+            })
+        };
+
+        let editor = open_file(cx).await.unwrap().downcast::<Editor>().unwrap();
+        cx.run_until_parked();
+        let original_text = editor.read_with(cx, |editor, cx| editor.text(cx));
+        // A file tab edits as usual until comment mode is switched on.
+        assert!(!editor.read_with(cx, |editor, _| editor.comment_mode()));
+        cx.simulate_keystrokes(toggle_comment_mode);
+        cx.run_until_parked();
+        assert!(editor.read_with(cx, |editor, _| editor.comment_mode()));
+
+        cx.simulate_input("why?");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            original_text
+        );
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.total_review_comment_count()),
+            1
+        );
+
+        // The comment is saved with the repository's others, so the Changes
+        // view and a reopened tab both show it.
+        let repository = project
+            .read_with(cx, |project, cx| project.active_repository(cx))
+            .unwrap();
+        let saved = cx.update(|_, cx| {
+            let key = review_comment_store::key_for_repository(&repository, cx);
+            review_comment_store::load(&key, cx)
+        });
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            (saved[0].file_path.as_str(), saved[0].comment.as_str()),
+            ("a.txt", "why?")
+        );
+
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.active_pane().update(cx, |pane, cx| {
+                    pane.close_all_items(&Default::default(), window, cx)
+                })
+            })
+            .await
+            .unwrap();
+        drop(editor);
+        cx.run_until_parked();
+        let reopened = open_file(cx).await.unwrap().downcast::<Editor>().unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            reopened.read_with(cx, |editor, cx| editor.saved_review_comments(cx)),
+            saved
+        );
     }
 }

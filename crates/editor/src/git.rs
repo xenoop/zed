@@ -690,6 +690,20 @@ impl Editor {
         self.open_diff_review_overlay(display_range, true, window, cx);
     }
 
+    /// Diff views take review comments, and so does a plain editor on a
+    /// project file. Other editors (a review box's own input, pickers) do
+    /// not.
+    fn can_host_review_comments(&self, cx: &App) -> bool {
+        self.show_diff_review_button
+            || (self.mode.is_full()
+                && self.project.is_some()
+                && self
+                    .buffer
+                    .read(cx)
+                    .as_singleton()
+                    .is_some_and(|buffer| buffer.read(cx).file().is_some()))
+    }
+
     /// Whether typing on code starts a review comment instead of editing.
     pub fn comment_mode(&self) -> bool {
         self.comment_mode
@@ -711,10 +725,11 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         // A review box's own input is an editor too: let its diff handle this.
-        if !self.show_diff_review_button {
+        if !self.can_host_review_comments(cx) {
             cx.propagate();
             return;
         }
+        self.show_diff_review_button = true;
         self.set_comment_mode(!self.comment_mode, cx);
     }
 
@@ -724,10 +739,11 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.show_diff_review_button {
+        if !self.can_host_review_comments(cx) {
             cx.propagate();
             return;
         }
+        self.show_diff_review_button = true;
         self.start_review_comment(None, window, cx);
     }
 

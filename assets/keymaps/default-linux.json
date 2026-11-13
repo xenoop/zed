@@ -1758,4 +1758,11 @@
       "ctrl-enter": "editor::SendDiffReviewCommentNow",
     },
   },
+  {
+    "context": "Editor && mode == full",
+    "bindings": {
+      "ctrl-alt-m": "editor::CommentOnSelection",
+      "ctrl-alt-c": "editor::ToggleCommentMode",
+    },
+  },
 ]
