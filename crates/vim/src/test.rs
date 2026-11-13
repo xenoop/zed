@@ -3438,3 +3438,101 @@ async fn test_project_search_opens_in_normal_mode(cx: &mut gpui::TestAppContext)
         assert_eq!(vim_mode, Some(Mode::Normal));
     });
 }
+
+#[gpui::test]
+async fn test_review_comment_mode(cx: &mut gpui::TestAppContext) {
+    let mut cx = VimTestContext::new(cx, true).await;
+    cx.set_state("ˇone\ntwo\nthree\n", Mode::Normal);
+    cx.update_editor(|editor, _window, cx| {
+        editor.set_show_diff_review_button(true, cx);
+        editor.set_comment_mode(true, cx);
+    });
+    let comment_box_text = |cx: &mut VimTestContext| {
+        cx.update_editor(|editor, _window, cx| {
+            editor
+                .diff_review_prompt_editor()
+                .map(|prompt| prompt.read(cx).text(cx))
+        })
+    };
+
+    // Normal-mode keys stay Vim's: they move the cursor and start no comment.
+    cx.simulate_keystrokes("j l");
+    cx.assert_state("one\ntˇwo\nthree\n", Mode::Normal);
+    cx.simulate_keystrokes("0");
+    cx.assert_state("one\nˇtwo\nthree\n", Mode::Normal);
+    assert_eq!(comment_box_text(&mut cx), None);
+
+    // Comment mode does not edit the file, whatever the Vim command.
+    cx.simulate_keystrokes("d d");
+    cx.simulate_keystrokes("x");
+    cx.simulate_keystrokes("shift-j");
+    cx.run_until_parked();
+    cx.update_editor(|editor, _window, cx| assert_eq!(editor.text(cx), "one\ntwo\nthree\n"));
+    assert_eq!(comment_box_text(&mut cx), None);
+
+    // In insert mode, typing starts a comment on the line; the comment box
+    // is a plain input, so the rest of the text goes straight into it.
+    cx.simulate_keystrokes("i w h y");
+    cx.run_until_parked();
+    cx.update_editor(|editor, _window, cx| assert_eq!(editor.text(cx), "one\ntwo\nthree\n"));
+    assert_eq!(comment_box_text(&mut cx).as_deref(), Some("why"));
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.update_editor(|editor, _window, _cx| assert_eq!(editor.total_review_comment_count(), 1));
+
+    // Escape leaves the comment box for the code. The box closes, and the
+    // comment stays, with a marker on its line.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    let code_focused = cx.update_editor(|editor, window, cx| {
+        gpui::Focusable::focus_handle(editor, cx).is_focused(window)
+    });
+    assert!(
+        code_focused,
+        "escape in the comment box should return to the code"
+    );
+    assert_eq!(comment_box_text(&mut cx), None);
+    cx.update_editor(|editor, _window, cx| {
+        assert_eq!(editor.total_review_comment_count(), 1);
+        assert!(editor.review_comments_hidden());
+        assert_eq!(editor.hidden_review_comment_marker_count(cx), 1);
+    });
+    // Back in the code, Vim is still in charge: one more escape leaves the
+    // insert mode the comment was started from.
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.run_until_parked();
+    assert_eq!(cx.mode(), Mode::Normal);
+    cx.simulate_keystrokes("g g");
+    cx.update_editor(|editor, _window, cx| assert_eq!(editor.text(cx), "one\ntwo\nthree\n"));
+
+    // A visual selection can be commented on with the shortcut.
+    cx.simulate_keystrokes("shift-v j");
+    assert_eq!(cx.mode(), Mode::VisualLine);
+    cx.simulate_keystrokes("cmd-alt-m");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("b o t h enter");
+    cx.run_until_parked();
+    let saved = cx.update_editor(|editor, _window, cx| editor.saved_review_comments(cx));
+    let both = saved
+        .iter()
+        .find(|comment| comment.comment == "both")
+        .expect("the visual selection should have a comment");
+    assert_eq!((both.start_row, both.end_row), (0, 1));
+    assert_eq!(both.code, "one\ntwo");
+
+    // With comment mode off, insert mode edits the file as usual.
+    cx.update_editor(|editor, window, cx| {
+        gpui::Focusable::focus_handle(editor, cx).focus(window, cx)
+    });
+    cx.simulate_keystrokes("escape escape");
+    cx.simulate_keystrokes("cmd-alt-c");
+    cx.run_until_parked();
+    cx.update_editor(|editor, _window, _cx| assert!(!editor.comment_mode()));
+    cx.simulate_keystrokes("g g i X escape");
+    cx.run_until_parked();
+    cx.update_editor(|editor, _window, cx| assert_eq!(editor.text(cx), "Xone\ntwo\nthree\n"));
+    assert_eq!(cx.mode(), Mode::Normal);
+}

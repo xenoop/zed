@@ -3610,7 +3610,13 @@ impl Editor {
             dismissed = true;
         }
         if !self.diff_review_overlays.is_empty() {
-            self.dismiss_all_diff_review_overlays(cx);
+            // Closing the boxes must not lose sight of the comments in them:
+            // hiding leaves a marker on each commented range.
+            if self.total_review_comment_count() > 0 {
+                self.set_review_comments_hidden(true, window, cx);
+            } else {
+                self.dismiss_all_diff_review_overlays(cx);
+            }
             dismissed = true;
         }
 
