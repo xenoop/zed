@@ -3591,7 +3591,7 @@ impl Editor {
             };
         }
 
-        let line_starts = rows.clone().map(|row| Point::new(row, 0));
+        let line_starts = rows.map(|row| Point::new(row, 0));
         let mut text = String::new();
         for (line_start, removed) in line_starts.zip(&removed_rows) {
             let line_end = Point::new(
