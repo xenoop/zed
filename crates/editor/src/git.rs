@@ -184,6 +184,22 @@ pub(super) struct StoredReviewComment {
     pub(super) outdated: bool,
 }
 
+/// The text of the marker shown where comments are hidden.
+pub(super) fn hidden_review_comment_marker_label(count: usize, answered: usize) -> SharedString {
+    let comments = match count {
+        1 => "1 comment".to_string(),
+        count => format!("{count} comments"),
+    };
+    let state = if answered == count {
+        "answered"
+    } else if answered == 0 {
+        "not answered yet"
+    } else {
+        "partly answered"
+    };
+    format!("{comments}, {state}").into()
+}
+
 /// Marks the rows of commented code while the review boxes are hidden.
 enum HiddenReviewComments {}
 
@@ -791,23 +807,31 @@ impl Editor {
         let Some(range) = range else {
             return false;
         };
-        let open_boxes = self.diff_review_overlays.len();
-        let rows = range
-            .start
-            .to_display_point(&snapshot.display_snapshot)
-            .row()..range.end.to_display_point(&snapshot.display_snapshot).row();
-        self.open_diff_review_overlay(rows, false, window, cx);
-        if self.diff_review_overlays.len() == open_boxes {
-            // Its box is already open.
-            return false;
-        }
-        self.remove_highlighted_rows::<HiddenReviewComments>(vec![range], cx);
-        cx.notify();
-        true
+        // The marker covers every comment of that place, not just this one.
+        let range = self
+            .hidden_review_comment_markers
+            .iter()
+            .map(|(_, marker_range)| marker_range.clone())
+            .find(|marker_range| {
+                (marker_range.start.to_point(buffer_snapshot).row
+                    ..=marker_range.end.to_point(buffer_snapshot).row)
+                    .contains(&cursor_row)
+            })
+            .unwrap_or(range);
+        self.open_hidden_review_comments(&range, window, cx)
     }
 
     pub fn review_comments_hidden(&self) -> bool {
         self.review_comments_hidden
+    }
+
+    /// How many places show a clickable marker while the boxes are hidden,
+    /// with the range of each.
+    pub fn hidden_review_comment_marker_ranges(&self) -> Vec<Range<Anchor>> {
+        self.hidden_review_comment_markers
+            .iter()
+            .map(|(_, range)| range.clone())
+            .collect()
     }
 
     /// How many commented ranges carry a marker while the boxes are hidden.
@@ -826,6 +850,14 @@ impl Editor {
     ) {
         self.review_comments_hidden = hidden;
         self.clear_row_highlights::<HiddenReviewComments>();
+        let marker_blocks: HashSet<CustomBlockId> = self
+            .hidden_review_comment_markers
+            .drain(..)
+            .map(|(block_id, _)| block_id)
+            .collect();
+        if !marker_blocks.is_empty() {
+            self.remove_blocks(marker_blocks, None, cx);
+        }
         let ranges: Vec<Range<Anchor>> = self
             .stored_review_comments
             .iter()
@@ -845,6 +877,7 @@ impl Editor {
                     cx,
                 );
             }
+            self.insert_hidden_review_comment_markers(cx);
         } else {
             for range in ranges {
                 let snapshot = self.snapshot(window, cx);
@@ -857,6 +890,125 @@ impl Editor {
             }
         }
         cx.notify();
+    }
+
+    /// Puts a one-line marker under each place that has comments: how many,
+    /// and whether the agent answered. Clicking one opens its comments.
+    fn insert_hidden_review_comment_markers(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let editor = cx.entity().downgrade();
+        let mut blocks = Vec::new();
+        let mut ranges = Vec::new();
+        for (index, (_, comments)) in self.stored_review_comments.iter().enumerate() {
+            let Some(start) = comments
+                .iter()
+                .map(|comment| comment.range.start)
+                .min_by(|left, right| left.cmp(right, &snapshot))
+            else {
+                continue;
+            };
+            let Some(end) = comments
+                .iter()
+                .map(|comment| comment.range.end)
+                .max_by(|left, right| left.cmp(right, &snapshot))
+            else {
+                continue;
+            };
+            let count = comments.len();
+            let answered = comments
+                .iter()
+                .filter(|comment| matches!(comment.agent_reply, AgentReply::Answered(_)))
+                .count();
+            let label = hidden_review_comment_marker_label(count, answered);
+            let range = start..end;
+            blocks.push(BlockProperties {
+                style: BlockStyle::Sticky,
+                placement: BlockPlacement::Below(end),
+                height: Some(1),
+                render: Arc::new({
+                    let editor = editor.clone();
+                    let range = range.clone();
+                    move |_cx| {
+                        let editor = editor.clone();
+                        let range = range.clone();
+                        h_flex()
+                            .id(("hidden-review-comments", index))
+                            .px_2()
+                            .gap_1()
+                            .cursor_pointer()
+                            .child(
+                                Icon::new(IconName::Chat)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(label.clone())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .on_click(move |_, window, cx| {
+                                editor
+                                    .update(cx, |editor, cx| {
+                                        editor.open_hidden_review_comments(&range, window, cx);
+                                    })
+                                    .ok();
+                            })
+                            .into_any_element()
+                    }
+                }),
+                priority: 0,
+            });
+            ranges.push(range);
+        }
+        let block_ids = self.insert_blocks(blocks, None, cx);
+        self.hidden_review_comment_markers = block_ids.into_iter().zip(ranges).collect();
+    }
+
+    /// While comments are hidden: opens the box of the comments in `range`
+    /// and removes that place's marker and highlights, leaving the other
+    /// places hidden. Returns whether a box was opened.
+    pub fn open_hidden_review_comments(
+        &mut self,
+        range: &Range<Anchor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let snapshot = self.snapshot(window, cx);
+        let open_boxes = self.diff_review_overlays.len();
+        let rows = range
+            .start
+            .to_display_point(&snapshot.display_snapshot)
+            .row()..range.end.to_display_point(&snapshot.display_snapshot).row();
+        self.open_diff_review_overlay(rows, false, window, cx);
+        if self.diff_review_overlays.len() == open_boxes {
+            // Its box is already open.
+            return false;
+        }
+        let buffer_snapshot = snapshot.buffer_snapshot();
+        let covered = range.start.to_point(buffer_snapshot)..=range.end.to_point(buffer_snapshot);
+        let mut marker_blocks = HashSet::default();
+        self.hidden_review_comment_markers
+            .retain(|(block_id, marker_range)| {
+                let inside = covered.contains(&marker_range.start.to_point(buffer_snapshot));
+                if inside {
+                    marker_blocks.insert(*block_id);
+                }
+                !inside
+            });
+        if !marker_blocks.is_empty() {
+            self.remove_blocks(marker_blocks, None, cx);
+        }
+        let highlighted: Vec<Range<Anchor>> = self
+            .stored_review_comments
+            .iter()
+            .flat_map(|(_, comments)| comments.iter().map(|comment| comment.range.clone()))
+            .filter(|comment_range| {
+                covered.contains(&comment_range.start.to_point(buffer_snapshot))
+            })
+            .collect();
+        self.remove_highlighted_rows::<HiddenReviewComments>(highlighted, cx);
+        cx.notify();
+        true
     }
 
     /// Opens a review comment on the lines of the newest selection, with

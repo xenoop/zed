@@ -51722,3 +51722,58 @@ fn document_color_rows(
     rows.sort();
     rows
 }
+
+#[gpui::test]
+fn test_hidden_review_comments_leave_markers(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("one\ntwo\nthree\nfour\n", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    _ = editor.update(cx, |editor: &mut Editor, window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let line = |row| {
+            snapshot.anchor_before(Point::new(row, 0))..snapshot.anchor_after(Point::new(row, 3))
+        };
+        // Two comments on the first line, one on the third.
+        let first_place = test_hunk_key_with_anchor("file.rs", line(0).start);
+        let second_place = test_hunk_key_with_anchor("file.rs", line(2).start);
+        editor.add_review_comment(first_place.clone(), "Why?".to_string(), line(0), cx);
+        let answered = editor.add_review_comment(first_place, "And this?".to_string(), line(0), cx);
+        editor.add_review_comment(second_place, "Rename".to_string(), line(2), cx);
+        editor.set_review_comment_replies(
+            vec![(answered, AgentReply::Answered("Because.".to_string()))],
+            window,
+            cx,
+        );
+        assert_eq!(
+            crate::git::hidden_review_comment_marker_label(2, 1).as_ref(),
+            "2 comments, partly answered"
+        );
+        assert_eq!(
+            crate::git::hidden_review_comment_marker_label(1, 1).as_ref(),
+            "1 comment, answered"
+        );
+
+        editor.set_review_comments_hidden(true, window, cx);
+        assert!(editor.diff_review_overlays.is_empty());
+        let markers = editor.hidden_review_comment_marker_ranges();
+        assert_eq!(markers.len(), 2);
+        assert_eq!(editor.total_review_comment_count(), 3);
+
+        // Opening one marker opens that place's box and leaves the other
+        // place hidden behind its marker.
+        assert!(editor.open_hidden_review_comments(&markers[0], window, cx));
+        assert_eq!(editor.diff_review_overlays.len(), 1);
+        assert_eq!(editor.hidden_review_comment_marker_ranges().len(), 1);
+        assert!(editor.review_comments_hidden());
+        assert!(!editor.open_hidden_review_comments(&markers[0], window, cx));
+
+        // Showing comments again removes every marker.
+        editor.set_review_comments_hidden(false, window, cx);
+        assert!(editor.hidden_review_comment_marker_ranges().is_empty());
+        assert_eq!(editor.diff_review_overlays.len(), 2);
+    });
+}
