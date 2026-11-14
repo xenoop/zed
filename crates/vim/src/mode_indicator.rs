@@ -132,6 +132,16 @@ impl Render for ModeIndicator {
             } else {
                 mode.to_string()
             };
+            // In comment mode the code is not edited: say so next to the
+            // mode, or commands like `dd` seem broken.
+            let in_comment_mode = vim_readable
+                .editor()
+                .is_some_and(|editor| editor.read(cx).comment_mode());
+            let mode_str = if in_comment_mode {
+                format!("{mode_str} · COMMENT")
+            } else {
+                mode_str
+            };
 
             let current_operators_description = self.current_operators_description(vim.clone(), cx);
             let pending = self

@@ -714,6 +714,7 @@ impl Editor {
     pub fn set_comment_mode(&mut self, comment_mode: bool, cx: &mut Context<Self>) {
         if self.comment_mode != comment_mode {
             self.comment_mode = comment_mode;
+            cx.emit(EditorEvent::CommentModeChanged);
             cx.notify();
         }
     }
@@ -948,6 +949,7 @@ impl Editor {
             if focus {
                 let focus_handle = prompt_editor.focus_handle(cx);
                 window.focus(&focus_handle, cx);
+                cx.emit(EditorEvent::ReviewCommentBoxOpened);
             }
             return Some(prompt_editor);
         }
@@ -1053,6 +1055,7 @@ impl Editor {
         if focus {
             let focus_handle = prompt_editor.focus_handle(cx);
             window.focus(&focus_handle, cx);
+            cx.emit(EditorEvent::ReviewCommentBoxOpened);
         }
 
         cx.notify();

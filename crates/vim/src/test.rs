@@ -3497,22 +3497,37 @@ async fn test_review_comment_mode(cx: &mut gpui::TestAppContext) {
         assert!(editor.review_comments_hidden());
         assert_eq!(editor.hidden_review_comment_marker_count(cx), 1);
     });
-    // Back in the code, Vim is still in charge: one more escape leaves the
-    // insert mode the comment was started from.
-    cx.update(|window, _| window.refresh());
-    cx.run_until_parked();
-    cx.simulate_keystrokes("escape");
-    cx.run_until_parked();
+    // Back in the code, Vim is in normal mode again, although the comment
+    // was started from insert mode.
     cx.run_until_parked();
     assert_eq!(cx.mode(), Mode::Normal);
     cx.simulate_keystrokes("g g");
     cx.update_editor(|editor, _window, cx| assert_eq!(editor.text(cx), "one\ntwo\nthree\n"));
 
-    // A visual selection can be commented on with the shortcut.
-    cx.simulate_keystrokes("shift-v j");
-    assert_eq!(cx.mode(), Mode::VisualLine);
-    cx.simulate_keystrokes("cmd-alt-m");
+    // `g m` comments on the cursor's line from normal mode.
+    cx.simulate_keystrokes("g g j j g m");
     cx.run_until_parked();
+    assert_eq!(cx.mode(), Mode::Normal);
+    cx.simulate_keystrokes("l a s t enter escape");
+    cx.run_until_parked();
+    let saved = cx.update_editor(|editor, _window, cx| editor.saved_review_comments(cx));
+    let last = saved
+        .iter()
+        .find(|comment| comment.comment == "last")
+        .expect("g m should comment on the current line");
+    assert_eq!(
+        (last.start_row, last.end_row, last.code.as_str()),
+        (2, 2, "three")
+    );
+
+    // In visual mode it comments on the selection, and leaves visual mode.
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("g g shift-v j");
+    assert_eq!(cx.mode(), Mode::VisualLine);
+    cx.simulate_keystrokes("g m");
+    cx.run_until_parked();
+    assert_eq!(cx.mode(), Mode::Normal);
     cx.simulate_keystrokes("b o t h enter");
     cx.run_until_parked();
     let saved = cx.update_editor(|editor, _window, cx| editor.saved_review_comments(cx));
@@ -3531,8 +3546,12 @@ async fn test_review_comment_mode(cx: &mut gpui::TestAppContext) {
     cx.simulate_keystrokes("cmd-alt-c");
     cx.run_until_parked();
     cx.update_editor(|editor, _window, _cx| assert!(!editor.comment_mode()));
-    cx.simulate_keystrokes("g g i X escape");
+    cx.simulate_keystrokes("g g 0 i X escape");
     cx.run_until_parked();
     cx.update_editor(|editor, _window, cx| assert_eq!(editor.text(cx), "Xone\ntwo\nthree\n"));
     assert_eq!(cx.mode(), Mode::Normal);
+    // `g c` is still Vim's code-comment toggle.
+    cx.simulate_keystrokes("g c c");
+    cx.run_until_parked();
+    cx.update_editor(|editor, _window, cx| assert_eq!(editor.text(cx), "// Xone\ntwo\nthree\n"));
 }

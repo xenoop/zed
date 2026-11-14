@@ -1151,6 +1151,16 @@ impl Vim {
         match event {
             EditorEvent::Focused => self.focused(true, window, cx),
             EditorEvent::Blurred => self.blurred(window, cx),
+            // The comment is written in its own box: the code should be in
+            // normal mode when the user comes back to it, whichever mode the
+            // comment was started from.
+            // The mode indicator shows comment mode.
+            EditorEvent::CommentModeChanged => cx.notify(),
+            EditorEvent::ReviewCommentBoxOpened => {
+                if self.mode != Mode::Normal && self.mode != Mode::HelixNormal {
+                    self.switch_mode(Mode::Normal, false, window, cx);
+                }
+            }
             EditorEvent::SelectionsChanged { local: true } => {
                 self.local_selections_changed(window, cx);
             }

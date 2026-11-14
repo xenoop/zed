@@ -12727,6 +12727,11 @@ impl Deref for EditorSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditorEvent {
+    /// Emitted when a review comment box opens and takes the keyboard focus
+    /// from the code.
+    ReviewCommentBoxOpened,
+    /// Emitted when comment mode is switched on or off.
+    CommentModeChanged,
     /// Emitted when the stored review comments change (added, removed, or updated).
     ReviewCommentsChanged {
         /// The new total count of review comments.
