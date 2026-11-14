@@ -3797,6 +3797,11 @@ impl AgentPanel {
             return Task::ready(Err(anyhow!("There is no thread to send from")));
         };
         let message = crate::thread_fork::thread_message(title.as_deref(), &last_reply);
+        if let ReplyTarget::Thread(thread_id) = &target
+            && self.conversation_view_for_thread(*thread_id, cx).is_none()
+        {
+            return self.send_to_unloaded_thread(*thread_id, message, window, cx);
+        }
         let (result, target_name) = match target {
             ReplyTarget::Thread(thread_id) => {
                 let name = self
@@ -3829,6 +3834,153 @@ impl AgentPanel {
             });
         }
         Task::ready(result)
+    }
+
+    /// This project's other threads that are not archived, loaded or not,
+    /// as places to send a reply to.
+    fn other_project_threads(&self, cx: &App) -> Vec<(ThreadId, SharedString)> {
+        let active_thread_id = self
+            .active_conversation_view()
+            .map(|view| view.read(cx).thread_id);
+        let mut threads: Vec<(ThreadId, SharedString)> = self
+            .retained_threads
+            .iter()
+            .map(|(thread_id, view)| (*thread_id, view.read(cx).title(cx)))
+            .collect();
+        if let Some(store) = ThreadMetadataStore::try_global(cx) {
+            let project = self.project.read(cx);
+            let folder_paths = project.worktree_paths(cx).folder_path_list().clone();
+            let stored = store
+                .read(cx)
+                .entries_for_path(&folder_paths, project.remote_connection_options(cx))
+                .filter(|metadata| !metadata.is_draft())
+                .map(|metadata| (metadata.thread_id, metadata.display_title()))
+                .collect::<Vec<_>>();
+            for (thread_id, title) in stored {
+                if !threads.iter().any(|(loaded, _)| *loaded == thread_id) {
+                    threads.push((thread_id, title));
+                }
+            }
+        }
+        threads.retain(|(thread_id, _)| Some(*thread_id) != active_thread_id);
+        threads.sort_by(|left, right| left.1.cmp(&right.1));
+        threads
+    }
+
+    /// Sends `message` to a thread of this project that is not loaded: the
+    /// panel loads it, hands it the message once its agent is connected,
+    /// and then shows the sending thread again.
+    fn send_to_unloaded_thread(
+        &mut self,
+        thread_id: ThreadId,
+        message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(sender_id) = self
+            .active_conversation_view()
+            .map(|view| view.read(cx).thread_id)
+        else {
+            return Task::ready(Err(anyhow!("There is no thread to send from")));
+        };
+        let metadata = ThreadMetadataStore::try_global(cx)
+            .and_then(|store| store.read(cx).entry(thread_id).cloned());
+        let Some(metadata) = metadata else {
+            return Task::ready(Err(anyhow!(
+                "That thread is not open and could not be found to load it."
+            )));
+        };
+        let target_name = metadata.display_title();
+        self.load_agent_thread(
+            Agent::from(metadata.agent_id.clone()),
+            thread_id,
+            Some(metadata.folder_paths().clone()),
+            metadata.title.clone(),
+            false,
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
+        self.deliver_when_loaded(thread_id, sender_id, target_name, message, window, cx)
+    }
+
+    /// Once the thread `thread_id` (being loaded, and shown meanwhile) is
+    /// connected to its agent: hands it `message`, shows the sending thread
+    /// again and notes the send there. A thread that fails to load gets
+    /// nothing, and the error says so.
+    fn deliver_when_loaded(
+        &mut self,
+        thread_id: ThreadId,
+        sender_id: ThreadId,
+        target_name: SharedString,
+        message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        const LOAD_TIMEOUT: Duration = Duration::from_secs(60);
+        const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+        cx.spawn_in(window, async move |this, cx| {
+            let started = std::time::Instant::now();
+            let failure = loop {
+                let (ready, failed) = this.read_with(cx, |panel, cx| {
+                    let view = panel.conversation_view_for_thread(thread_id, cx);
+                    (
+                        view.as_ref()
+                            .is_some_and(|view| view.read(cx).active_thread().is_some()),
+                        view.is_none_or(|view| view.read(cx).load_failed()),
+                    )
+                })?;
+                if ready {
+                    break None;
+                }
+                if failed {
+                    break Some(format!(
+                        "{target_name} could not be loaded, so nothing was sent."
+                    ));
+                }
+                if started.elapsed() > LOAD_TIMEOUT {
+                    break Some(format!(
+                        "{target_name} did not load within a minute, so nothing was sent."
+                    ));
+                }
+                cx.background_executor().timer(POLL_INTERVAL).await;
+            };
+            this.update_in(cx, |panel, window, cx| {
+                let result = match failure {
+                    None => panel.deliver_message(Some(thread_id), message, window, cx),
+                    Some(failure) => Err(anyhow!(failure)),
+                };
+                // Back to the thread the reply was sent from.
+                if panel.retained_threads.contains_key(&sender_id) {
+                    panel.activate_retained_thread(sender_id, false, window, cx);
+                }
+                let sender_is_active = panel
+                    .active_conversation_view()
+                    .is_some_and(|view| view.read(cx).thread_id == sender_id);
+                if result.is_ok() && sender_is_active {
+                    panel.record_sent_note(target_name.clone(), cx);
+                }
+                if result.is_ok()
+                    && let Some(workspace) = panel.workspace.upgrade()
+                {
+                    workspace.update(cx, |workspace, cx| {
+                        struct ReplySentToUnloadedToast;
+                        workspace.show_toast(
+                            workspace::Toast::new(
+                                workspace::notifications::NotificationId::unique::<
+                                    ReplySentToUnloadedToast,
+                                >(),
+                                format!("Sent the last reply to {target_name}"),
+                            )
+                            .autohide(),
+                            cx,
+                        );
+                    });
+                }
+                result
+            })?
+        })
     }
 
     /// Starts a thread, in this working tree, that lands the active
@@ -3918,13 +4070,7 @@ impl AgentPanel {
         let active_thread_id = self
             .active_conversation_view()
             .map(|view| view.read(cx).thread_id);
-        let other_threads: Vec<(ThreadId, SharedString)> = self
-            .retained_threads
-            .iter()
-            .filter(|(thread_id, _)| Some(**thread_id) != active_thread_id)
-            .map(|(thread_id, view)| (*thread_id, view.read(cx).title(cx)))
-            .sorted_by(|left, right| left.1.cmp(&right.1))
-            .collect();
+        let other_threads = self.other_project_threads(cx);
         let has_active_thread = active_thread_id.is_some();
         PopoverMenu::new("thread-forks-menu")
             .trigger_with_tooltip(
@@ -16206,7 +16352,10 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("not open"), "{error:#}");
+        assert!(
+            error.to_string().contains("could not be found"),
+            "{error:#}"
+        );
 
         // Each send that went through is noted in the sender's transcript,
         // under the entry that was sent; the refused one is not.
@@ -16228,5 +16377,145 @@ mod tests {
         });
         assert_eq!(notes.len(), 2, "{notes:?}");
         assert_eq!(notes[0], "the thread this one lands changes for");
+    }
+
+    #[gpui::test]
+    async fn test_send_last_reply_to_a_thread_that_is_not_loaded(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = crate::test_support::set_stub_agent_connection(
+            StubAgentConnection::new().with_supports_load_session(true),
+        );
+        panel.update(&mut cx, |panel, _| panel.selected_agent = Agent::Stub);
+
+        // Two threads that each finished a turn.
+        let open_finished_thread = |cx: &mut VisualTestContext| {
+            panel.update_in(cx, |panel, window, cx| {
+                let thread_id = panel.create_thread_with_options(
+                    CreateThreadOptions::default(),
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                );
+                panel.activate_retained_thread(thread_id, false, window, cx);
+            });
+            cx.run_until_parked();
+            let thread_id = active_thread_id(&panel, cx);
+            // The stub answers and ends the turn at once.
+            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new("done".into()),
+            )]);
+            send_message(&panel, cx);
+            cx.run_until_parked();
+            thread_id
+        };
+        let first_thread = open_finished_thread(&mut cx);
+        let second_thread = open_finished_thread(&mut cx);
+        assert_ne!(first_thread, second_thread);
+
+        // The first thread is dropped from memory, as the panel does with
+        // idle threads beyond its limit.
+        panel.update(&mut cx, |panel, _| {
+            panel.retained_threads.remove(&first_thread);
+        });
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            assert!(!panel.retained_threads.contains_key(&first_thread));
+            assert_eq!(panel.active_thread_id(cx), Some(second_thread));
+            // It is still offered as a place to send a reply to.
+            assert!(
+                panel
+                    .other_project_threads(cx)
+                    .iter()
+                    .any(|(thread_id, _)| *thread_id == first_thread)
+            );
+        });
+
+        // The test agent cannot reload a session, so loading the first
+        // thread fails: the send is refused at once, nothing is noted, and
+        // the panel shows the sending thread again.
+        let error = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.send_last_reply_to(ReplyTarget::Thread(first_thread), window, cx)
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("could not be loaded"),
+            "{error:#}"
+        );
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.active_thread_id(cx), Some(second_thread));
+            assert!(
+                panel
+                    .active_thread_view(cx)
+                    .unwrap()
+                    .read(cx)
+                    .sent_notes()
+                    .is_empty()
+            );
+        });
+
+        // Once a thread has loaded, the panel is showing it and the sender
+        // is kept in the background. From that state the message is
+        // delivered, the sender shown again, and the send noted there.
+        let third_thread = open_finished_thread(&mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.activate_retained_thread(second_thread, false, window, cx);
+            panel.activate_retained_thread(third_thread, false, window, cx);
+        });
+        cx.run_until_parked();
+        let message = crate::thread_fork::thread_message(Some("Second"), "a finding");
+        panel
+            .update_in(&mut cx, |panel, window, cx| {
+                assert_eq!(panel.active_thread_id(cx), Some(third_thread));
+                panel.deliver_when_loaded(
+                    third_thread,
+                    second_thread,
+                    "Third".into(),
+                    message.clone(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(panel.active_thread_id(cx), Some(second_thread));
+            // The test agent's turn never ends, so the receiving thread is
+            // busy and holds the message in its queue; an idle one sends it
+            // (see test_messages_between_threads_are_sent_or_queued).
+            let receiving_view = panel
+                .retained_threads
+                .get(&third_thread)
+                .expect("the receiving thread should stay loaded")
+                .read(cx)
+                .active_thread()
+                .unwrap()
+                .clone();
+            assert_eq!(receiving_view.read(cx).message_queue.len(), 1);
+            let notes = panel
+                .active_thread_view(cx)
+                .unwrap()
+                .read(cx)
+                .sent_notes()
+                .iter()
+                .map(|(_, target)| target.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(notes, vec!["Third".to_string()]);
+        });
+
+        // A thread that does not exist is refused, and nothing is sent.
+        let error = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.send_last_reply_to(ReplyTarget::Thread(ThreadId::new()), window, cx)
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("could not be found"),
+            "{error:#}"
+        );
     }
 }

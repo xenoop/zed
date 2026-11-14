@@ -1919,6 +1919,11 @@ impl ConversationView {
         matches!(self.server_state, ServerState::Loading { .. })
     }
 
+    /// Whether connecting the thread to its agent failed.
+    pub(crate) fn load_failed(&self) -> bool {
+        matches!(self.server_state, ServerState::LoadError { .. })
+    }
+
     fn send_queued_after_confirmed_idle(
         &mut self,
         window: &mut Window,
