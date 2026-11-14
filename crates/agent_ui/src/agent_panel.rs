@@ -3731,7 +3731,11 @@ impl AgentPanel {
         if let Some(parent_thread_id) =
             active_thread_id.and_then(|thread_id| crate::thread_fork::land_parent(thread_id, cx))
         {
-            return Task::ready(self.send_to_thread(parent_thread_id, message, window, cx));
+            let result = self.send_to_thread(parent_thread_id, message, window, cx);
+            if result.is_ok() {
+                self.record_sent_note("the thread this one lands changes for", cx);
+            }
+            return Task::ready(result);
         }
         let record = self
             .working_tree_path(cx)
@@ -3739,13 +3743,28 @@ impl AgentPanel {
         let Some(record) = record else {
             return Task::ready(Err(anyhow!("This thread has no parent thread")));
         };
-        Task::ready(self.deliver_to_working_tree(
+        let result = self.deliver_to_working_tree(
             &record.parent_path,
             record.parent_thread_id,
             message,
             window,
             cx,
-        ))
+        );
+        if result.is_ok() {
+            self.record_sent_note("the thread this one was forked from", cx);
+        }
+        Task::ready(result)
+    }
+
+    /// Notes in the active thread's transcript that its last reply was
+    /// sent on.
+    fn record_sent_note(&mut self, target: impl Into<SharedString>, cx: &mut Context<Self>) {
+        if let Some(thread_view) = self.active_thread_view(cx) {
+            let target = target.into();
+            thread_view.update(cx, |thread_view, cx| {
+                thread_view.record_sent_note(target, cx)
+            });
+        }
     }
 
     /// Hands a message to a thread this panel has loaded. Unlike
@@ -3791,6 +3810,9 @@ impl AgentPanel {
                 path,
             ),
         };
+        if result.is_ok() {
+            self.record_sent_note(target_name.clone(), cx);
+        }
         if result.is_ok()
             && let Some(workspace) = self.workspace.upgrade()
         {
@@ -16185,5 +16207,26 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("not open"), "{error:#}");
+
+        // Each send that went through is noted in the sender's transcript,
+        // under the entry that was sent; the refused one is not.
+        let notes = panel.read_with(&cx, |panel, cx| {
+            let thread_view = panel.active_thread_view(cx).unwrap();
+            let thread_view = thread_view.read(cx);
+            let last_entry = thread_view.thread.read(cx).entries().len() - 1;
+            assert!(
+                thread_view
+                    .sent_notes()
+                    .iter()
+                    .all(|(entry, _)| *entry <= last_entry)
+            );
+            thread_view
+                .sent_notes()
+                .iter()
+                .map(|(_, target)| target.to_string())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_eq!(notes[0], "the thread this one lands changes for");
     }
 }

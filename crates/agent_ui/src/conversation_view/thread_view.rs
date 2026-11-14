@@ -765,6 +765,11 @@ pub struct ThreadView {
     /// Questions asked from the editor (by the index of their user message)
     /// that the user expanded in the chat; the rest stay collapsed.
     expanded_editor_questions: HashSet<usize>,
+    /// Where this thread's last reply was sent on to another thread: the
+    /// index of the transcript entry the note follows, and who received it.
+    /// Kept only while the view lives; the agent's transcript has no place
+    /// for entries the agent did not see.
+    sent_notes: Vec<(usize, SharedString)>,
     /// Sandbox escalation prompts whose "surprising Unicode" warning the user
     /// has explicitly acknowledged. Until a prompt's tool call is in this set,
     /// its allow buttons stay disabled. See [`Self::sandbox_confusable_findings`].
@@ -1309,6 +1314,7 @@ impl ThreadView {
             should_be_following: false,
             editing_message: None,
             expanded_editor_questions: HashSet::default(),
+            sent_notes: Vec::new(),
             message_queue: MessageQueue::default(),
             turn_fields: TurnFields::default(),
             discarded_partial_edits: HashSet::default(),
@@ -7548,7 +7554,64 @@ impl ThreadView {
         .flex_grow_1()
     }
 
+    /// Notes below the transcript's current last entry that its reply was
+    /// sent on to `target`.
+    pub(crate) fn record_sent_note(
+        &mut self,
+        target: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let last_entry = self.thread.read(cx).entries().len().saturating_sub(1);
+        self.sent_notes.push((last_entry, target.into()));
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sent_notes(&self) -> &[(usize, SharedString)] {
+        &self.sent_notes
+    }
+
     fn render_entry(
+        &self,
+        entry_ix: usize,
+        total_entries: usize,
+        entry: &AgentThreadEntry,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let rendered = self.render_entry_or_question(entry_ix, total_entries, entry, window, cx);
+        let mut notes = self
+            .sent_notes
+            .iter()
+            .filter(|(note_ix, _)| *note_ix == entry_ix)
+            .peekable();
+        if notes.peek().is_none() {
+            return rendered;
+        }
+        v_flex()
+            .child(rendered)
+            .children(notes.map(|(_, target)| {
+                h_flex()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(IconName::ArrowUpRight)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(format!("Sent this reply to {target}"))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    )
+            }))
+            .into_any_element()
+    }
+
+    fn render_entry_or_question(
         &self,
         entry_ix: usize,
         total_entries: usize,
