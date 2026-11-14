@@ -3442,6 +3442,10 @@ async fn test_project_search_opens_in_normal_mode(cx: &mut gpui::TestAppContext)
 #[gpui::test]
 async fn test_review_comment_mode(cx: &mut gpui::TestAppContext) {
     let mut cx = VimTestContext::new(cx, true).await;
+    // Review comments are saved per repository in the database, which the
+    // tests of this crate share: keep this test's comments to itself, or the
+    // next test to open the same file would get them back.
+    cx.update(|_, cx| cx.set_global(db::AppDatabase::test_new()));
     cx.set_state("ˇone\ntwo\nthree\n", Mode::Normal);
     cx.update_editor(|editor, _window, cx| {
         editor.set_show_diff_review_button(true, cx);
