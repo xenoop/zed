@@ -6779,6 +6779,87 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_collapsed_question_turn_shows_pending_authorization(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        let finish_turn = connection.defer_next_prompt_response();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text(
+                &format!(
+                    "{INLINE_QUESTION_PREFIX}`a.rs` lines 1-1:\n\nWhy?\n\n{INLINE_QUESTION_SUFFIX}"
+                ),
+                window,
+                cx,
+            );
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let tool_call_id = acp_v1::ToolCallId::new("question-tool");
+        thread
+            .update(cx, |thread, cx| {
+                thread.upsert_tool_call(
+                    acp_v1::ToolCall::new(tool_call_id.clone(), "Run a command"),
+                    cx,
+                )
+            })
+            .expect("tool call should be added");
+        let _authorization = thread
+            .update(cx, |thread, cx| {
+                thread.request_tool_call_authorization(
+                    acp_v1::ToolCallUpdate::new(
+                        tool_call_id.clone(),
+                        acp_v1::ToolCallUpdateFields::new(),
+                    ),
+                    PermissionOptions::Flat(vec![acp_v2::PermissionOption::new(
+                        "allow",
+                        "Allow",
+                        acp_v2::PermissionOptionKind::AllowOnce,
+                    )]),
+                    acp_thread::AuthorizationKind::PermissionGrant,
+                    cx,
+                )
+            })
+            .expect("authorization should be requested");
+        cx.run_until_parked();
+
+        let hidden_entries = |cx: &mut VisualTestContext| {
+            thread_view.read_with(cx, |view, cx| {
+                let entries = view.thread.read(cx).entries();
+                assert!(matches!(entries[0], AgentThreadEntry::UserMessage(_)));
+                (1..entries.len())
+                    .filter(|ix| view.collapsed_turn_hides_entry(*ix, 0, &entries[*ix], cx))
+                    .count()
+            })
+        };
+        assert_eq!(hidden_entries(cx), 0);
+
+        thread.update(cx, |thread, cx| {
+            thread.authorize_tool_call(
+                acp_v2::ToolCallId::new(tool_call_id.0.clone()),
+                SelectedPermissionOutcome::new(
+                    acp_v2::PermissionOptionId::new("allow"),
+                    acp_v2::PermissionOptionKind::AllowOnce,
+                ),
+                cx,
+            );
+        });
+        finish_turn
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
+        assert!(hidden_entries(cx) > 0, "a finished turn should collapse");
+    }
+
+    #[gpui::test]
     async fn test_comment_on_transcript_passage(cx: &mut TestAppContext) {
         use crate::conversation_view::thread_view::{PASSAGE_COMMENT_PREFIX, PassageCommentState};
 

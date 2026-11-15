@@ -7750,10 +7750,10 @@ impl ThreadView {
         };
         let expanded = self.expanded_editor_questions.contains(&question_ix);
         if entry_ix != question_ix {
-            return if expanded {
-                self.render_entry_contents(entry_ix, total_entries, entry, window, cx)
-            } else {
+            return if self.collapsed_turn_hides_entry(entry_ix, question_ix, entry, cx) {
                 Empty.into_any_element()
+            } else {
+                self.render_entry_contents(entry_ix, total_entries, entry, window, cx)
             };
         }
         let header = self.render_editor_question_header(question_ix, summary, expanded, cx);
@@ -7764,6 +7764,35 @@ impl ThreadView {
             .child(header)
             .child(self.render_entry_contents(entry_ix, total_entries, entry, window, cx))
             .into_any_element()
+    }
+
+    /// Whether `entry` is hidden because the editor question at `question_ix`
+    /// that started its turn is collapsed. Entries the user must act on, and
+    /// every entry of a turn that is still running, stay visible so a
+    /// permission prompt can never be hidden.
+    pub(crate) fn collapsed_turn_hides_entry(
+        &self,
+        entry_ix: usize,
+        question_ix: usize,
+        entry: &AgentThreadEntry,
+        cx: &App,
+    ) -> bool {
+        if self.expanded_editor_questions.contains(&question_ix) {
+            return false;
+        }
+        if matches!(
+            entry,
+            AgentThreadEntry::ToolCall(call)
+                if call.status() == ToolCallStatus::WaitingForConfirmation
+        ) {
+            return false;
+        }
+        let thread = self.thread.read(cx);
+        let turn_is_last = !thread.entries().iter().skip(entry_ix + 1).any(
+            |later| matches!(later, AgentThreadEntry::UserMessage(message) if !message.indented),
+        );
+        let turn_is_running = turn_is_last && thread.status() == ThreadStatus::Generating;
+        !turn_is_running
     }
 
     /// The user message that starts the turn `entry_ix` belongs to, with a
