@@ -5075,6 +5075,11 @@ impl AgentPanel {
                 if connected {
                     return Ok(conversation_view);
                 }
+                if conversation_view.read_with(cx, |view, _| view.load_failed()) {
+                    return Err(anyhow!(
+                        "The agent failed to start; check the agent panel."
+                    ));
+                }
                 if started.elapsed() > AGENT_START_TIMEOUT {
                     return Err(anyhow!(
                         "The agent didn't start within a minute; check the agent panel."
