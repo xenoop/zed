@@ -3579,8 +3579,8 @@ impl AgentPanel {
             .cloned()
     }
 
-    /// Hands a message to one of this panel's threads: `thread_id` when it
-    /// is still loaded, otherwise the thread the panel shows.
+    /// Hands a message to one of this panel's threads: `thread_id` when
+    /// given, which must be loaded, otherwise the thread the panel shows.
     pub(crate) fn deliver_message(
         &mut self,
         thread_id: Option<ThreadId>,
@@ -3588,10 +3588,15 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
-        let conversation_view = thread_id
-            .and_then(|thread_id| self.conversation_view_for_thread(thread_id, cx))
-            .or_else(|| self.active_conversation_view().cloned())
-            .context("That workspace has no thread to receive the message")?;
+        let conversation_view = match thread_id {
+            Some(thread_id) => self
+                .conversation_view_for_thread(thread_id, cx)
+                .context("The thread to receive the message is not open in that workspace")?,
+            None => self
+                .active_conversation_view()
+                .cloned()
+                .context("That workspace has no thread to receive the message")?,
+        };
         let thread_view = conversation_view
             .read(cx)
             .active_thread()
@@ -16277,6 +16282,25 @@ mod tests {
         finish_first
             .send(Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)))
             .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            user_message_texts(&panel, &cx),
+            vec![first.clone(), second.clone()]
+        );
+
+        // A thread that is not loaded gets nothing, and the thread on show
+        // does not take its place.
+        let error = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.deliver_message(
+                    Some(ThreadId::new()),
+                    "for someone else".to_string(),
+                    window,
+                    cx,
+                )
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("not open"), "{error:#}");
         cx.run_until_parked();
         assert_eq!(user_message_texts(&panel, &cx), vec![first, second]);
     }
