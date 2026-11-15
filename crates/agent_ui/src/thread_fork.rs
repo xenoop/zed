@@ -820,18 +820,18 @@ async fn merge_into_parent_exclusively(
 
     let parent_sha = snapshot(project, &record.parent_path, cx).await?;
     // `merge-tree` exits with 1 when there are conflicts; the tree it prints
-    // then holds the conflict markers.
+    // first then holds the conflict markers. With `--name-only` the tree is
+    // followed by the conflicted paths, up to the first blank line.
     let script = format!(
         "cd {parent} && \
-         merged=$(git merge-tree --write-tree --merge-base={merge_base} {parent_sha} {fork_sha}); \
+         merged=$(git -c core.quotePath=false merge-tree --write-tree --name-only --merge-base={merge_base} {parent_sha} {fork_sha}); \
          status=$?; [ $status -le 1 ] || exit $status; \
          tree=$(printf '%s\\n' \"$merged\" | head -n 1) && \
          patch=$(mktemp) && \
          git diff --binary {parent_sha} \"$tree\" > \"$patch\" && \
-         git diff --name-only {parent_sha} \"$tree\" && \
+         git -c core.quotePath=false diff --name-only {parent_sha} \"$tree\" && \
          echo '--conflicts--' && \
-         (git diff --name-only --diff-filter=U {parent_sha} \"$tree\"; \
-          [ $status -eq 1 ] && printf '%s\\n' \"$merged\" | sed -n 's/^CONFLICT.* in \\(.*\\)$/\\1/p'; true) && \
+         printf '%s\\n' \"$merged\" | awk 'NR > 1 {{ if ($0 == \"\") exit; print }}' && \
          if [ -s \"$patch\" ]; then git apply --whitespace=nowarn \"$patch\"; fi; \
          applied=$?; rm -f \"$patch\"; exit $applied"
     );
@@ -1411,10 +1411,13 @@ mod tests {
         init_test(cx);
         let fixture = Fixture::new(cx).await;
         let parent = fixture.parent.clone();
+        // A name that git would quote when printing it.
+        let name = "my fïle.txt";
+        std::fs::write(parent.join(name), "base\n").unwrap();
         let record = fixture.fork("fork-conflict", cx).await;
         let fork = Path::new(&record.fork_path).to_path_buf();
-        std::fs::write(fork.join("b.txt"), "from fork\n").unwrap();
-        std::fs::write(parent.join("b.txt"), "from parent\n").unwrap();
+        std::fs::write(fork.join(name), "from fork\n").unwrap();
+        std::fs::write(parent.join(name), "from parent\n").unwrap();
 
         let mut async_cx = cx.to_async();
         let (_, outcome) = merge_into_parent(&fixture.project, record, &mut async_cx)
@@ -1423,13 +1426,41 @@ mod tests {
         assert_eq!(
             outcome,
             MergeOutcome::Merged {
-                changed_files: vec!["b.txt".to_string()],
-                conflicted_files: vec!["b.txt".to_string()],
+                changed_files: vec![name.to_string()],
+                conflicted_files: vec![name.to_string()],
             }
         );
-        let merged = std::fs::read_to_string(parent.join("b.txt")).unwrap();
+        let merged = std::fs::read_to_string(parent.join(name)).unwrap();
         assert!(merged.contains("<<<<<<<"), "{merged}");
         assert!(merged.contains("from fork") && merged.contains("from parent"));
+    }
+
+    #[gpui::test]
+    async fn test_modify_delete_conflict_is_listed(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fixture = Fixture::new(cx).await;
+        let parent = fixture.parent.clone();
+        let record = fixture.fork("fork-delete", cx).await;
+        let fork = Path::new(&record.fork_path).to_path_buf();
+        std::fs::remove_file(fork.join("b.txt")).unwrap();
+        std::fs::write(parent.join("b.txt"), "alpha edited in parent\n").unwrap();
+
+        let mut async_cx = cx.to_async();
+        let (_, outcome) = merge_into_parent(&fixture.project, record, &mut async_cx)
+            .await
+            .unwrap();
+        let MergeOutcome::Merged {
+            conflicted_files, ..
+        } = outcome
+        else {
+            panic!("expected a merge, got {outcome:?}");
+        };
+        assert_eq!(conflicted_files, vec!["b.txt".to_string()]);
+        // The parent's edit is what stays.
+        assert_eq!(
+            std::fs::read_to_string(parent.join("b.txt")).unwrap(),
+            "alpha edited in parent\n"
+        );
     }
 
     #[cfg(unix)]
