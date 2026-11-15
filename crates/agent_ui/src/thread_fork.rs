@@ -593,13 +593,16 @@ fn quote(text: &str) -> String {
 }
 
 /// Runs a POSIX shell script in the project's environment (local or remote)
-/// and returns its standard output, trimmed.
+/// and returns its standard output, trimmed. The user's shell may not be
+/// POSIX (fish, nushell), so the script always runs under `sh`.
 async fn run_script(
     project: &Entity<Project>,
     script: String,
     cx: &mut AsyncApp,
 ) -> Result<String> {
-    let command = project.update(cx, |project, cx| project.exec_in_shell(script, cx));
+    let command = project.update(cx, |project, cx| {
+        project.exec_in_shell(format!("sh -c {}", quote(&script)), cx)
+    });
     let output = command.await?.output().await?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() {
