@@ -7,8 +7,9 @@
 //! result is applied to the parent's files as a patch.
 
 use anyhow::{Context as _, Result, anyhow};
+use collections::HashSet;
 use db::kvp::KeyValueStore;
-use gpui::{App, AsyncApp, Entity};
+use gpui::{App, AsyncApp, Entity, Global};
 use project::Project;
 use serde::{Deserialize, Serialize};
 use util::ResultExt as _;
@@ -613,6 +614,35 @@ pub(crate) enum MergeOutcome {
 /// gets conflict markers. The parent's `HEAD` and index stay as they are.
 pub(crate) async fn merge_into_parent(
     project: &Entity<Project>,
+    record: ForkRecord,
+    cx: &mut AsyncApp,
+) -> Result<(ForkRecord, MergeOutcome)> {
+    let parent_path = record.parent_path.clone();
+    let acquired = cx.update(|cx| {
+        cx.default_global::<MergesRunning>()
+            .0
+            .insert(parent_path.clone())
+    });
+    anyhow::ensure!(
+        acquired,
+        "A merge into this working tree is already running"
+    );
+    let result = merge_into_parent_exclusively(project, record, cx).await;
+    cx.update(|cx| {
+        cx.default_global::<MergesRunning>().0.remove(&parent_path);
+    });
+    result
+}
+
+/// The working trees that a merge is running into. Two merges applying
+/// patches to one working tree at once would trample each other.
+#[derive(Default)]
+struct MergesRunning(HashSet<String>);
+
+impl Global for MergesRunning {}
+
+async fn merge_into_parent_exclusively(
+    project: &Entity<Project>,
     mut record: ForkRecord,
     cx: &mut AsyncApp,
 ) -> Result<(ForkRecord, MergeOutcome)> {
@@ -666,9 +696,14 @@ pub(crate) async fn merge_into_parent(
         lines
     };
 
-    record.merged_sha = Some(fork_sha);
-    let updated = record.clone();
-    cx.update(|cx| upsert_record(updated, cx));
+    // The merge took a while: the record may have changed meanwhile (a
+    // review verdict, say), and only the merge point is this function's.
+    record = cx.update(|cx| {
+        let mut current = record_for_fork(&record.fork_path, cx).unwrap_or(record);
+        current.merged_sha = Some(fork_sha);
+        upsert_record(current.clone(), cx);
+        current
+    });
     Ok((
         record,
         MergeOutcome::Merged {
@@ -830,6 +865,58 @@ mod tests {
             cx.run_until_parked();
             record
         }
+    }
+
+    #[gpui::test]
+    async fn test_merge_keeps_changes_made_to_the_record_meanwhile(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fixture = Fixture::new(cx).await;
+        let stale_record = fixture.fork("fork-verdict", cx).await;
+        std::fs::write(Path::new(&stale_record.fork_path).join("new.txt"), "x\n").unwrap();
+
+        let mut with_verdict = stale_record.clone();
+        with_verdict.verdict = Some(ReviewVerdict::Approved);
+        cx.update(|cx| upsert_record(with_verdict, cx));
+
+        let mut async_cx = cx.to_async();
+        let (returned, _) =
+            merge_into_parent(&fixture.project, stale_record.clone(), &mut async_cx)
+                .await
+                .unwrap();
+        assert_eq!(returned.verdict, Some(ReviewVerdict::Approved));
+        let stored = cx
+            .update(|cx| record_for_fork(&stale_record.fork_path, cx))
+            .unwrap();
+        assert_eq!(stored.verdict, Some(ReviewVerdict::Approved));
+        assert!(stored.merged_sha.is_some());
+    }
+
+    #[gpui::test]
+    async fn test_only_one_merge_into_a_working_tree_runs_at_a_time(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fixture = Fixture::new(cx).await;
+        let record = fixture.fork("fork-busy", cx).await;
+        let parent_path = fixture.parent_path();
+        cx.update(|cx| {
+            cx.default_global::<MergesRunning>()
+                .0
+                .insert(parent_path.clone());
+        });
+
+        let mut async_cx = cx.to_async();
+        let error = merge_into_parent(&fixture.project, record.clone(), &mut async_cx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already running"), "{error:#}");
+
+        cx.update(|cx| {
+            cx.default_global::<MergesRunning>().0.remove(&parent_path);
+        });
+        merge_into_parent(&fixture.project, record, &mut async_cx)
+            .await
+            .unwrap();
+        let still_running = cx.update(|cx| cx.default_global::<MergesRunning>().0.len());
+        assert_eq!(still_running, 0);
     }
 
     #[gpui::test]
