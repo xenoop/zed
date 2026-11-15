@@ -6860,6 +6860,56 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_agent_command_takes_precedence_over_zed_slash_command(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+        let user_message_count = |cx: &mut VisualTestContext| {
+            thread_view.read_with(cx, |view, cx| {
+                view.thread
+                    .read(cx)
+                    .entries()
+                    .iter()
+                    .filter(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+                    .count()
+            })
+        };
+
+        // Without an agent command of that name, Zed's own command runs.
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("/review", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert_eq!(user_message_count(cx), 0);
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "",
+            "Zed's command is taken out of the message box"
+        );
+
+        // With one, the message goes to the agent.
+        thread_view.update(cx, |view, _| {
+            view.session_capabilities
+                .write()
+                .set_available_commands(vec![acp_v2::AvailableCommand::Command(
+                    acp_v2::Command::new("review", "Review the changes"),
+                )]);
+        });
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("/review", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert_eq!(user_message_count(cx), 1);
+    }
+
+    #[gpui::test]
     async fn test_comment_on_transcript_passage(cx: &mut TestAppContext) {
         use crate::conversation_view::thread_view::{PASSAGE_COMMENT_PREFIX, PassageCommentState};
 

@@ -2243,7 +2243,17 @@ impl ThreadView {
 
         let text = message_editor.read(cx).text(cx);
         let text = text.trim();
-        if let Some(action) = crate::thread_fork::slash_command_action(text) {
+        // An agent's own command of the same name (such as `/review`) wins.
+        let agent_has_command = |name: &str| {
+            self.session_capabilities
+                .read()
+                .available_commands()
+                .iter()
+                .any(|available_command| available_command.name() == name)
+        };
+        if let Some(action) = crate::thread_fork::slash_command_action(text)
+            && !agent_has_command(text.trim_start_matches('/'))
+        {
             message_editor.update(cx, |editor, cx| editor.clear(window, cx));
             window.dispatch_action(action, cx);
             return;
