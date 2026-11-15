@@ -3429,96 +3429,112 @@ impl AgentPanel {
 
         cx.spawn_in(window, async move |_, cx| {
             thread_fork::ensure_room_for_fork(&project, &parent_path, cx).await?;
-            let base_sha = thread_fork::snapshot(&project, &parent_path, cx).await?;
-            let id = thread_fork::new_fork_id();
-            thread_fork::pin_commit(
-                &project,
-                &parent_path,
-                &thread_fork::fork_ref(&id, "base"),
-                &base_sha,
-                cx,
-            )
-            .await?;
+            let reserved_path = parent_path.clone();
+            let result: Result<()> = async {
+                let base_sha = thread_fork::snapshot(&project, &parent_path, cx).await?;
+                let id = thread_fork::new_fork_id();
+                thread_fork::pin_commit(
+                    &project,
+                    &parent_path,
+                    &thread_fork::fork_ref(&id, "base"),
+                    &base_sha,
+                    cx,
+                )
+                .await?;
 
-            let action = zed_actions::CreateWorktree {
-                worktree_name: None,
-                branch_target: zed_actions::NewWorktreeBranchTarget::ExistingBranch {
-                    name: base_sha.clone(),
-                },
-            };
-            let created = workspace
-                .update_in(cx, |workspace, window, cx| {
-                    git_ui_core::worktree_service::create_worktree_workspace(
-                        workspace, &action, window, None, cx,
-                    )
-                })?
-                .await
-                .context("could not create the fork's worktree");
-            let created = match created {
-                Ok(created) => created,
-                Err(error) => {
-                    thread_fork::unpin_fork_commits(&project, &parent_path, &id, cx)
-                        .await
-                        .log_err();
-                    return Err(error);
-                }
-            };
-            let fork_workspace = created.workspace;
-            let fork_path = fork_workspace
-                .read_with(cx, |workspace, cx| {
+                let action = zed_actions::CreateWorktree {
+                    worktree_name: None,
+                    branch_target: zed_actions::NewWorktreeBranchTarget::ExistingBranch {
+                        name: base_sha.clone(),
+                    },
+                };
+                let created = workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        git_ui_core::worktree_service::create_worktree_workspace(
+                            workspace, &action, window, None, cx,
+                        )
+                    })?
+                    .await
+                    .context("could not create the fork's worktree");
+                let created = match created {
+                    Ok(created) => created,
+                    Err(error) => {
+                        thread_fork::unpin_fork_commits(&project, &parent_path, &id, cx)
+                            .await
+                            .log_err();
+                        return Err(error);
+                    }
+                };
+                let fork_workspace = created.workspace;
+                let workspace_path = fork_workspace.read_with(cx, |workspace, cx| {
                     workspace
                         .project()
                         .read(cx)
                         .visible_worktrees(cx)
                         .next()
                         .map(|worktree| worktree.read(cx).abs_path().to_string_lossy().to_string())
-                })
-                .context("the fork's workspace has no folder")?;
-            let record = ForkRecord {
-                id,
-                fork_path,
-                parent_path,
-                base_sha,
-                merged_sha: None,
-                kind: kind.clone(),
-                parent_title: parent_title.clone(),
-                verdict: None,
-                parent_thread_id,
-            };
-            cx.update(|_, cx| thread_fork::upsert_record(record, cx))?;
+                });
+                // The worktree exists on disk either way, so it must be recorded
+                // to be counted and removable.
+                let fork_path = match workspace_path {
+                    Some(path) => path,
+                    None => {
+                        thread_fork::unrecorded_worktree_at(&project, &parent_path, &base_sha, cx)
+                            .await?
+                            .context("the fork's workspace has no folder")?
+                    }
+                };
+                let record = ForkRecord {
+                    id,
+                    fork_path,
+                    parent_path,
+                    base_sha,
+                    merged_sha: None,
+                    kind: kind.clone(),
+                    parent_title: parent_title.clone(),
+                    verdict: None,
+                    parent_thread_id,
+                };
+                cx.update(|_, cx| thread_fork::upsert_record(record, cx))?;
 
-            let panel = fork_workspace
-                .read_with(cx, |workspace, cx| workspace.panel::<AgentPanel>(cx))
-                .context("the fork's workspace has no agent panel")?;
-            let title = thread_fork::fork_thread_title(&kind, parent_title.as_deref());
-            let message = thread_fork::first_message(&kind, parent_title.as_deref(), &transcript);
-            let options = CreateThreadOptions {
-                title: Some(title.into()),
-                initial_content: Some(AgentInitialContent::ContentBlock {
-                    blocks: vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
-                        message,
-                    ))],
-                    auto_submit: true,
-                }),
-                agent: Some(agent),
-                model: None,
-                work_dirs: None,
-            };
-            panel.update_in(cx, |panel, window, cx| {
-                let thread_id = panel.create_thread_with_options(
-                    options,
-                    AgentThreadSource::AgentPanel,
-                    window,
-                    cx,
-                );
-                panel.activate_retained_thread(thread_id, true, window, cx);
-            })?;
-            if let Some(multi_workspace) = multi_workspace {
-                multi_workspace.update(cx, |multi_workspace, window, cx| {
-                    multi_workspace.activate(fork_workspace.clone(), None, window, cx);
+                let panel = fork_workspace
+                    .read_with(cx, |workspace, cx| workspace.panel::<AgentPanel>(cx))
+                    .context("the fork's workspace has no agent panel")?;
+                let title = thread_fork::fork_thread_title(&kind, parent_title.as_deref());
+                let message =
+                    thread_fork::first_message(&kind, parent_title.as_deref(), &transcript);
+                let options = CreateThreadOptions {
+                    title: Some(title.into()),
+                    initial_content: Some(AgentInitialContent::ContentBlock {
+                        blocks: vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                            message,
+                        ))],
+                        auto_submit: true,
+                    }),
+                    agent: Some(agent),
+                    model: None,
+                    work_dirs: None,
+                };
+                panel.update_in(cx, |panel, window, cx| {
+                    let thread_id = panel.create_thread_with_options(
+                        options,
+                        AgentThreadSource::AgentPanel,
+                        window,
+                        cx,
+                    );
+                    panel.activate_retained_thread(thread_id, true, window, cx);
                 })?;
+                if let Some(multi_workspace) = multi_workspace {
+                    multi_workspace.update(cx, |multi_workspace, window, cx| {
+                        multi_workspace.activate(fork_workspace.clone(), None, window, cx);
+                    })?;
+                }
+                Ok(())
             }
-            Ok(())
+            .await;
+            cx.update(|_, cx| thread_fork::release_fork_place(&reserved_path, cx))
+                .log_err();
+            result
         })
     }
 

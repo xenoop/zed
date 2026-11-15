@@ -7,7 +7,7 @@
 //! result is applied to the parent's files as a patch.
 
 use anyhow::{Context as _, Result, anyhow};
-use collections::HashSet;
+use collections::{HashMap, HashSet};
 use db::kvp::KeyValueStore;
 use gpui::{App, AsyncApp, Entity, Global};
 use project::Project;
@@ -709,6 +709,39 @@ pub(crate) async fn live_worktree_paths(
         .collect())
 }
 
+/// The linked worktree of the repository that is detached at `sha` and has no
+/// record: where a fork lives when its workspace could not say.
+pub(crate) async fn unrecorded_worktree_at(
+    project: &Entity<Project>,
+    parent_path: &str,
+    sha: &str,
+    cx: &mut AsyncApp,
+) -> Result<Option<String>> {
+    let script = format!("cd {} && git worktree list --porcelain", quote(parent_path));
+    let listing = run_script(project, script, cx).await?;
+    let recorded: HashSet<String> = cx.update(|cx| {
+        load_records(cx)
+            .into_iter()
+            .map(|record| record.fork_path)
+            .collect()
+    });
+    let parent_path = normalize_path(parent_path);
+    Ok(listing
+        .split("\n\n")
+        .filter(|entry| {
+            entry
+                .lines()
+                .any(|line| line.strip_prefix("HEAD ") == Some(sha))
+        })
+        .filter_map(|entry| {
+            entry
+                .lines()
+                .find_map(|line| line.strip_prefix("worktree "))
+        })
+        .map(normalize_path)
+        .find(|path| *path != parent_path && !recorded.contains(path)))
+}
+
 /// Drops records whose fork directory is no longer a worktree of the
 /// repository, and returns the live forks of `parent_path`.
 pub(crate) async fn live_forks(
@@ -736,19 +769,49 @@ pub(crate) async fn live_forks(
         .collect())
 }
 
-/// Refuses a new fork once [`MAX_LIVE_FORKS`] of the working tree exist.
+/// The forks being created per working tree: they have no record yet, so
+/// two quick forks would otherwise both pass the cap.
+#[derive(Default)]
+struct ForksBeingCreated(HashMap<String, usize>);
+
+impl Global for ForksBeingCreated {}
+
+/// Refuses a new fork once [`MAX_LIVE_FORKS`] of the working tree exist,
+/// counting those still being created. Otherwise it reserves a place for the
+/// new fork, which the caller must give back with [`release_fork_place`]
+/// once the fork is recorded or its creation failed.
 pub(crate) async fn ensure_room_for_fork(
     project: &Entity<Project>,
     parent_path: &str,
     cx: &mut AsyncApp,
 ) -> Result<()> {
-    let live = live_forks(project, parent_path, cx).await?;
-    anyhow::ensure!(
-        live.len() < MAX_LIVE_FORKS,
-        "This working tree already has {} forks. Merge and archive some of them before forking again.",
-        live.len()
-    );
-    Ok(())
+    let parent_path = normalize_path(parent_path);
+    let live = live_forks(project, &parent_path, cx).await?;
+    cx.update(|cx| {
+        let being_created = cx
+            .default_global::<ForksBeingCreated>()
+            .0
+            .entry(parent_path)
+            .or_default();
+        let total = live.len() + *being_created;
+        anyhow::ensure!(
+            total < MAX_LIVE_FORKS,
+            "This working tree already has {total} forks. Merge and archive some of them before forking again."
+        );
+        *being_created += 1;
+        Ok(())
+    })
+}
+
+pub(crate) fn release_fork_place(parent_path: &str, cx: &mut App) {
+    let parent_path = normalize_path(parent_path);
+    let being_created = cx.default_global::<ForksBeingCreated>();
+    if let Some(count) = being_created.0.get_mut(&parent_path) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            being_created.0.remove(&parent_path);
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1069,7 +1132,10 @@ mod tests {
                 verdict: None,
                 parent_thread_id: None,
             };
-            cx.update(|cx| upsert_record(record.clone(), cx));
+            cx.update(|cx| {
+                upsert_record(record.clone(), cx);
+                release_fork_place(&record.parent_path, cx);
+            });
             cx.run_until_parked();
             record
         }
@@ -1648,5 +1714,80 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("already has"), "{error:#}");
+    }
+
+    #[gpui::test]
+    async fn test_worktree_without_a_record_is_found_by_its_snapshot(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fixture = Fixture::new(cx).await;
+        let parent_path = fixture.parent_path();
+        let mut async_cx = cx.to_async();
+        let base_sha = snapshot(&fixture.project, &parent_path, &mut async_cx)
+            .await
+            .unwrap();
+        let fork = fixture.parent.parent().unwrap().join("fork-orphan");
+        git(
+            &fixture.parent,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                fork.to_str().unwrap(),
+                &base_sha,
+            ],
+        );
+
+        let found =
+            unrecorded_worktree_at(&fixture.project, &parent_path, &base_sha, &mut async_cx)
+                .await
+                .unwrap();
+        assert_eq!(found, Some(fork.to_string_lossy().to_string()));
+
+        let record = ForkRecord {
+            id: new_fork_id(),
+            fork_path: fork.to_string_lossy().to_string(),
+            parent_path: parent_path.clone(),
+            base_sha: base_sha.clone(),
+            merged_sha: None,
+            kind: ForkKind::Fork,
+            parent_title: None,
+            verdict: None,
+            parent_thread_id: None,
+        };
+        cx.update(|cx| upsert_record(record, cx));
+        let found =
+            unrecorded_worktree_at(&fixture.project, &parent_path, &base_sha, &mut async_cx)
+                .await
+                .unwrap();
+        assert_eq!(found, None);
+    }
+
+    #[gpui::test]
+    async fn test_forks_being_created_count_towards_the_cap(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fixture = Fixture::new(cx).await;
+        let parent_path = fixture.parent_path();
+        let mut async_cx = cx.to_async();
+
+        // None of these has a record yet, as when forks are started quickly.
+        for _ in 0..MAX_LIVE_FORKS {
+            ensure_room_for_fork(&fixture.project, &parent_path, &mut async_cx)
+                .await
+                .unwrap();
+        }
+        let error = ensure_room_for_fork(&fixture.project, &parent_path, &mut async_cx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already has"), "{error:#}");
+
+        cx.update(|cx| release_fork_place(&parent_path, cx));
+        ensure_room_for_fork(&fixture.project, &parent_path, &mut async_cx)
+            .await
+            .unwrap();
+        // Failed attempts reserved nothing: releasing everything empties it.
+        for _ in 0..MAX_LIVE_FORKS {
+            cx.update(|cx| release_fork_place(&parent_path, cx));
+        }
+        assert!(cx.update(|cx| cx.default_global::<ForksBeingCreated>().0.is_empty()));
     }
 }
