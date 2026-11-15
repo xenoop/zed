@@ -3620,8 +3620,14 @@ impl AgentPanel {
         let matches = |panel: &Entity<AgentPanel>, cx: &App| {
             *panel != this && panel.read(cx).working_tree_path(cx).as_deref() == Some(path)
         };
+        let own_workspace_id = self.workspace.entity_id();
         let find = |multi_workspace: &MultiWorkspace, cx: &App| {
             multi_workspace.workspaces().find_map(|workspace| {
+                // This panel's workspace is usually mid-update (an action
+                // handler called us), and reading it then panics.
+                if workspace.entity_id() == own_workspace_id {
+                    return None;
+                }
                 let panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
                 matches(&panel, cx).then_some(panel)
             })
@@ -16199,6 +16205,25 @@ mod tests {
             thread_view.read(cx).message_editor.read(cx).text(cx)
         });
         assert_eq!(draft, "");
+
+        // The same through the registered action, which runs while the
+        // review's own workspace is being updated.
+        crate::test_support::type_draft_prompt(&fork_panel, "Looks good now.", &mut fork_cx);
+        let fork_workspace =
+            fork_panel.read_with(&fork_cx, |panel, _| panel.workspace.upgrade().unwrap());
+        fork_workspace.update_in(&mut fork_cx, |workspace, window, cx| {
+            workspace.focus_panel::<AgentPanel>(window, cx);
+        });
+        fork_cx.run_until_parked();
+        fork_cx.dispatch_action(zed_actions::agent::ApproveReview);
+        // The verdict is only recorded once delivery to the parent worked;
+        // that thread is still busy with the first one, so this one queues.
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| crate::thread_fork::record_for_fork(&record.fork_path, cx))
+                .and_then(|record| record.verdict),
+            Some(crate::thread_fork::ReviewVerdict::Approved)
+        );
     }
 
     /// The user messages of the thread the panel shows.
