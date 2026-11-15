@@ -1096,11 +1096,15 @@ impl Editor {
             buffer_snapshot.anchor_after(start_point)..buffer_snapshot.anchor_before(line_end);
 
         // Compute the hunk key for this display row
+        let hunk_start_anchor = buffer_snapshot.anchor_before(start_point);
+        // `file_at` finds no file on the very first row of a multibuffer, so
+        // the file comes from the buffer that holds the start anchor.
         let file_path = buffer_snapshot
-            .file_at(start_point)
+            .anchor_to_buffer_anchor(hunk_start_anchor)
+            .and_then(|(_, buffer)| buffer.file())
+            .or_else(|| buffer_snapshot.file_at(start_point))
             .map(|file: &Arc<dyn language::File>| file.path().clone())
             .unwrap_or_else(|| Arc::from(util::rel_path::RelPath::empty()));
-        let hunk_start_anchor = buffer_snapshot.anchor_before(start_point);
         let new_hunk_key = DiffHunkKey {
             file_path,
             hunk_start_anchor,

@@ -2393,6 +2393,62 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_comment_on_first_line_keeps_its_file_path(cx: &mut TestAppContext) {
+        init_test(cx);
+        bind_default_keymap(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "one\ntwo\nthree\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "zero\n".into())],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "zero\n".into())],
+        );
+        cx.run_until_parked();
+
+        cx.focus(&workspace);
+        cx.simulate_keystrokes("alt-shift-d");
+        cx.run_until_parked();
+        let diff = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_item_as::<BranchDiff>(cx)
+            })
+            .unwrap();
+        let editor = diff.read_with(cx, |diff, cx| diff.rhs_editor(cx));
+        diff.update_in(cx, |diff, window, cx| {
+            diff.focus_handle(cx).focus(window, cx);
+            diff.diff
+                .update(cx, |diff, cx| diff.move_to_beginning(window, cx));
+        });
+        cx.run_until_parked();
+
+        cx.simulate_input("first line");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        let saved = editor.read_with(cx, |editor, cx| editor.saved_review_comments(cx));
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].file_path, "a.txt");
+        assert_eq!(saved[0].comment, "first line");
+    }
+
+    #[gpui::test]
     async fn test_review_comments_survive_a_restart(cx: &mut TestAppContext) {
         init_test(cx);
         bind_default_keymap(cx);
