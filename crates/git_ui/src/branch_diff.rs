@@ -2094,6 +2094,8 @@ mod tests {
         // An uncommitted edit made before the turn starts: part of "Last
         // Commit", but not of "Last Turn".
         std::fs::write(root.join("a.txt"), "one edited before the turn\n").unwrap();
+        // An untracked file that exists before the turn and stays as it is.
+        std::fs::write(root.join("scratch.txt"), "scratch\n").unwrap();
 
         let project =
             Project::test(fs::RealFs::new(None, cx.executor()), [root.as_path()], cx).await;
@@ -2133,13 +2135,32 @@ mod tests {
         };
 
         let last_turn = open(turn_snapshot.into(), LAST_TURN_LABEL, cx);
+        let last_turn_files = vec![
+            ("b.txt".to_string(), Some("two\n".to_string())),
+            ("new.txt".to_string(), None),
+        ];
+        wait_for(cx, last_turn_files.clone(), |cx| {
+            shown_files(&last_turn, cx)
+        });
+        // `scratch.txt` was in the snapshot and has not changed since, so the
+        // file list leaves it out.
+        let listed_files = |cx: &mut VisualTestContext| {
+            last_turn.read_with(cx, |diff, cx| {
+                diff.branch_diff_list(cx)
+                    .read(cx)
+                    .statuses_by_path()
+                    .map(|statuses| {
+                        statuses
+                            .iter()
+                            .map(|entry| entry.repo_path.as_unix_str().to_string())
+                            .collect::<Vec<_>>()
+                    })
+            })
+        };
         wait_for(
             cx,
-            vec![
-                ("b.txt".to_string(), Some("two\n".to_string())),
-                ("new.txt".to_string(), None),
-            ],
-            |cx| shown_files(&last_turn, cx),
+            Some(vec!["b.txt".to_string(), "new.txt".to_string()]),
+            listed_files,
         );
 
         let last_commit = open("HEAD".into(), LAST_COMMIT_LABEL, cx);
@@ -2149,6 +2170,7 @@ mod tests {
                 ("a.txt".to_string(), Some("one\n".to_string())),
                 ("b.txt".to_string(), Some("two\n".to_string())),
                 ("new.txt".to_string(), None),
+                ("scratch.txt".to_string(), None),
             ],
             |cx| shown_files(&last_commit, cx),
         );
