@@ -1636,40 +1636,36 @@ impl Sidebar {
             if should_load_threads {
                 let thread_store = ThreadMetadataStore::global(cx);
 
-                let make_thread_entry =
-                    |row: ThreadMetadata, workspace: ThreadEntryWorkspace| -> Arc<ThreadEntry> {
-                        let (icon, icon_from_external_svg) = resolve_agent_icon(&row.agent_id);
-                        let fork_parent = fork_links
-                            .iter()
-                            .find(|link| {
-                                row.worktree_paths
-                                    .folder_path_list()
-                                    .paths()
-                                    .contains(&link.fork_path)
-                            })
-                            .cloned();
-                        let worktrees =
-                            worktree_info_from_thread_paths(&row.worktree_paths, &branch_by_path);
-                        // Start drafts as `WithContent`; the post-processing
-                        // pass below downgrades them to `Empty` if no draft
-                        // label can be derived.
-                        let draft = row.is_draft().then_some(DraftKind::WithContent);
-                        Arc::new(ThreadEntry {
-                            metadata: row,
-                            icon,
-                            icon_from_external_svg,
-                            status: AgentThreadStatus::default(),
-                            workspace,
-                            is_live: false,
-                            is_background: false,
-                            is_title_generating: false,
-                            draft,
-                            highlight_positions: Vec::new(),
-                            worktrees,
-                            diff_stats: DiffStats::default(),
-                            fork_parent,
-                        })
-                    };
+                let make_thread_entry = |row: ThreadMetadata,
+                                         workspace: ThreadEntryWorkspace|
+                 -> Arc<ThreadEntry> {
+                    let (icon, icon_from_external_svg) = resolve_agent_icon(&row.agent_id);
+                    let fork_parent = fork_links
+                        .iter()
+                        .find(|link| link.is_among(row.worktree_paths.folder_path_list().paths()))
+                        .cloned();
+                    let worktrees =
+                        worktree_info_from_thread_paths(&row.worktree_paths, &branch_by_path);
+                    // Start drafts as `WithContent`; the post-processing
+                    // pass below downgrades them to `Empty` if no draft
+                    // label can be derived.
+                    let draft = row.is_draft().then_some(DraftKind::WithContent);
+                    Arc::new(ThreadEntry {
+                        metadata: row,
+                        icon,
+                        icon_from_external_svg,
+                        status: AgentThreadStatus::default(),
+                        workspace,
+                        is_live: false,
+                        is_background: false,
+                        is_title_generating: false,
+                        draft,
+                        highlight_positions: Vec::new(),
+                        worktrees,
+                        diff_stats: DiffStats::default(),
+                        fork_parent,
+                    })
+                };
 
                 // Main code path: one query per group via main_worktree_paths.
                 // The main_worktree_paths column is set on all new threads and

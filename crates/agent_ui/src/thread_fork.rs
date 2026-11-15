@@ -58,6 +58,12 @@ pub(crate) enum ReviewVerdict {
 }
 
 impl ForkRecord {
+    fn normalized(mut self) -> Self {
+        self.fork_path = normalize_path(&self.fork_path);
+        self.parent_path = normalize_path(&self.parent_path);
+        self
+    }
+
     /// A short name for menus: the last component of the fork's directory
     /// that is not the repository name repeated.
     pub fn display_name(&self) -> String {
@@ -120,13 +126,23 @@ pub(crate) fn set_land_parent(land_thread: ThreadId, parent: ThreadId, cx: &mut 
     });
 }
 
-/// How a fork's working tree relates to the one it was made from, for views
+/// How a fork's working tree relates to the one it was forked from, for views
 /// that list threads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForkLink {
     pub fork_path: std::path::PathBuf,
     pub parent_path: std::path::PathBuf,
     pub parent_thread_id: Option<crate::thread_metadata_store::ThreadId>,
+}
+
+impl ForkLink {
+    /// Whether any of `folder_paths` is this fork's directory, however the
+    /// path is spelled.
+    pub fn is_among(&self, folder_paths: &[std::path::PathBuf]) -> bool {
+        folder_paths
+            .iter()
+            .any(|path| normalize_fork_path(path) == self.fork_path)
+    }
 }
 
 /// Every known fork, with its parent.
@@ -157,52 +173,110 @@ pub struct ForkListRow {
 /// the list stays where it is. `describe` returns `None` for rows that are
 /// not threads.
 pub fn nest_forks_under_parents<T>(
-    mut rows: Vec<T>,
+    rows: Vec<T>,
     describe: impl Fn(&T) -> Option<ForkListRow>,
 ) -> Vec<T> {
-    let forks: Vec<(crate::thread_metadata_store::ThreadId, ForkLink)> = rows
-        .iter()
-        .filter_map(|row| {
-            let row = describe(row)?;
-            Some((row.thread_id, row.fork_parent?))
+    struct Entry<T> {
+        row: T,
+        info: Option<ForkListRow>,
+        original_index: usize,
+    }
+
+    let mut entries: Vec<Entry<T>> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(original_index, row)| {
+            let info = describe(&row).map(|mut info| {
+                for path in &mut info.folder_paths {
+                    *path = normalize_fork_path(path);
+                }
+                info
+            });
+            Entry {
+                row,
+                info,
+                original_index,
+            }
         })
         .collect();
-    for (fork_id, link) in forks {
-        let position = |rows: &[T], matches: &dyn Fn(&ForkListRow) -> bool| {
-            rows.iter()
-                .position(|row| describe(row).is_some_and(|row| matches(&row)))
-        };
-        let parent_index = position(&rows, &|row| {
-            row.thread_id != fork_id && Some(row.thread_id) == link.parent_thread_id
+    let forks: Vec<(crate::thread_metadata_store::ThreadId, ForkLink)> = entries
+        .iter()
+        .filter_map(|entry| {
+            let info = entry.info.as_ref()?;
+            Some((info.thread_id, info.fork_parent.clone()?))
         })
-        .or_else(|| {
-            position(&rows, &|row| {
-                row.thread_id != fork_id && row.folder_paths.contains(&link.parent_path)
+        .collect();
+
+    // A fork whose parent is itself a fork can be placed before that parent
+    // moves, so placing repeats until the order settles.
+    for _ in 0..=entries.len() {
+        let order_before: Vec<usize> = entries.iter().map(|entry| entry.original_index).collect();
+        for (fork_id, link) in &forks {
+            let position = |entries: &[Entry<T>], matches: &dyn Fn(&ForkListRow) -> bool| {
+                entries
+                    .iter()
+                    .position(|entry| entry.info.as_ref().is_some_and(matches))
+            };
+            let parent_index = position(&entries, &|info| {
+                info.thread_id != *fork_id && Some(info.thread_id) == link.parent_thread_id
             })
-        });
-        let fork_index = position(&rows, &|row| row.thread_id == fork_id);
-        let (Some(parent_index), Some(fork_index)) = (parent_index, fork_index) else {
-            continue;
-        };
-        let fork_row = rows.remove(fork_index);
-        let parent_index = if fork_index < parent_index {
-            parent_index - 1
-        } else {
-            parent_index
-        };
-        // After the forks already placed under this parent, so siblings
-        // keep their order.
-        let mut insert_at = parent_index + 1;
-        while rows.get(insert_at).is_some_and(|row| {
-            describe(row)
-                .and_then(|row| row.fork_parent)
-                .is_some_and(|other| other.parent_path == link.parent_path)
-        }) {
-            insert_at += 1;
+            .or_else(|| {
+                position(&entries, &|info| {
+                    info.thread_id != *fork_id && info.folder_paths.contains(&link.parent_path)
+                })
+            });
+            let fork_index = position(&entries, &|info| info.thread_id == *fork_id);
+            let (Some(parent_index), Some(fork_index)) = (parent_index, fork_index) else {
+                continue;
+            };
+            let fork_entry = entries.remove(fork_index);
+            let parent_index = if fork_index < parent_index {
+                parent_index - 1
+            } else {
+                parent_index
+            };
+            // After the forks already placed under this parent, so siblings
+            // keep their order.
+            let mut insert_at = parent_index + 1;
+            while entries.get(insert_at).is_some_and(|entry| {
+                entry
+                    .info
+                    .as_ref()
+                    .and_then(|info| info.fork_parent.as_ref())
+                    .is_some_and(|other| other.parent_path == link.parent_path)
+            }) {
+                insert_at += 1;
+            }
+            entries.insert(insert_at, fork_entry);
         }
-        rows.insert(insert_at, fork_row);
+        let order_after: Vec<usize> = entries.iter().map(|entry| entry.original_index).collect();
+        if order_after == order_before {
+            break;
+        }
     }
-    rows
+    entries.into_iter().map(|entry| entry.row).collect()
+}
+
+/// A path in the form git reports it and records compare it in: symlinks
+/// resolved and no trailing separator. Paths that cannot be resolved here,
+/// such as those of a remote project, are only trimmed.
+pub(crate) fn normalize_path(path: &str) -> String {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => canonical.to_string_lossy().to_string(),
+        Err(_) => {
+            let trimmed = path.trim_end_matches(['/', '\\']);
+            if trimmed.is_empty() {
+                path.to_string()
+            } else {
+                trimmed.to_string()
+            }
+        }
+    }
+}
+
+/// [`normalize_path`] for views that hold `PathBuf`s.
+pub(crate) fn normalize_fork_path(path: &std::path::Path) -> std::path::PathBuf {
+    normalize_path(&path.to_string_lossy()).into()
 }
 
 /// The fork records, held in memory once read: the database write is
@@ -216,12 +290,16 @@ pub(crate) fn load_records(cx: &App) -> Vec<ForkRecord> {
     if let Some(records) = cx.try_global::<ForkRecords>() {
         return records.0.clone();
     }
+    // Records saved by earlier versions may hold paths as Zed spelled them.
     KeyValueStore::global(cx)
         .read_kvp(FORKS_KEY)
         .log_err()
         .flatten()
-        .and_then(|json| serde_json::from_str(&json).log_err())
+        .and_then(|json| serde_json::from_str::<Vec<ForkRecord>>(&json).log_err())
         .unwrap_or_default()
+        .into_iter()
+        .map(ForkRecord::normalized)
+        .collect()
 }
 
 pub(crate) fn save_records(records: Vec<ForkRecord>, cx: &mut App) {
@@ -236,6 +314,7 @@ pub(crate) fn save_records(records: Vec<ForkRecord>, cx: &mut App) {
 
 /// Adds or replaces the record for a fork directory.
 pub(crate) fn upsert_record(record: ForkRecord, cx: &mut App) {
+    let record = record.normalized();
     let mut records = load_records(cx);
     records.retain(|existing| existing.fork_path != record.fork_path);
     records.push(record);
@@ -243,12 +322,14 @@ pub(crate) fn upsert_record(record: ForkRecord, cx: &mut App) {
 }
 
 pub(crate) fn record_for_fork(fork_path: &str, cx: &App) -> Option<ForkRecord> {
+    let fork_path = normalize_path(fork_path);
     load_records(cx)
         .into_iter()
         .find(|record| record.fork_path == fork_path)
 }
 
 pub(crate) fn records_for_parent(parent_path: &str, cx: &App) -> Vec<ForkRecord> {
+    let parent_path = normalize_path(parent_path);
     load_records(cx)
         .into_iter()
         .filter(|record| record.parent_path == parent_path)
@@ -577,7 +658,12 @@ pub(crate) async fn live_forks(
     parent_path: &str,
     cx: &mut AsyncApp,
 ) -> Result<Vec<ForkRecord>> {
-    let worktrees = live_worktree_paths(project, parent_path, cx).await?;
+    let parent_path = normalize_path(parent_path);
+    let worktrees: HashSet<String> = live_worktree_paths(project, &parent_path, cx)
+        .await?
+        .iter()
+        .map(|path| normalize_path(path))
+        .collect();
     let records = cx.update(|cx| load_records(cx));
     let (live, stale): (Vec<_>, Vec<_>) = records.into_iter().partition(|record| {
         record.parent_path != parent_path || worktrees.contains(&record.fork_path)
@@ -821,8 +907,28 @@ mod tests {
 
     impl Fixture {
         async fn new(cx: &mut TestAppContext) -> Self {
+            Self::build(false, cx).await
+        }
+
+        /// A fixture whose paths all go through a symlink to the directory
+        /// that really holds the repository.
+        #[cfg(unix)]
+        async fn new_via_symlink(cx: &mut TestAppContext) -> Self {
+            Self::build(true, cx).await
+        }
+
+        async fn build(symlinked: bool, cx: &mut TestAppContext) -> Self {
             let directory = tempfile::tempdir().unwrap();
-            let parent = directory.path().canonicalize().unwrap().join("repo");
+            let root = directory.path().canonicalize().unwrap();
+            let parent = if symlinked {
+                let real = root.join("real");
+                std::fs::create_dir_all(&real).unwrap();
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&real, root.join("link")).unwrap();
+                root.join("link").join("repo")
+            } else {
+                root.join("repo")
+            };
             std::fs::create_dir_all(&parent).unwrap();
             std::fs::write(parent.join("a.txt"), "one\ntwo\nthree\n").unwrap();
             std::fs::write(parent.join("b.txt"), "alpha\n").unwrap();
@@ -1236,6 +1342,55 @@ mod tests {
         let merged = std::fs::read_to_string(parent.join("b.txt")).unwrap();
         assert!(merged.contains("<<<<<<<"), "{merged}");
         assert!(merged.contains("from fork") && merged.contains("from parent"));
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_forks_are_found_through_symlinked_paths(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fixture = Fixture::new_via_symlink(cx).await;
+        let parent_path = fixture.parent_path();
+        let record = fixture.fork("fork-linked", cx).await;
+        let real_parent = fixture.parent.canonicalize().unwrap();
+        assert_ne!(real_parent.to_string_lossy(), parent_path);
+
+        let mut async_cx = cx.to_async();
+        let live = live_forks(&fixture.project, &parent_path, &mut async_cx)
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(
+            live[0].fork_path,
+            Path::new(&record.fork_path)
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+        );
+
+        // Every spelling of the paths finds the record, and it was not
+        // dropped as stale.
+        for parent in [
+            parent_path.clone(),
+            format!("{parent_path}/"),
+            real_parent.to_string_lossy().to_string(),
+        ] {
+            assert_eq!(cx.update(|cx| records_for_parent(&parent, cx)).len(), 1);
+        }
+        for fork in [
+            record.fork_path.clone(),
+            format!("{}/", record.fork_path),
+            live[0].fork_path.clone(),
+        ] {
+            assert!(cx.update(|cx| record_for_fork(&fork, cx)).is_some());
+        }
+        let links = cx.update(|cx| fork_links(cx));
+        assert!(links[0].is_among(&[Path::new(&record.fork_path).to_path_buf()]));
+
+        assert_eq!(
+            normalize_path("/definitely/not/here/"),
+            "/definitely/not/here"
+        );
+        assert_eq!(normalize_path("/"), "/");
     }
 
     #[gpui::test]
