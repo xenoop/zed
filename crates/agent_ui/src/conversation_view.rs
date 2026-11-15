@@ -2041,6 +2041,7 @@ impl ConversationView {
                     entry_view_state.update(cx, |view_state, _cx| view_state.remove(range.clone()));
                     list_state.splice(range.clone(), 0);
                     active.update(cx, |active, cx| {
+                        active.forget_entries_from(range.start, cx);
                         active.sync_editor_mode(cx);
                     });
                 }
@@ -11768,6 +11769,69 @@ pub(crate) mod tests {
                     assert!(entry_view_state.entry(2).is_none());
                     assert!(entry_view_state.entry(3).is_none());
                 });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_rewind_drops_state_of_removed_entries(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        let mut second_user_message_id = None;
+        for message in ["first", "second"] {
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new("An answer.".into()),
+            )]);
+            thread
+                .update(cx, |thread, cx| thread.send_raw(message, cx))
+                .await
+                .unwrap();
+            cx.run_until_parked();
+            if message == "first" {
+                thread_view.update_in(cx, |view, window, cx| {
+                    view.comment_on_passage(1, "kept", window, cx);
+                    view.record_sent_note("kept", cx);
+                    view.expanded_editor_questions.insert(0);
+                });
+            } else {
+                second_user_message_id = thread.read_with(cx, |thread, _| {
+                    let AgentThreadEntry::UserMessage(user_message) = &thread.entries()[2] else {
+                        panic!("expected the second user message");
+                    };
+                    user_message.client_id.clone()
+                });
+                thread_view.update_in(cx, |view, window, cx| {
+                    view.comment_on_passage(3, "removed", window, cx);
+                    view.record_sent_note("removed", cx);
+                    view.expanded_editor_questions.insert(2);
+                });
+            }
+        }
+
+        thread
+            .update(cx, |thread, cx| {
+                thread.rewind(second_user_message_id.expect("a second message"), cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, _| {
+            let passages: Vec<_> = view
+                .passage_comments
+                .iter()
+                .map(|comment| comment.passage.to_string())
+                .collect();
+            assert_eq!(passages, ["kept"]);
+            assert_eq!(view.sent_notes(), [(1, SharedString::from("kept"))]);
+            assert_eq!(view.expanded_editor_questions.len(), 1);
+            assert!(view.expanded_editor_questions.contains(&0));
         });
     }
 

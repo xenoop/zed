@@ -764,7 +764,7 @@ pub struct ThreadView {
     collapsed_sandbox_network_details: HashSet<acp_v2::ToolCallId>,
     /// Questions asked from the editor (by the index of their user message)
     /// that the user expanded in the chat; the rest stay collapsed.
-    expanded_editor_questions: HashSet<usize>,
+    pub(crate) expanded_editor_questions: HashSet<usize>,
     /// Where this thread's last reply was sent on to another thread: the
     /// index of the transcript entry the note follows, and who received it.
     /// Kept only while the view lives; the agent's transcript has no place
@@ -7700,6 +7700,23 @@ impl ThreadView {
     ) {
         let last_entry = self.thread.read(cx).entries().len().saturating_sub(1);
         self.sent_notes.push((last_entry, target.into()));
+        cx.notify();
+    }
+
+    /// Forgets what was attached to transcript entries from `first_removed_entry`
+    /// on, once those entries are gone: their indexes would otherwise point at
+    /// whatever entries take their place.
+    pub(crate) fn forget_entries_from(
+        &mut self,
+        first_removed_entry: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.sent_notes
+            .retain(|(entry_ix, _)| *entry_ix < first_removed_entry);
+        self.passage_comments
+            .retain(|comment| comment.entry_ix < first_removed_entry);
+        self.expanded_editor_questions
+            .retain(|entry_ix| *entry_ix < first_removed_entry);
         cx.notify();
     }
 
