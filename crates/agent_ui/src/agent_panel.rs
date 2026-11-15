@@ -5076,9 +5076,7 @@ impl AgentPanel {
                     return Ok(conversation_view);
                 }
                 if conversation_view.read_with(cx, |view, _| view.load_failed()) {
-                    return Err(anyhow!(
-                        "The agent failed to start; check the agent panel."
-                    ));
+                    return Err(anyhow!("The agent failed to start; check the agent panel."));
                 }
                 if started.elapsed() > AGENT_START_TIMEOUT {
                     return Err(anyhow!(
@@ -16201,7 +16199,7 @@ mod tests {
         let received = user_message_texts(&panel, &cx);
         assert_eq!(received.len(), 1, "{received:?}");
         assert!(
-            received[0].starts_with("Review verdict: changes requested."),
+            received[0].starts_with("[Zed: review verdict]\nReview verdict: changes requested."),
             "{received:?}"
         );
         assert!(received[0].contains("Rename the helper."), "{received:?}");
@@ -16363,7 +16361,7 @@ mod tests {
         let land_messages = user_message_texts(&panel, &cx);
         assert_eq!(land_messages.len(), 1, "{land_messages:?}");
         assert!(
-            land_messages[0].starts_with(crate::thread_fork::LAND_PREFIX),
+            land_messages[0].starts_with(crate::thread_fork::LAND_MARKER),
             "{land_messages:?}"
         );
         assert!(land_messages[0].contains("Push the branch"));
@@ -16380,7 +16378,7 @@ mod tests {
         let parent_messages = cx.update(|_, cx| thread_user_message_texts(&parent_thread, cx));
         assert_eq!(parent_messages.len(), 2, "{parent_messages:?}");
         assert!(
-            parent_messages[1].starts_with(crate::thread_fork::THREAD_MESSAGE_PREFIX),
+            parent_messages[1].starts_with(crate::thread_fork::THREAD_MESSAGE_MARKER),
             "{parent_messages:?}"
         );
 

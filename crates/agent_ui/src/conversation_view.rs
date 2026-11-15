@@ -4371,9 +4371,11 @@ fn plan_label_markdown_style(
     }
 }
 
-/// Questions asked from the editor (inline assist, review comments) begin and
-/// end with these, so the agent chat can collapse their turns: the answers are
-/// shown in the editor already.
+/// Questions asked from the editor (inline assist, review comments) begin with
+/// one of these marker lines, so the agent chat can collapse their turns: the
+/// answers are shown in the editor already.
+pub(crate) const INLINE_QUESTION_MARKER: &str = "[Zed: question]";
+pub(crate) const REVIEW_QUESTION_MARKER: &str = "[Zed: review comments]";
 pub(crate) const INLINE_QUESTION_PREFIX: &str = "Question about ";
 pub(crate) const INLINE_QUESTION_SUFFIX: &str =
     "(Answer in text. Only change files if the question asks for a change.)";
@@ -4384,7 +4386,7 @@ pub(crate) const REVIEW_QUESTION_PREFIX: &str = "Review comments on the diff.";
 /// [`split_review_answer`] can put each answer under its comment.
 pub(crate) fn review_question(comments: &[ReviewCommentForAgent], cx: &App) -> String {
     let mut question = format!(
-        "{REVIEW_QUESTION_PREFIX} Answer each comment in its own section that \
+        "{REVIEW_QUESTION_MARKER}\n{REVIEW_QUESTION_PREFIX} Answer each comment in its own section that \
          starts with its ID alone on a line, like `R1:`. Answer in text; only change \
          files where a comment asks for a change.\n",
     );
@@ -6794,7 +6796,7 @@ pub(crate) mod tests {
         message_editor.update_in(cx, |editor, window, cx| {
             editor.set_text(
                 &format!(
-                    "{INLINE_QUESTION_PREFIX}`a.rs` lines 1-1:\n\nWhy?\n\n{INLINE_QUESTION_SUFFIX}"
+                    "{INLINE_QUESTION_MARKER}\n{INLINE_QUESTION_PREFIX}`a.rs` lines 1-1:\n\nWhy?\n\n{INLINE_QUESTION_SUFFIX}"
                 ),
                 window,
                 cx,
@@ -6911,7 +6913,7 @@ pub(crate) mod tests {
 
     #[gpui::test]
     async fn test_comment_on_transcript_passage(cx: &mut TestAppContext) {
-        use crate::conversation_view::thread_view::{PASSAGE_COMMENT_PREFIX, PassageCommentState};
+        use crate::conversation_view::thread_view::{PASSAGE_COMMENT_MARKER, PassageCommentState};
 
         init_test(cx);
 
@@ -6978,7 +6980,7 @@ pub(crate) mod tests {
                 })
                 .unwrap()
         });
-        assert!(question.starts_with(PASSAGE_COMMENT_PREFIX), "{question}");
+        assert!(question.starts_with(PASSAGE_COMMENT_MARKER), "{question}");
         assert!(
             question.ends_with("> first line\n>\n> second line\n\nWhy?\n"),
             "{question}"
@@ -16392,7 +16394,7 @@ pub(crate) mod tests {
             },
         ];
         let question = cx.update(|cx| review_question(&comments, cx));
-        assert!(question.starts_with("Review comments on the diff."));
+        assert!(question.starts_with("[Zed: review comments]\nReview comments on the diff."));
         assert!(
             question
                 .contains("R1: `src/a.rs` lines 2-2\n```\nlet x = 10 + 10;\n```\nUse a constant\n")

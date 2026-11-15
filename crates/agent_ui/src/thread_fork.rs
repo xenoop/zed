@@ -255,8 +255,21 @@ pub(crate) fn records_for_parent(parent_path: &str, cx: &App) -> Vec<ForkRecord>
         .collect()
 }
 
-/// Starts the first message of a fork: the thread view shows such messages
-/// collapsed to one line.
+/// Zed-generated messages start with one of these marker lines, which the
+/// thread view uses to show them collapsed to one line. A person would not type
+/// them, unlike the wording of the message itself.
+pub(crate) const FORK_MARKER: &str = "[Zed: fork]";
+pub(crate) const VERDICT_MARKER: &str = "[Zed: review verdict]";
+pub(crate) const THREAD_MESSAGE_MARKER: &str = "[Zed: message from another thread]";
+pub(crate) const LAND_MARKER: &str = "[Zed: land]";
+
+/// The message text after `marker` and its line break, when `text` starts with
+/// the marker alone on its first line.
+pub(crate) fn marked_body<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+    text.strip_prefix(marker)?.strip_prefix('\n')
+}
+
+/// How the fork message continues after its marker.
 pub(crate) const FORK_CONTEXT_PREFIX: &str = "This thread is a fork of";
 
 /// How much of the parent's transcript a fork receives, counted from its end.
@@ -276,7 +289,7 @@ pub(crate) fn fork_context_message(parent_title: Option<&str>, transcript: &str)
         ""
     };
     format!(
-        "{FORK_CONTEXT_PREFIX} \"{title}\". Its conversation so far is below, for context. \
+        "{FORK_MARKER}\n{FORK_CONTEXT_PREFIX} \"{title}\". Its conversation so far is below, for context. \
          You are working in a separate git worktree that started as a copy of that \
          thread's working tree, including uncommitted changes; what you change here \
          reaches the original only when I merge it. Do not act on the conversation \
@@ -322,12 +335,9 @@ const REVIEW_INSTRUCTIONS: &str = "You are the reviewer of that thread's work. T
      saying what changed and why it matters, with anything risky, unclear or untested \
      called out. I will then comment and give a verdict.";
 
-/// Starts a message that carries a review's verdict to the reviewed thread.
-pub(crate) const VERDICT_PREFIX: &str = "Review verdict:";
-/// Starts a message passed on from another thread.
-pub(crate) const THREAD_MESSAGE_PREFIX: &str = "Message from thread";
-/// Starts the first message of a thread that lands changes.
-pub(crate) const LAND_PREFIX: &str = "Land the changes of thread";
+const VERDICT_PREFIX: &str = "Review verdict:";
+const THREAD_MESSAGE_PREFIX: &str = "Message from thread";
+const LAND_PREFIX: &str = "Land the changes of thread";
 
 const MAX_FORWARDED_BYTES: usize = 8_000;
 
@@ -356,7 +366,7 @@ pub(crate) fn verdict_message(
             "Address what is asked below, then say what you changed.",
         ),
     };
-    let mut message = format!("{VERDICT_PREFIX} {label}. {instruction}\n");
+    let mut message = format!("{VERDICT_MARKER}\n{VERDICT_PREFIX} {label}. {instruction}\n");
     if !note.trim().is_empty() {
         message.push_str(&format!("\nFrom me:\n{}\n", note.trim()));
     }
@@ -383,7 +393,7 @@ pub(crate) fn thread_message(sender_title: Option<&str>, text: &str) -> String {
         .take(60)
         .collect();
     format!(
-        "{THREAD_MESSAGE_PREFIX} \"{title}\":\n\n{}\n",
+        "{THREAD_MESSAGE_MARKER}\n{THREAD_MESSAGE_PREFIX} \"{title}\":\n\n{}\n",
         clipped(text.trim())
     )
 }
@@ -403,7 +413,7 @@ pub(crate) fn land_message(parent_title: Option<&str>, steps: Option<&str>) -> S
          4. Push the branch, and open or update its pull request.",
         );
     format!(
-        "{LAND_PREFIX} \"{title}\". You are in the same working tree as that thread. \
+        "{LAND_MARKER}\n{LAND_PREFIX} \"{title}\". You are in the same working tree as that thread. \
          Follow these steps in order. Stop at the first step that fails and do not force \
          anything (no force-push, no skipped checks).\n\n{steps}\n\n\
          Finish with a short report: what landed, what did not, and what I need to do.\n"
@@ -427,7 +437,8 @@ pub(crate) async fn landing_steps(
 /// The one-line form of a message delivered from another thread, a verdict
 /// or a landing request, for the collapsed row in the transcript.
 pub(crate) fn delivered_message_summary(text: &str) -> Option<String> {
-    if let Some(rest) = text.strip_prefix(VERDICT_PREFIX) {
+    if let Some(body) = marked_body(text, VERDICT_MARKER) {
+        let rest = body.strip_prefix(VERDICT_PREFIX).unwrap_or(body);
         let verdict = rest.trim_start().split('.').next().unwrap_or_default();
         return Some(format!("Review verdict: {verdict}"));
     }
@@ -437,13 +448,15 @@ pub(crate) fn delivered_message_summary(text: &str) -> Option<String> {
             .and_then(|rest| rest.split_once('"'))
             .map(|(title, _)| title.to_string())
     };
-    if let Some(rest) = text.strip_prefix(THREAD_MESSAGE_PREFIX) {
+    if let Some(body) = marked_body(text, THREAD_MESSAGE_MARKER) {
+        let rest = body.strip_prefix(THREAD_MESSAGE_PREFIX).unwrap_or(body);
         return Some(match quoted_title(rest) {
             Some(title) => format!("Message from thread \"{title}\""),
             None => "Message from another thread".to_string(),
         });
     }
-    if let Some(rest) = text.strip_prefix(LAND_PREFIX) {
+    if let Some(body) = marked_body(text, LAND_MARKER) {
+        let rest = body.strip_prefix(LAND_PREFIX).unwrap_or(body);
         return Some(match quoted_title(rest) {
             Some(title) => format!("Landing the changes of \"{title}\""),
             None => "Landing changes".to_string(),
@@ -1003,7 +1016,7 @@ mod tests {
     #[test]
     fn test_fork_messages() {
         let message = fork_context_message(Some("Fix the parser"), "## User\nhello\n");
-        assert!(message.starts_with(FORK_CONTEXT_PREFIX));
+        assert!(message.starts_with("[Zed: fork]\nThis thread is a fork of"));
         assert!(message.contains("\"Fix the parser\""));
         assert!(message.contains("<conversation>\n## User\nhello\n\n</conversation>"));
 
@@ -1037,7 +1050,7 @@ mod tests {
     #[test]
     fn test_review_land_and_thread_messages() {
         let review = first_message(&ForkKind::Review, Some("Fix the parser"), "hello");
-        assert!(review.starts_with(FORK_CONTEXT_PREFIX));
+        assert!(review.starts_with("[Zed: fork]\nThis thread is a fork of"));
         assert!(review.contains("Write a change guide"));
         assert!(!review.contains("reply with one short line"));
 
@@ -1048,7 +1061,7 @@ mod tests {
         );
         assert_eq!(
             verdict,
-            "Review verdict: changes requested. Address what is asked below, then say what you \
+            "[Zed: review verdict]\nReview verdict: changes requested. Address what is asked below, then say what you \
              changed.\n\nFrom me:\nRename the helper.\n\nThe reviewer's findings:\n\
              1. The parser drops the last token.\n"
         );
@@ -1065,7 +1078,7 @@ mod tests {
         let forwarded = thread_message(Some("Review: Fix the parser"), "All good.");
         assert_eq!(
             forwarded,
-            "Message from thread \"Review: Fix the parser\":\n\nAll good.\n"
+            "[Zed: message from another thread]\nMessage from thread \"Review: Fix the parser\":\n\nAll good.\n"
         );
         assert_eq!(
             delivered_message_summary(&forwarded).as_deref(),
@@ -1091,6 +1104,15 @@ mod tests {
             )
         );
         assert!(delivered_message_summary("An ordinary message").is_none());
+        // Typing the wording of a generated message does not collapse the turn.
+        for typed in [
+            "Message from thread notes: remember the milk",
+            "Review verdict: I think it is fine",
+            "Land the changes of thread two on Friday",
+            "[Zed: land] but on the same line",
+        ] {
+            assert!(delivered_message_summary(typed).is_none(), "{typed}");
+        }
         for command in ["/review", "/land", "/send-to-parent"] {
             assert!(slash_command_action(command).is_some(), "{command}");
         }

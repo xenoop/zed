@@ -7492,10 +7492,11 @@ async fn record_last_turn_snapshot(
     }
 }
 
-/// Starts the message a comment on a transcript passage is sent with: the
-/// thread view shows such a turn collapsed, since the answer is shown under
-/// the passage.
-pub(crate) const PASSAGE_COMMENT_PREFIX: &str = "Comment on a passage of your reply above.";
+/// The first line of the message a comment on a transcript passage is sent
+/// with: the thread view shows such a turn collapsed, since the answer is shown
+/// under the passage.
+pub(crate) const PASSAGE_COMMENT_MARKER: &str = "[Zed: passage comment]";
+const PASSAGE_COMMENT_PREFIX: &str = "Comment on a passage of your reply above.";
 
 /// A comment on a passage of one of the agent's messages.
 pub(crate) struct PassageComment {
@@ -7521,7 +7522,8 @@ pub(crate) enum PassageCommentState {
 
 /// The message a passage comment is sent to the agent with.
 pub(crate) fn passage_comment_question(passage: &str, comment: &str) -> String {
-    let mut question = format!("{PASSAGE_COMMENT_PREFIX} Answer in text.\n\n");
+    let mut question =
+        format!("{PASSAGE_COMMENT_MARKER}\n{PASSAGE_COMMENT_PREFIX} Answer in text.\n\n");
     for line in passage.trim().lines() {
         question.push_str(if line.is_empty() { ">" } else { "> " });
         question.push_str(line);
@@ -7536,17 +7538,18 @@ pub(crate) fn passage_comment_question(passage: &str, comment: &str) -> String {
 /// A one-line summary of a question asked from the editor (inline assist or
 /// review comments), or `None` for any other message.
 fn editor_question_summary(text: &str) -> Option<SharedString> {
-    use super::{INLINE_QUESTION_PREFIX, INLINE_QUESTION_SUFFIX, REVIEW_QUESTION_PREFIX};
-    if text.starts_with(PASSAGE_COMMENT_PREFIX) {
+    use super::{INLINE_QUESTION_MARKER, INLINE_QUESTION_PREFIX, REVIEW_QUESTION_MARKER};
+    use crate::thread_fork::{FORK_CONTEXT_PREFIX, FORK_MARKER, marked_body};
+    if marked_body(text, PASSAGE_COMMENT_MARKER).is_some() {
         return Some("Comment on a passage, answered under it".into());
     }
     if let Some(summary) = crate::thread_fork::delivered_message_summary(text) {
         return Some(summary.into());
     }
-    if let Some(rest) = text.strip_prefix(crate::thread_fork::FORK_CONTEXT_PREFIX) {
-        let title = rest
-            .trim_start()
-            .strip_prefix('"')
+    if let Some(body) = marked_body(text, FORK_MARKER) {
+        let title = body
+            .strip_prefix(FORK_CONTEXT_PREFIX)
+            .and_then(|rest| rest.trim_start().strip_prefix('"'))
             .and_then(|rest| rest.split_once("\". "))
             .map(|(title, _)| title);
         return Some(match title {
@@ -7556,8 +7559,8 @@ fn editor_question_summary(text: &str) -> Option<SharedString> {
             None => "Forked, with the earlier conversation as context".into(),
         });
     }
-    if text.starts_with(REVIEW_QUESTION_PREFIX) {
-        let count = text
+    if let Some(body) = marked_body(text, REVIEW_QUESTION_MARKER) {
+        let count = body
             .lines()
             .filter(|line| {
                 line.split_once(':')
@@ -7570,9 +7573,8 @@ fn editor_question_summary(text: &str) -> Option<SharedString> {
             count => format!("{count} review comments, answered in the diff").into(),
         });
     }
-    let location = text
-        .strip_prefix(INLINE_QUESTION_PREFIX)
-        .filter(|_| text.trim_end().ends_with(INLINE_QUESTION_SUFFIX))?
+    let location = marked_body(text, INLINE_QUESTION_MARKER)?
+        .strip_prefix(INLINE_QUESTION_PREFIX)?
         .lines()
         .next()?
         .trim_end_matches(':');
@@ -15377,11 +15379,12 @@ mod tests {
     #[test]
     fn test_editor_question_summary() {
         use super::super::{
-            INLINE_QUESTION_PREFIX, INLINE_QUESTION_SUFFIX, REVIEW_QUESTION_PREFIX,
+            INLINE_QUESTION_MARKER, INLINE_QUESTION_PREFIX, INLINE_QUESTION_SUFFIX,
+            REVIEW_QUESTION_MARKER, REVIEW_QUESTION_PREFIX,
         };
 
         let inline = format!(
-            "{INLINE_QUESTION_PREFIX}`src/lib.rs` lines 18-20:\n```\nfn a() {{}}\n```\n\nWhy?\n\n{INLINE_QUESTION_SUFFIX}"
+            "{INLINE_QUESTION_MARKER}\n{INLINE_QUESTION_PREFIX}`src/lib.rs` lines 18-20:\n```\nfn a() {{}}\n```\n\nWhy?\n\n{INLINE_QUESTION_SUFFIX}"
         );
         assert_eq!(
             editor_question_summary(&inline).as_deref(),
@@ -15389,7 +15392,7 @@ mod tests {
         );
 
         let review = format!(
-            "{REVIEW_QUESTION_PREFIX} Answer each comment, like `R1:`.\n\
+            "{REVIEW_QUESTION_MARKER}\n{REVIEW_QUESTION_PREFIX} Answer each comment, like `R1:`.\n\
              \nR1: `a.rs` lines 1-2\n```\nx\n```\nwhy?\n\
              \nR2: `b.rs` lines 3-3\n```\ny\n```\nand this?\n"
         );
@@ -15398,11 +15401,17 @@ mod tests {
             Some("2 review comments, answered in the diff")
         );
 
-        // An ordinary message, even one starting the same way, stays visible.
-        assert_eq!(
-            editor_question_summary("Question about the build failure"),
-            None
-        );
+        // An ordinary message, even one worded the same way, stays visible.
+        for typed in [
+            "Question about the build failure",
+            "Review comments on the diff. R1: looks fine",
+            "This thread is a fork of \"x\". Ready?",
+            "Comment on a passage of your reply above. Why?",
+            "[Zed: question] Question about nothing",
+            &format!("{INLINE_QUESTION_PREFIX}`a.rs`:\n\nWhy?\n\n{INLINE_QUESTION_SUFFIX}"),
+        ] {
+            assert_eq!(editor_question_summary(typed), None, "{typed}");
+        }
         assert_eq!(editor_question_summary("hello"), None);
         // A comment on a transcript passage is answered in its card.
         assert_eq!(

@@ -13,7 +13,7 @@ use crate::{
     buffer_codegen::{
         BufferCodegen, CodegenAlternative, CodegenEvent, InlineAssistAsksAgentThread,
     },
-    conversation_view::{INLINE_QUESTION_PREFIX, INLINE_QUESTION_SUFFIX},
+    conversation_view::{INLINE_QUESTION_MARKER, INLINE_QUESTION_PREFIX, INLINE_QUESTION_SUFFIX},
     inline_prompt_editor::{CodegenStatus, InlineAssistId, PromptEditor, PromptEditorEvent},
     terminal_inline_assistant::TerminalInlineAssistant,
 };
@@ -1705,7 +1705,9 @@ fn agent_question(
             row(end)
         )
     };
-    format!("{INLINE_QUESTION_PREFIX}{location}\n\n{user_prompt}\n\n{INLINE_QUESTION_SUFFIX}")
+    format!(
+        "{INLINE_QUESTION_MARKER}\n{INLINE_QUESTION_PREFIX}{location}\n\n{user_prompt}\n\n{INLINE_QUESTION_SUFFIX}"
+    )
 }
 
 /// Whether `assist` asks the agent thread a question. Its answer changes
