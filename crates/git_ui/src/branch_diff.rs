@@ -2139,7 +2139,7 @@ mod tests {
             ("b.txt".to_string(), Some("two\n".to_string())),
             ("new.txt".to_string(), None),
         ];
-        wait_for(cx, last_turn_files.clone(), |cx| {
+        wait_for(cx, last_turn_files, |cx| {
             shown_files(&last_turn, cx)
         });
         // `scratch.txt` was in the snapshot and has not changed since, so the
