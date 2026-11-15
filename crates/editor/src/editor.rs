@@ -3449,7 +3449,14 @@ impl Editor {
     }
 
     pub fn read_only(&self, cx: &App) -> bool {
-        self.read_only || self.comment_mode || self.buffer.read(cx).read_only()
+        self.read_only || self.buffer.read(cx).read_only()
+    }
+
+    /// Whether the user's own edits are ignored. Comment mode ignores them
+    /// like a read-only editor does, but leaves the editor saveable and
+    /// formattable.
+    pub fn blocks_user_edits(&self, cx: &App) -> bool {
+        self.read_only(cx) || self.comment_mode
     }
 
     pub fn set_read_only(&mut self, read_only: bool) {
@@ -3490,7 +3497,7 @@ impl Editor {
         S: ToOffset,
         T: Into<Arc<str>>,
     {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
 
@@ -3504,7 +3511,7 @@ impl Editor {
         S: ToOffset,
         T: Into<Arc<str>>,
     {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
 
@@ -3519,7 +3526,7 @@ impl Editor {
         S: ToOffset,
         T: Into<Arc<str>>,
     {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
 
@@ -3538,7 +3545,7 @@ impl Editor {
         S: ToOffset,
         T: Into<Arc<str>>,
     {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
 
@@ -5277,7 +5284,7 @@ impl Editor {
     }
 
     pub fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         self.transact(window, cx, |this, window, cx| {
@@ -5335,7 +5342,7 @@ impl Editor {
     }
 
     pub fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         self.transact(window, cx, |this, window, cx| {
@@ -5418,7 +5425,7 @@ impl Editor {
         if self.move_to_next_snippet_tabstop(window, cx) {
             return;
         }
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         let mut selections = self.selections.all_adjusted(&self.display_snapshot(cx));
@@ -5554,7 +5561,7 @@ impl Editor {
     }
 
     pub fn indent(&mut self, _: &Indent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         if self.mode.is_single_line() {
@@ -5667,7 +5674,7 @@ impl Editor {
     }
 
     pub fn outdent(&mut self, _: &Outdent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         if self.mode.is_single_line() {
@@ -5735,7 +5742,7 @@ impl Editor {
     }
 
     pub fn autoindent(&mut self, _: &AutoIndent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         if self.mode.is_single_line() {
@@ -5761,7 +5768,7 @@ impl Editor {
     }
 
     pub fn delete_line(&mut self, _: &DeleteLine, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
@@ -5855,7 +5862,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         let mut row_ranges = Vec::<Range<MultiBufferRow>>::new();
@@ -6068,7 +6075,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
 
@@ -6547,7 +6554,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
 
@@ -6851,7 +6858,7 @@ impl Editor {
     }
 
     fn rotate_selections(&mut self, window: &mut Window, cx: &mut Context<Self>, reverse: bool) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         let display_snapshot = self.display_snapshot(cx);
@@ -7005,7 +7012,7 @@ impl Editor {
     ) where
         M: FnMut(&str) -> LineManipulationResult,
     {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
 
@@ -7455,7 +7462,7 @@ impl Editor {
     where
         Fn: FnMut(&str) -> String,
     {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         let buffer = self.buffer.read(cx).snapshot(cx);
@@ -7578,7 +7585,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
 
@@ -7725,7 +7732,7 @@ impl Editor {
     }
 
     pub fn move_line_up(&mut self, _: &MoveLineUp, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         if self.mode.is_single_line() {
@@ -7838,7 +7845,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         if self.mode.is_single_line() {
@@ -7934,7 +7941,7 @@ impl Editor {
     }
 
     pub fn transpose(&mut self, _: &Transpose, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         let text_layout_details = &self.text_layout_details(window, cx);
@@ -8021,7 +8028,7 @@ impl Editor {
     }
 
     pub fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
 
@@ -8052,7 +8059,7 @@ impl Editor {
     }
 
     pub fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
 
@@ -9231,7 +9238,7 @@ impl Editor {
     }
 
     fn insert_uuid(&mut self, version: UuidVersion, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         self.transact(window, cx, |this, window, cx| {
@@ -10001,7 +10008,7 @@ impl Editor {
     }
 
     pub fn show_local_cursors(&self, window: &mut Window, cx: &mut App) -> bool {
-        (self.read_only(cx) || self.blink_manager.read(cx).visible())
+        (self.blocks_user_edits(cx) || self.blink_manager.read(cx).visible())
             && self.focus_handle.is_focused(window)
     }
 

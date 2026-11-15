@@ -627,7 +627,7 @@ impl Editor {
     }
 
     pub fn git_restore(&mut self, _: &Restore, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         let selections = self
@@ -1491,7 +1491,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         let mut buffer_ids = HashSet::default();
@@ -1520,7 +1520,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         let selections = self
@@ -2390,7 +2390,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         let mut restorable_hunks = Vec::new();
@@ -2466,7 +2466,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
 
@@ -2498,7 +2498,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         let snapshot = self.snapshot(window, cx);

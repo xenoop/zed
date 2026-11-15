@@ -77,7 +77,7 @@ impl Editor {
 
         let text: Arc<str> = text.into();
 
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
 
@@ -546,7 +546,7 @@ impl Editor {
     }
 
     pub fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
 
@@ -799,7 +799,7 @@ impl Editor {
     }
 
     pub fn newline_above(&mut self, _: &NewlineAbove, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
 
@@ -868,7 +868,7 @@ impl Editor {
     }
 
     pub fn newline_below(&mut self, _: &NewlineBelow, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
 
@@ -992,7 +992,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         self.transact(window, cx, |this, window, cx| {
@@ -1025,7 +1025,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         self.transact(window, cx, |this, window, cx| {
@@ -1058,7 +1058,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         self.transact(window, cx, |this, window, cx| {
@@ -1090,7 +1090,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         self.transact(window, cx, |this, window, cx| {
@@ -1122,7 +1122,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         self.transact(window, cx, |this, window, cx| {
@@ -1150,7 +1150,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         self.transact(window, cx, |this, window, cx| {
@@ -1177,7 +1177,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         self.transact(window, cx, |this, window, cx| {
@@ -1224,7 +1224,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         self.transact(window, cx, |this, _window, cx| {
@@ -1414,7 +1414,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         let text_layout_details = &self.text_layout_details(window, cx);
@@ -1736,7 +1736,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
 
@@ -1997,7 +1997,7 @@ impl Editor {
         cx: &mut Context<Self>,
         apply_linked_edits: bool,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
 

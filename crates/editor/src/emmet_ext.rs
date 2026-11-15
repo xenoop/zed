@@ -85,7 +85,7 @@ pub fn wrap_with_abbreviation(
     window: &mut Window,
     cx: &mut Context<Editor>,
 ) {
-    if editor.read_only(cx) {
+    if editor.blocks_user_edits(cx) {
         return;
     }
 

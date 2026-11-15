@@ -19020,6 +19020,60 @@ async fn test_save_actions_are_hidden_for_read_only_files(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+async fn test_review_comment_mode_keeps_editor_saveable(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_file(path!("/file.rs"), b"one\ntwo\n".to_vec())
+        .await;
+    let project = Project::test(fs.clone(), [path!("/file.rs").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/file.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer.clone(), cx));
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        build_editor_with_project(project.clone(), multi_buffer, window, cx)
+    });
+
+    editor.update(cx, |editor, cx| editor.set_comment_mode(true, cx));
+    editor.update_in(cx, |editor, window, cx| {
+        editor.handle_input("typed", window, cx);
+        editor.edit([(MultiBufferOffset(0)..MultiBufferOffset(0), "typed")], cx);
+    });
+    assert_eq!(
+        buffer.read_with(cx, |buffer, _| buffer.text()),
+        "one\ntwo\n"
+    );
+
+    // The agent edits the buffer directly.
+    buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "agent ")], None, cx));
+    assert!(editor.read_with(cx, |editor, cx| editor.blocks_user_edits(cx)));
+    assert!(editor.read_with(cx, |editor, cx| !editor.read_only(cx)));
+    assert!(editor.read_with(cx, |editor, cx| Item::can_save(editor, cx)));
+
+    let save = editor.update_in(cx, |editor, window, cx| {
+        editor.save(
+            SaveOptions {
+                format: false,
+                force_format: false,
+                autosave: false,
+            },
+            project.clone(),
+            window,
+            cx,
+        )
+    });
+    save.await.unwrap();
+    assert_eq!(
+        fs.load(path!("/file.rs").as_ref()).await.unwrap(),
+        "agent one\ntwo\n"
+    );
+}
+
+#[gpui::test]
 async fn test_document_format_during_save(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

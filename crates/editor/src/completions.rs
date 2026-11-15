@@ -52,7 +52,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return None;
         }
         self.do_completion(action.item_ix, CompletionIntent::Complete, window, cx)
@@ -64,7 +64,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return None;
         }
         self.do_completion(None, CompletionIntent::CompleteWithInsert, window, cx)
@@ -76,7 +76,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return None;
         }
         self.do_completion(None, CompletionIntent::CompleteWithReplace, window, cx)

@@ -2,7 +2,7 @@ use super::*;
 
 impl Editor {
     pub fn rewrap(&mut self, options: RewrapOptions, cx: &mut Context<Self>) {
-        if self.read_only(cx) || self.mode.is_single_line() {
+        if self.blocks_user_edits(cx) || self.mode.is_single_line() {
             return;
         }
         let buffer = self.buffer.read(cx).snapshot(cx);

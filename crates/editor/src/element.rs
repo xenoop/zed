@@ -712,7 +712,7 @@ impl EditorElement {
         register_action(editor, window, Editor::toggle_read_only);
         register_action(editor, window, Editor::reload_file);
 
-        if !editor.read(cx).read_only(cx) {
+        if !editor.read(cx).blocks_user_edits(cx) {
             register_action(editor, window, Editor::newline);
             register_action(editor, window, Editor::newline_above);
             register_action(editor, window, Editor::newline_below);
@@ -8582,7 +8582,7 @@ impl Element for EditorElement {
             window.with_text_style(Some(text_style), |window| {
                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
                     let (mut snapshot, is_read_only) = self.editor.update(cx, |editor, cx| {
-                        (editor.snapshot(window, cx), editor.read_only(cx))
+                        (editor.snapshot(window, cx), editor.blocks_user_edits(cx))
                     });
                     let style = &self.style;
 

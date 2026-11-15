@@ -359,7 +359,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         if self.show_edit_predictions_in_menu() {
@@ -1609,7 +1609,7 @@ impl Editor {
         cx: &App,
     ) -> bool {
         maybe!({
-            if self.read_only(cx) || self.leader_id.is_some() {
+            if self.blocks_user_edits(cx) || self.leader_id.is_some() {
                 return Some(false);
             }
             let provider = self.edit_prediction_provider()?;
