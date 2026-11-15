@@ -1336,8 +1336,28 @@ mod tests {
             parent_thread_id,
         };
         let older_parent = row("older parent", "/repo", None);
+        let fork_one = row(
+            "fork one",
+            "/worktrees/one",
+            Some(link(
+                "/worktrees/one",
+                "/repo",
+                Some(older_parent.thread_id),
+            )),
+        );
+        // A fork of a fork, listed before the fork it follows moves.
+        let nested_fork = row(
+            "fork of fork one",
+            "/worktrees/nested",
+            Some(link(
+                "/worktrees/nested",
+                "/worktrees/one",
+                Some(fork_one.thread_id),
+            )),
+        );
         // As a thread list sorts them: most recent first.
         let rows = vec![
+            nested_fork,
             row(
                 "fork two",
                 "/worktrees/two",
@@ -1345,15 +1365,7 @@ mod tests {
             ),
             row("unrelated", "/other", None),
             row("recent parent", "/repo", None),
-            row(
-                "fork one",
-                "/worktrees/one",
-                Some(link(
-                    "/worktrees/one",
-                    "/repo",
-                    Some(older_parent.thread_id),
-                )),
-            ),
+            fork_one,
             older_parent,
             row(
                 "orphan fork",
@@ -1382,6 +1394,7 @@ mod tests {
                 // With one, it follows that thread.
                 "older parent",
                 "fork one",
+                "fork of fork one",
                 // A fork whose parent is not listed stays in place.
                 "orphan fork",
             ]
