@@ -3430,6 +3430,15 @@ impl AgentPanel {
         cx.spawn_in(window, async move |_, cx| {
             thread_fork::ensure_room_for_fork(&project, &parent_path, cx).await?;
             let base_sha = thread_fork::snapshot(&project, &parent_path, cx).await?;
+            let id = thread_fork::new_fork_id();
+            thread_fork::pin_commit(
+                &project,
+                &parent_path,
+                &thread_fork::fork_ref(&id, "base"),
+                &base_sha,
+                cx,
+            )
+            .await?;
 
             let action = zed_actions::CreateWorktree {
                 worktree_name: None,
@@ -3444,7 +3453,16 @@ impl AgentPanel {
                     )
                 })?
                 .await
-                .context("could not create the fork's worktree")?;
+                .context("could not create the fork's worktree");
+            let created = match created {
+                Ok(created) => created,
+                Err(error) => {
+                    thread_fork::unpin_fork_commits(&project, &parent_path, &id, cx)
+                        .await
+                        .log_err();
+                    return Err(error);
+                }
+            };
             let fork_workspace = created.workspace;
             let fork_path = fork_workspace
                 .read_with(cx, |workspace, cx| {
@@ -3457,6 +3475,7 @@ impl AgentPanel {
                 })
                 .context("the fork's workspace has no folder")?;
             let record = ForkRecord {
+                id,
                 fork_path,
                 parent_path,
                 base_sha,

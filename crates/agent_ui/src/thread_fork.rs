@@ -30,6 +30,10 @@ pub(crate) enum ForkKind {
 /// A fork of a working tree, as remembered between sessions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ForkRecord {
+    /// Names the git refs that keep this fork's snapshot commits alive. Empty
+    /// for records made before those refs existed.
+    #[serde(default)]
+    pub id: String,
     /// The fork's worktree directory.
     pub fork_path: String,
     /// The directory of the working tree it was forked from.
@@ -632,6 +636,56 @@ pub(crate) async fn snapshot(
     Ok(sha)
 }
 
+pub(crate) fn new_fork_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+pub(crate) fn fork_ref(id: &str, name: &str) -> String {
+    format!("refs/zed/forks/{id}/{name}")
+}
+
+/// Points `ref_name` at `sha` in the repository of `directory`, so that
+/// `git gc` keeps a snapshot commit nothing else refers to. Refs are shared
+/// by all of a repository's worktrees.
+pub(crate) async fn pin_commit(
+    project: &Entity<Project>,
+    directory: &str,
+    ref_name: &str,
+    sha: &str,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let script = format!(
+        "cd {} && git update-ref {} {}",
+        quote(directory),
+        quote(ref_name),
+        quote(sha)
+    );
+    run_script(project, script, cx)
+        .await
+        .context("could not keep the fork's snapshot commit")?;
+    Ok(())
+}
+
+/// Deletes the refs that pin a fork's snapshot commits.
+pub(crate) async fn unpin_fork_commits(
+    project: &Entity<Project>,
+    parent_path: &str,
+    id: &str,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    if id.is_empty() {
+        return Ok(());
+    }
+    let script = format!(
+        "cd {} && git update-ref -d {} && git update-ref -d {}",
+        quote(parent_path),
+        quote(&fork_ref(id, "base")),
+        quote(&fork_ref(id, "merged"))
+    );
+    run_script(project, script, cx).await?;
+    Ok(())
+}
+
 /// The directories of the repository's linked worktrees, after pruning
 /// entries whose directory is gone.
 pub(crate) async fn live_worktree_paths(
@@ -797,8 +851,25 @@ async fn merge_into_parent_exclusively(
 
     // The merge took a while: the record may have changed meanwhile (a
     // review verdict, say), and only the merge point is this function's.
+    let id = cx.update(|cx| {
+        record_for_fork(&record.fork_path, cx)
+            .map(|current| current.id)
+            .unwrap_or_else(|| record.id.clone())
+    });
+    let id = if id.is_empty() { new_fork_id() } else { id };
+    // The merge is applied by now, so a failure to pin must not fail it.
+    pin_commit(
+        project,
+        &record.parent_path,
+        &fork_ref(&id, "merged"),
+        &fork_sha,
+        cx,
+    )
+    .await
+    .log_err();
     record = cx.update(|cx| {
         let mut current = record_for_fork(&record.fork_path, cx).unwrap_or(record);
+        current.id = id;
         current.merged_sha = Some(fork_sha);
         upsert_record(current.clone(), cx);
         current
@@ -855,6 +926,9 @@ pub(crate) async fn remove_fork(
     )
     .await
     .context("could not remove the fork's worktree")?;
+    unpin_fork_commits(project, &record.parent_path, &record.id, cx)
+        .await
+        .log_err();
     let fork_path = record.fork_path.clone();
     cx.update(|cx| {
         let mut records = load_records(cx);
@@ -959,6 +1033,16 @@ mod tests {
             let base_sha = snapshot(&self.project, &parent_path, &mut async_cx)
                 .await
                 .unwrap();
+            let id = new_fork_id();
+            pin_commit(
+                &self.project,
+                &parent_path,
+                &fork_ref(&id, "base"),
+                &base_sha,
+                &mut async_cx,
+            )
+            .await
+            .unwrap();
             let fork = self.parent.parent().unwrap().join(name);
             git(
                 &self.parent,
@@ -971,6 +1055,7 @@ mod tests {
                 ],
             );
             let record = ForkRecord {
+                id,
                 fork_path: fork.to_string_lossy().to_string(),
                 parent_path,
                 base_sha,
@@ -1394,6 +1479,46 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_snapshot_commits_are_pinned_until_the_fork_is_removed(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fixture = Fixture::new(cx).await;
+        let record = fixture.fork("fork-pinned", cx).await;
+        let fork = Path::new(&record.fork_path).to_path_buf();
+        std::fs::write(fork.join("new.txt"), "made in fork\n").unwrap();
+
+        let mut async_cx = cx.to_async();
+        let (record, _) = merge_into_parent(&fixture.project, record, &mut async_cx)
+            .await
+            .unwrap();
+        let refs = git(
+            &fixture.parent,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/zed/forks",
+            ],
+        );
+        assert_eq!(
+            refs,
+            format!(
+                "{base_ref} {base}\n{merged_ref} {merged}",
+                base_ref = fork_ref(&record.id, "base"),
+                base = record.base_sha,
+                merged_ref = fork_ref(&record.id, "merged"),
+                merged = record.merged_sha.clone().unwrap(),
+            )
+        );
+
+        remove_fork(&fixture.project, &record, &mut async_cx)
+            .await
+            .unwrap();
+        assert_eq!(
+            git(&fixture.parent, &["for-each-ref", "refs/zed/forks"]),
+            ""
+        );
+    }
+
+    #[gpui::test]
     async fn test_fork_cleanup_is_safe_and_capped(cx: &mut TestAppContext) {
         init_test(cx);
         let fixture = Fixture::new(cx).await;
@@ -1424,6 +1549,10 @@ mod tests {
                 .is_empty()
         );
         assert!(!git(&fixture.parent, &["worktree", "list"]).contains("fork-keep"));
+        assert_eq!(
+            git(&fixture.parent, &["for-each-ref", "refs/zed/forks"]),
+            ""
+        );
 
         // A fork deleted behind Zed's back is forgotten and pruned from git.
         let gone = fixture.fork("fork-gone", cx).await;
