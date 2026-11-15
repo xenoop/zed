@@ -3440,6 +3440,34 @@ async fn test_project_search_opens_in_normal_mode(cx: &mut gpui::TestAppContext)
 }
 
 #[gpui::test]
+async fn test_vim_escape_keeps_review_comment_boxes_open(cx: &mut gpui::TestAppContext) {
+    let mut cx = VimTestContext::new(cx, true).await;
+    cx.update(|_, cx| cx.set_global(db::AppDatabase::test_new()));
+    cx.set_state("ˇone\ntwo\nthree\n", Mode::Normal);
+    cx.update_editor(|editor, _window, cx| {
+        editor.set_show_diff_review_button(true, cx);
+        editor.set_comment_mode(true, cx);
+    });
+    cx.simulate_keystrokes("i w h y enter");
+    cx.run_until_parked();
+    cx.update_editor(|editor, _window, _cx| {
+        assert_eq!(editor.total_review_comment_count(), 1);
+        assert!(editor.diff_review_prompt_editor().is_some());
+    });
+
+    cx.update_editor(|editor, window, cx| {
+        gpui::Focusable::focus_handle(editor, cx).focus(window, cx)
+    });
+    cx.simulate_keystrokes("i escape");
+    cx.run_until_parked();
+    cx.update_editor(|editor, _window, _cx| {
+        assert!(editor.diff_review_prompt_editor().is_some());
+        assert!(!editor.review_comments_hidden());
+        assert_eq!(editor.total_review_comment_count(), 1);
+    });
+}
+
+#[gpui::test]
 async fn test_review_comment_mode(cx: &mut gpui::TestAppContext) {
     let mut cx = VimTestContext::new(cx, true).await;
     // Review comments are saved per repository in the database, which the

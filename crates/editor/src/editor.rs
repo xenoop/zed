@@ -3620,7 +3620,14 @@ impl Editor {
             self.cancel_diff_review_drag(cx);
             dismissed = true;
         }
-        if !self.diff_review_overlays.is_empty() {
+        // Vim dismisses popups on every insert to normal Escape, which is
+        // not a request to close the comment boxes, and a box holding text
+        // that was not sent yet would lose it.
+        let has_unsent_comment_text = self
+            .diff_review_overlays
+            .iter()
+            .any(|overlay| !overlay.prompt_editor.read(cx).text(cx).trim().is_empty());
+        if !self.diff_review_overlays.is_empty() && is_user_requested && !has_unsent_comment_text {
             // Closing the boxes must not lose sight of the comments in them:
             // hiding leaves a marker on each commented range.
             if self.total_review_comment_count() > 0 {
