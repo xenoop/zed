@@ -2421,7 +2421,8 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.send_content_reporting_failure(contents_task, is_native_command, window, cx);
+        // Callers of this one learn of a failure from the thread's error.
+        drop(self.send_content_reporting_failure(contents_task, is_native_command, window, cx));
     }
 
     /// Like [`Self::send_content`]. The returned receiver gets the error when
@@ -2438,7 +2439,6 @@ impl ThreadView {
         let (failure_tx, failure_rx) = futures::channel::oneshot::channel();
         let failure_tx = Rc::new(std::cell::Cell::new(Some(failure_tx)));
         let report_failure = {
-            let failure_tx = failure_tx.clone();
             move |error: &anyhow::Error| {
                 if let Some(failure_tx) = failure_tx.take() {
                     failure_tx.send(format!("{error:#}").into()).ok();
@@ -9733,7 +9733,7 @@ impl ThreadView {
             };
             let state = match answer {
                 Ok(Ok(answer)) => PassageCommentState::Answered(answer.into()),
-                Ok(Err(error)) => PassageCommentState::Failed(error.into()),
+                Ok(Err(error)) => PassageCommentState::Failed(error),
                 Err(_) => {
                     PassageCommentState::Failed("The thread was closed before it answered.".into())
                 }
