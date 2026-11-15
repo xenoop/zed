@@ -2421,6 +2421,30 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.send_content_reporting_failure(contents_task, is_native_command, window, cx);
+    }
+
+    /// Like [`Self::send_content`]. The returned receiver gets the error when
+    /// the send fails, and is dropped without a value when it does not.
+    pub(crate) fn send_content_reporting_failure(
+        &mut self,
+        contents_task: Task<
+            anyhow::Result<Option<(Vec<acp_v2::ContentBlock>, Vec<Entity<Buffer>>)>>,
+        >,
+        is_native_command: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> futures::channel::oneshot::Receiver<SharedString> {
+        let (failure_tx, failure_rx) = futures::channel::oneshot::channel();
+        let failure_tx = Rc::new(std::cell::Cell::new(Some(failure_tx)));
+        let report_failure = {
+            let failure_tx = failure_tx.clone();
+            move |error: &anyhow::Error| {
+                if let Some(failure_tx) = failure_tx.take() {
+                    failure_tx.send(format!("{error:#}").into()).ok();
+                }
+            }
+        };
         let session_id = self.thread.read(cx).session_id().clone();
         let parent_session_id = self.thread.read(cx).parent_session_id().cloned();
         let agent_telemetry_id = self.thread.read(cx).connection().telemetry_id();
@@ -2441,6 +2465,7 @@ impl ThreadView {
         let side = crate::agent_sidebar_side(cx);
 
         let snapshot_project = self.project.clone();
+        let report_failure_in_task = report_failure.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
             let Some((contents, tracked_buffers)) = contents_task.await? else {
                 return Ok(());
@@ -2568,7 +2593,10 @@ impl ThreadView {
                     }
                     Ok(Some(SubmissionResponse::Accepted(_))) => {}
                     Ok(None) => {}
-                    Err(error) => this.handle_thread_error(error, cx),
+                    Err(error) => {
+                        report_failure_in_task(&error);
+                        this.handle_thread_error(error, cx)
+                    }
                 }
             })?;
             anyhow::Ok(())
@@ -2576,6 +2604,7 @@ impl ThreadView {
 
         cx.spawn(async move |this, cx| {
             if let Err(err) = task.await {
+                report_failure(&err);
                 this.update(cx, |this, cx| {
                     this.handle_thread_error(err, cx);
                 })
@@ -2583,6 +2612,7 @@ impl ThreadView {
             }
         })
         .detach();
+        failure_rx
     }
 
     pub fn interrupt_and_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7458,6 +7488,30 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
     }
 }
 
+/// What `event` means for a question asked of the thread whose answer starts
+/// at entry `first_new_entry`: the answer when the turn ends, an error when it
+/// does not produce one, and `None` for events that do not end the turn.
+pub(super) fn question_outcome(
+    thread: &AcpThread,
+    event: &AcpThreadEvent,
+    first_new_entry: usize,
+    cx: &App,
+) -> Option<Result<String, &'static str>> {
+    match event {
+        AcpThreadEvent::Stopped {
+            stop_reason: Some(acp_v2::StopReason::Cancelled),
+            ..
+        } => Some(Err("The question was cancelled.")),
+        AcpThreadEvent::Stopped { .. } => {
+            Some(Ok(super::final_answer(thread, first_new_entry, cx)))
+        }
+        AcpThreadEvent::Error => Some(Err("The agent stopped with an error.")),
+        AcpThreadEvent::Refusal => Some(Err("The agent refused to answer.")),
+        AcpThreadEvent::ConnectionLost => Some(Err("The agent's connection was lost.")),
+        _ => None,
+    }
+}
+
 /// How long sending a message waits for the Last Turn snapshot before going
 /// ahead without it.
 const LAST_TURN_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -9613,8 +9667,9 @@ impl ThreadView {
                 cx.notify();
             };
 
-        // A turn in progress would end first and be taken for the answer.
-        if self.thread.read(cx).status() == ThreadStatus::Generating {
+        // A turn in progress, or a send still being prepared, would end first
+        // and be taken for the answer.
+        if self.thread.read(cx).status() == ThreadStatus::Generating || self.is_loading_contents {
             set_state(
                 self,
                 PassageCommentState::Failed(
@@ -9631,15 +9686,10 @@ impl ThreadView {
         let (answer_tx, answer_rx) = futures::channel::oneshot::channel();
         let mut answer_tx = Some(answer_tx);
         let subscription = cx.subscribe(&thread, move |_, thread, event, cx| {
-            let result = match event {
-                AcpThreadEvent::Stopped { .. } => {
-                    Ok(super::final_answer(thread.read(cx), first_new_entry, cx))
-                }
-                AcpThreadEvent::Error => Err("The agent stopped with an error."),
-                AcpThreadEvent::Refusal => Err("The agent refused to answer."),
-                AcpThreadEvent::ConnectionLost => Err("The agent's connection was lost."),
-                _ => return,
+            let Some(result) = question_outcome(thread.read(cx), event, first_new_entry, cx) else {
+                return;
             };
+            let result = result.map_err(SharedString::from);
             if let Some(answer_tx) = answer_tx.take() {
                 answer_tx.send(result).ok();
             }
@@ -9649,7 +9699,7 @@ impl ThreadView {
             passage_comment.comment = comment.into();
             passage_comment.state = PassageCommentState::Waiting;
         }
-        self.send_content(
+        let send_failure = self.send_content_reporting_failure(
             Task::ready(Ok(Some((vec![question.into()], Vec::new())))),
             false,
             window,
@@ -9659,7 +9709,12 @@ impl ThreadView {
 
         cx.spawn(async move |this, cx| {
             let _subscription = subscription;
-            let state = match answer_rx.await {
+            let answer = match futures::future::select(answer_rx, send_failure).await {
+                futures::future::Either::Left((answer, _)) => answer,
+                futures::future::Either::Right((Ok(error), _)) => Ok(Err(error)),
+                futures::future::Either::Right((Err(_), answer_rx)) => answer_rx.await,
+            };
+            let state = match answer {
                 Ok(Ok(answer)) => PassageCommentState::Answered(answer.into()),
                 Ok(Err(error)) => PassageCommentState::Failed(error.into()),
                 Err(_) => {

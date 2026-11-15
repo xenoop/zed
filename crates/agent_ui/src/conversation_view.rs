@@ -3810,9 +3810,12 @@ impl ConversationView {
             .cloned()
             .context("The agent thread isn't ready yet. Ask again once it is.")?;
         let thread = thread_view.read(cx).thread.clone();
-        // A turn in progress would end first and be taken for the answer. A new
-        // thread may not have confirmed it is idle yet; that is not a turn.
-        if thread.read(cx).status() == ThreadStatus::Generating {
+        // A turn in progress, or a send still being prepared, would end first
+        // and be taken for the answer. A new thread may not have confirmed it is
+        // idle yet; that is not a turn.
+        if thread.read(cx).status() == ThreadStatus::Generating
+            || thread_view.read(cx).is_loading_contents
+        {
             return Err(anyhow!(
                 "The agent is still working on something else. Ask again when it is done."
             ));
@@ -3822,35 +3825,37 @@ impl ConversationView {
         let (answer_tx, answer_rx) = futures::channel::oneshot::channel();
         let mut answer_tx = Some(answer_tx);
         let subscription = cx.subscribe(&thread, move |_, thread, event, cx| {
-            let result = match event {
-                AcpThreadEvent::Stopped { .. } => {
-                    Ok(final_answer(thread.read(cx), first_new_entry, cx))
-                }
-                AcpThreadEvent::Error => Err(anyhow!("The agent stopped with an error.")),
-                AcpThreadEvent::Refusal => Err(anyhow!("The agent refused to answer.")),
-                AcpThreadEvent::ConnectionLost => Err(anyhow!("The agent's connection was lost.")),
-                _ => return,
+            let Some(result) =
+                thread_view::question_outcome(thread.read(cx), event, first_new_entry, cx)
+            else {
+                return;
             };
+            let result = result.map_err(|error| anyhow!(error));
             if let Some(answer_tx) = answer_tx.take() {
                 // The receiver is gone when the inline assist was stopped.
                 answer_tx.send(result).ok();
             }
         });
 
-        thread_view.update(cx, |thread_view, cx| {
-            thread_view.send_content(
+        let send_failure = thread_view.update(cx, |thread_view, cx| {
+            thread_view.send_content_reporting_failure(
                 Task::ready(Ok(Some((vec![prompt.into()], Vec::new())))),
                 false,
                 window,
                 cx,
-            );
+            )
         });
 
         Ok(cx.spawn(async move |_, _| {
             let _subscription = subscription;
-            answer_rx
-                .await
-                .map_err(|_| anyhow!("The agent thread was closed before it answered."))?
+            let closed = || anyhow!("The agent thread was closed before it answered.");
+            match futures::future::select(answer_rx, send_failure).await {
+                futures::future::Either::Left((answer, _)) => answer.map_err(|_| closed())?,
+                futures::future::Either::Right((Ok(error), _)) => Err(anyhow!(error)),
+                futures::future::Either::Right((Err(_), answer_rx)) => {
+                    answer_rx.await.map_err(|_| closed())?
+                }
+            }
         }))
     }
 
@@ -16583,6 +16588,62 @@ pub(crate) mod tests {
         message_editor.read_with(cx, |editor, cx| {
             assert_eq!(editor.text(cx), "my unsent draft");
         });
+    }
+
+    #[gpui::test]
+    async fn test_ask_active_thread_reports_cancellation_and_failed_sends(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+
+        // A send that is still being prepared is refused.
+        thread_view.update(cx, |view, _| view.is_loading_contents = true);
+        assert!(
+            conversation_view
+                .update_in(cx, |view, window, cx| {
+                    view.ask_active_thread("Why?".to_string(), window, cx)
+                })
+                .is_err()
+        );
+        thread_view.update(cx, |view, _| view.is_loading_contents = false);
+
+        // Cancelling the turn is not an answer.
+        let finish_turn = connection.defer_next_prompt_response();
+        let answer = conversation_view
+            .update_in(cx, |view, window, cx| {
+                view.ask_active_thread("Why?".to_string(), window, cx)
+            })
+            .expect("the thread is idle");
+        cx.run_until_parked();
+        thread_view.update_in(cx, |view, _window, cx| view.cancel_generation(cx));
+        finish_turn
+            .send(Ok(acp_v1::PromptResponse::new(
+                acp_v1::StopReason::Cancelled,
+            )))
+            .ok();
+        cx.run_until_parked();
+        let error = answer
+            .await
+            .expect_err("a cancelled question has no answer");
+        assert_eq!(error.to_string(), "The question was cancelled.");
+
+        // A send that fails before the turn starts does not leave it waiting.
+        let fail_send = connection.defer_next_prompt_response();
+        let answer = conversation_view
+            .update_in(cx, |view, window, cx| {
+                view.ask_active_thread("Why again?".to_string(), window, cx)
+            })
+            .expect("the thread is idle again");
+        cx.run_until_parked();
+        fail_send
+            .send(Err(anyhow!("no connection to the model")))
+            .ok();
+        cx.run_until_parked();
+        answer.await.expect_err("a failed send has no answer");
     }
 
     #[gpui::test]
