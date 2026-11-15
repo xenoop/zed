@@ -617,7 +617,7 @@ impl BranchDiff {
             return;
         };
         let editor = self.rhs_editor(cx);
-        let comments = editor.read(cx).saved_review_comments(cx);
+        let mut comments = editor.read(cx).saved_review_comments(cx);
         let files: collections::HashSet<String> = editor
             .read(cx)
             .buffer()
@@ -626,6 +626,13 @@ impl BranchDiff {
             .into_iter()
             .filter_map(|buffer| Some(buffer.read(cx).file()?.path().as_unix_str().to_string()))
             .collect();
+        // Comments the view could not place are still the user's: saving
+        // only the placed ones would delete them.
+        for unplaced in &self.unplaced_comments {
+            if files.contains(&unplaced.file_path) && !comments.contains(unplaced) {
+                comments.push(unplaced.clone());
+            }
+        }
         review_comment_store::save_for_files(key, &files, comments, cx);
     }
 
@@ -2616,5 +2623,89 @@ mod tests {
             reopened.read_with(cx, |editor, cx| editor.saved_review_comments(cx)),
             saved
         );
+    }
+
+    #[gpui::test]
+    async fn test_changes_view_keeps_comments_it_cannot_show(cx: &mut TestAppContext) {
+        init_test(cx);
+        bind_default_keymap(cx);
+
+        let head_text: String = (1..=40).map(|line| format!("line {line}\n")).collect();
+        let working_text = head_text.replacen("line 1\n", "changed 1\n", 1);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": working_text,
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", head_text.clone())],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", head_text)],
+        );
+        cx.run_until_parked();
+
+        // A comment on a line far from the only change, which the view's
+        // excerpts do not show.
+        let repository = project
+            .read_with(cx, |project, cx| project.active_repository(cx))
+            .unwrap();
+        let far_comment = SavedReviewComment {
+            file_path: "a.txt".to_string(),
+            start_row: 30,
+            end_row: 30,
+            code: "line 31".to_string(),
+            comment: "far away".to_string(),
+            answer: None,
+            outdated: false,
+        };
+        let key = cx.update(|_, cx| review_comment_store::key_for_repository(&repository, cx));
+        cx.update(|_, cx| {
+            review_comment_store::save_for_files(
+                key.clone(),
+                &collections::HashSet::from_iter(["a.txt".to_string()]),
+                vec![far_comment.clone()],
+                cx,
+            );
+        });
+
+        cx.focus(&workspace);
+        cx.simulate_keystrokes("alt-shift-d");
+        cx.run_until_parked();
+        let diff = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_item_as::<BranchDiff>(cx)
+            })
+            .unwrap();
+        diff.update_in(cx, |diff, window, cx| {
+            diff.focus_handle(cx).focus(window, cx);
+            diff.diff
+                .update(cx, |diff, cx| diff.move_to_beginning(window, cx));
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down");
+        cx.simulate_input("near the change");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        let stored = cx.update(|_, cx| review_comment_store::load(&key, cx));
+        assert!(
+            stored.iter().any(|comment| comment.comment == "near the change"
+                && comment.file_path == "a.txt"),
+            "{stored:?}"
+        );
+        assert!(stored.contains(&far_comment), "{stored:?}");
     }
 }

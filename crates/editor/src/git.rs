@@ -1271,6 +1271,20 @@ impl Editor {
             let buffer_snapshot = buffer.read(cx).snapshot();
             let (start_row, end_row, outdated) =
                 locate_saved_comment(&saved_comment, &buffer_snapshot);
+            // `buffer_point_to_anchor` moves a point outside the excerpts to
+            // the nearest excerpt edge, which would put the comment on the
+            // wrong line.
+            let is_shown = multibuffer
+                .snapshot(cx)
+                .excerpts_for_buffer(buffer_snapshot.remote_id())
+                .any(|excerpt| {
+                    excerpt.context.start.to_point(&buffer_snapshot).row <= start_row
+                        && end_row <= excerpt.context.end.to_point(&buffer_snapshot).row
+                });
+            if !is_shown {
+                unplaced.push(saved_comment);
+                continue;
+            }
             let anchors = multibuffer
                 .buffer_point_to_anchor(&buffer, Point::new(start_row, 0), cx)
                 .zip(multibuffer.buffer_point_to_anchor(&buffer, Point::new(end_row, 0), cx));

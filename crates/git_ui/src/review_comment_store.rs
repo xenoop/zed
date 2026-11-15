@@ -1,7 +1,11 @@
 //! Where review comments are kept between sessions: one list per
 //! repository, shared by the Changes view and by file tabs.
 
-use std::{cell::Cell, rc::Rc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    time::Duration,
+};
 
 use collections::{HashMap, HashSet};
 use db::kvp::KeyValueStore;
@@ -106,8 +110,11 @@ pub(crate) fn register_file_editor(
     }
 
     let restored = Rc::new(Cell::new(false));
+    // Saved comments whose lines the editor could not place.
+    let unplaced: Rc<RefCell<Vec<SavedReviewComment>>> = Rc::default();
     cx.subscribe(&cx.entity(), {
         let restored = restored.clone();
+        let unplaced = unplaced.clone();
         move |editor, _, event: &EditorEvent, cx| {
             if !matches!(event, EditorEvent::ReviewCommentsChanged { .. }) {
                 return;
@@ -123,6 +130,11 @@ pub(crate) fn register_file_editor(
                     if stored.file_path == path && !comments.contains(&stored) {
                         comments.push(stored);
                     }
+                }
+            }
+            for stored in unplaced.borrow().iter() {
+                if !comments.contains(stored) {
+                    comments.push(stored.clone());
                 }
             }
             save_for_files(key, &HashSet::from_iter([path]), comments, cx);
@@ -143,7 +155,8 @@ pub(crate) fn register_file_editor(
                     restored.set(true);
                     if !comments.is_empty() {
                         editor.set_show_diff_review_button(true, cx);
-                        editor.restore_review_comments(comments, window, cx);
+                        let not_placed = editor.restore_review_comments(comments, window, cx);
+                        unplaced.borrow_mut().extend(not_placed);
                     }
                 })?;
                 break;
