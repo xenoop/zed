@@ -7458,6 +7458,10 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
     }
 }
 
+/// How long sending a message waits for the Last Turn snapshot before going
+/// ahead without it.
+const LAST_TURN_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Captures the working tree of the project's active repository as a detached
 /// commit (staged, unstaged and untracked files) and records it as the start
 /// of the latest turn. Failures only cost the "Last Turn" comparison.
@@ -7475,7 +7479,26 @@ async fn record_last_turn_snapshot(
     let Ok(Some((repo_id, checkpoint))) = snapshot else {
         return;
     };
-    match checkpoint.await {
+    let timeout = cx.background_executor().timer(LAST_TURN_SNAPSHOT_TIMEOUT);
+    let checkpoint = match futures::future::select(checkpoint, timeout).await {
+        futures::future::Either::Left((checkpoint, _)) => checkpoint,
+        futures::future::Either::Right(_) => {
+            log::warn!(
+                "snapshotting the working tree for this turn took more than {}s; sending without it",
+                LAST_TURN_SNAPSHOT_TIMEOUT.as_secs()
+            );
+            // The previous snapshot would make Last Turn show an older turn.
+            project
+                .update(cx, |project, cx| {
+                    project.git_store().update(cx, |git_store, _| {
+                        git_store.clear_last_turn_snapshot(repo_id)
+                    })
+                })
+                .log_err();
+            return;
+        }
+    };
+    match checkpoint {
         Ok(Ok((_staged, full))) => {
             project
                 .update(cx, |project, cx| {

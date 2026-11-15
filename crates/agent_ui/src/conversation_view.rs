@@ -6862,6 +6862,84 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_send_does_not_wait_for_a_slow_last_turn_snapshot(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            serde_json::json!({ ".git": {}, "a.txt": "one" }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [std::path::Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) = setup_conversation_view_in_project(
+            StubAgentServer::new(connection.clone()),
+            project.clone(),
+            None,
+            cx,
+        )
+        .await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+        let last_turn_snapshot = |cx: &mut VisualTestContext| {
+            project.read_with(cx, |project, cx| {
+                let repository = project.active_repository(cx)?;
+                project
+                    .git_store()
+                    .read(cx)
+                    .last_turn_snapshot(repository.read(cx).id)
+            })
+        };
+
+        let finish_first = connection.defer_next_prompt_response();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert!(last_turn_snapshot(cx).is_some());
+        finish_first
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
+
+        fs.set_archive_checkpoint_hangs(std::path::Path::new("/project/.git"), true);
+        let finish_second = connection.defer_next_prompt_response();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("second", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        let user_message_count = |cx: &mut VisualTestContext| {
+            thread_view.read_with(cx, |view, cx| {
+                view.thread
+                    .read(cx)
+                    .entries()
+                    .iter()
+                    .filter(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+                    .count()
+            })
+        };
+        assert_eq!(user_message_count(cx), 1, "waits for the snapshot at first");
+
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        assert_eq!(user_message_count(cx), 2);
+        assert_eq!(
+            last_turn_snapshot(cx),
+            None,
+            "Last Turn must not keep showing the previous turn"
+        );
+        finish_second
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
     async fn test_agent_command_takes_precedence_over_zed_slash_command(cx: &mut TestAppContext) {
         init_test(cx);
 

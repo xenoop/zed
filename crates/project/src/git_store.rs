@@ -5047,6 +5047,10 @@ impl GitStore {
         self.last_turn_snapshots.insert(repo_id, commit);
     }
 
+    pub fn clear_last_turn_snapshot(&mut self, repo_id: RepositoryId) {
+        self.last_turn_snapshots.remove(&repo_id);
+    }
+
     pub fn last_turn_snapshot(&self, repo_id: RepositoryId) -> Option<SharedString> {
         self.last_turn_snapshots.get(&repo_id).cloned()
     }

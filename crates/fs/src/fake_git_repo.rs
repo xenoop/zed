@@ -76,6 +76,7 @@ pub struct FakeGitRepositoryState {
     pub simulated_index_write_error_message: Option<String>,
     pub simulated_create_worktree_error: Option<String>,
     pub simulated_graph_error: Option<String>,
+    pub simulated_archive_checkpoint_hang: bool,
     pub branches_requiring_force_delete: HashSet<String>,
     pub worktrees_requiring_force_delete: HashSet<PathBuf>,
     pub refs: HashMap<String, String>,
@@ -104,6 +105,7 @@ impl FakeGitRepositoryState {
             simulated_index_write_error_message: Default::default(),
             simulated_create_worktree_error: Default::default(),
             simulated_graph_error: None,
+            simulated_archive_checkpoint_hang: false,
             branches_requiring_force_delete: Default::default(),
             worktrees_requiring_force_delete: Default::default(),
             refs: HashMap::from_iter([("HEAD".into(), "abc".into())]),
@@ -1498,7 +1500,14 @@ impl GitRepository for FakeGitRepository {
         let fs = self.fs.clone();
         let checkpoints = self.checkpoints.clone();
         let repository_dir_path = self.repository_dir_path.parent().unwrap().to_path_buf();
+        let dot_git_path = self.dot_git_path.clone();
         async move {
+            let hangs = fs.with_git_state(&dot_git_path, false, |state| {
+                state.simulated_archive_checkpoint_hang
+            })?;
+            if hangs {
+                futures::future::pending::<()>().await;
+            }
             executor.simulate_random_delay().await;
             let staged_oid = git::Oid::random(&mut *executor.rng().lock());
             let unstaged_oid = git::Oid::random(&mut *executor.rng().lock());
