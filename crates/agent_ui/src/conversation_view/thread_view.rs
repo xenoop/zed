@@ -770,6 +770,9 @@ pub struct ThreadView {
     /// Kept only while the view lives; the agent's transcript has no place
     /// for entries the agent did not see.
     sent_notes: Vec<(usize, SharedString)>,
+    /// Comments on passages of the agent's messages, shown under the
+    /// message they are about. Kept only while the view lives.
+    pub(crate) passage_comments: Vec<PassageComment>,
     /// Sandbox escalation prompts whose "surprising Unicode" warning the user
     /// has explicitly acknowledged. Until a prompt's tool call is in this set,
     /// its allow buttons stay disabled. See [`Self::sandbox_confusable_findings`].
@@ -1315,6 +1318,7 @@ impl ThreadView {
             editing_message: None,
             expanded_editor_questions: HashSet::default(),
             sent_notes: Vec::new(),
+            passage_comments: Vec::new(),
             message_queue: MessageQueue::default(),
             turn_fields: TurnFields::default(),
             discarded_partial_edits: HashSet::default(),
@@ -7478,10 +7482,54 @@ async fn record_last_turn_snapshot(
     }
 }
 
+/// Starts the message a comment on a transcript passage is sent with: the
+/// thread view shows such a turn collapsed, since the answer is shown under
+/// the passage.
+pub(crate) const PASSAGE_COMMENT_PREFIX: &str = "Comment on a passage of your reply above.";
+
+/// A comment on a passage of one of the agent's messages.
+pub(crate) struct PassageComment {
+    /// The transcript entry (an agent message) the passage is in.
+    pub(crate) entry_ix: usize,
+    pub(crate) passage: SharedString,
+    /// Where the comment is typed. Enter sends it.
+    pub(crate) input: Entity<Editor>,
+    /// The comment as sent.
+    pub(crate) comment: SharedString,
+    pub(crate) state: PassageCommentState,
+    _send_on_enter: Subscription,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PassageCommentState {
+    Writing,
+    Waiting,
+    Answered(SharedString),
+    /// Not answered; the comment stays in the input to send again.
+    Failed(SharedString),
+}
+
+/// The message a passage comment is sent to the agent with.
+pub(crate) fn passage_comment_question(passage: &str, comment: &str) -> String {
+    let mut question = format!("{PASSAGE_COMMENT_PREFIX} Answer in text.\n\n");
+    for line in passage.trim().lines() {
+        question.push_str(if line.is_empty() { ">" } else { "> " });
+        question.push_str(line);
+        question.push('\n');
+    }
+    question.push('\n');
+    question.push_str(comment.trim());
+    question.push('\n');
+    question
+}
+
 /// A one-line summary of a question asked from the editor (inline assist or
 /// review comments), or `None` for any other message.
 fn editor_question_summary(text: &str) -> Option<SharedString> {
     use super::{INLINE_QUESTION_PREFIX, INLINE_QUESTION_SUFFIX, REVIEW_QUESTION_PREFIX};
+    if text.starts_with(PASSAGE_COMMENT_PREFIX) {
+        return Some("Comment on a passage, answered under it".into());
+    }
     if let Some(summary) = crate::thread_fork::delivered_message_summary(text) {
         return Some(summary.into());
     }
@@ -7580,35 +7628,113 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let rendered = self.render_entry_or_question(entry_ix, total_entries, entry, window, cx);
-        let mut notes = self
+        let has_notes = self
             .sent_notes
             .iter()
-            .filter(|(note_ix, _)| *note_ix == entry_ix)
-            .peekable();
-        if notes.peek().is_none() {
+            .any(|(note_ix, _)| *note_ix == entry_ix);
+        let has_passage_comments = self
+            .passage_comments
+            .iter()
+            .any(|comment| comment.entry_ix == entry_ix);
+        if !has_notes && !has_passage_comments {
             return rendered;
         }
         v_flex()
             .child(rendered)
-            .children(notes.map(|(_, target)| {
-                h_flex()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .gap_1p5()
-                    .child(
-                        Icon::new(IconName::ArrowUpRight)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        Label::new(format!("Sent this reply to {target}"))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .truncate(),
-                    )
-            }))
+            .children(
+                self.passage_comments
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, comment)| comment.entry_ix == entry_ix)
+                    .map(|(index, comment)| self.render_passage_comment(index, comment, cx)),
+            )
+            .children(
+                self.sent_notes
+                    .iter()
+                    .filter(|(note_ix, _)| *note_ix == entry_ix)
+                    .map(|(_, target)| {
+                        h_flex()
+                            .w_full()
+                            .px_2()
+                            .py_1()
+                            .gap_1p5()
+                            .child(
+                                Icon::new(IconName::ArrowUpRight)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(format!("Sent this reply to {target}"))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            )
+                    }),
+            )
             .into_any_element()
+    }
+
+    /// The card of a comment on a passage: the passage, then the input, or
+    /// the comment with the agent's answer.
+    fn render_passage_comment(
+        &self,
+        index: usize,
+        comment: &PassageComment,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let passage: SharedString = comment
+            .passage
+            .lines()
+            .take(4)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into();
+        let card = v_flex()
+            .id(("passage-comment", index))
+            .mx_2()
+            .my_1()
+            .p_2()
+            .gap_1p5()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.editor_background)
+            .child(
+                div()
+                    .pl_2()
+                    .border_l_2()
+                    .border_color(colors.border_variant)
+                    .child(
+                        Label::new(passage)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            );
+        let sent_comment = || {
+            Label::new(comment.comment.clone())
+                .size(LabelSize::Small)
+                .color(Color::Default)
+        };
+        match &comment.state {
+            PassageCommentState::Writing => card.child(comment.input.clone()),
+            PassageCommentState::Waiting => card.child(sent_comment()).child(
+                Label::new("Waiting for the agent…")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            ),
+            PassageCommentState::Answered(answer) => card
+                .child(sent_comment())
+                .child(Label::new(answer.clone()).size(LabelSize::Small)),
+            PassageCommentState::Failed(error) => card
+                .child(
+                    Label::new(error.clone())
+                        .size(LabelSize::Small)
+                        .color(Color::Error),
+                )
+                .child(comment.input.clone()),
+        }
+        .into_any_element()
     }
 
     fn render_entry_or_question(
@@ -9293,7 +9419,12 @@ impl ThreadView {
                                 Some(Box::new(zed_actions::agent::CommentOnTranscriptSelection)),
                                 move |window, cx| {
                                     entity.update(cx, |this, cx| {
-                                        this.comment_on_passage(&selected_text, window, cx);
+                                        this.comment_on_passage(
+                                            entry_ix,
+                                            &selected_text,
+                                            window,
+                                            cx,
+                                        );
                                     });
                                 },
                             )
@@ -9318,47 +9449,162 @@ impl ThreadView {
             .into_any_element()
     }
 
-    /// The text selected in one of the agent's messages, as markdown source.
-    fn selected_transcript_passage(&self, cx: &App) -> Option<String> {
-        self.thread.read(cx).entries().iter().find_map(|entry| {
-            let AgentThreadEntry::AssistantMessage(message) = entry else {
-                return None;
-            };
-            message.chunks.iter().find_map(|chunk| {
-                let (AssistantMessageChunk::Message { block, .. }
-                | AssistantMessageChunk::Thought { block, .. }) = chunk;
-                block.markdowns().find_map(|markdown| {
-                    let passage = markdown.read(cx).selected_source()?;
-                    (!passage.trim().is_empty()).then(|| passage.to_string())
+    /// The text selected in one of the agent's messages, as markdown source,
+    /// with the index of that message's transcript entry.
+    fn selected_transcript_passage(&self, cx: &App) -> Option<(usize, String)> {
+        self.thread
+            .read(cx)
+            .entries()
+            .iter()
+            .enumerate()
+            .find_map(|(entry_ix, entry)| {
+                let AgentThreadEntry::AssistantMessage(message) = entry else {
+                    return None;
+                };
+                message.chunks.iter().find_map(|chunk| {
+                    let (AssistantMessageChunk::Message { block, .. }
+                    | AssistantMessageChunk::Thought { block, .. }) = chunk;
+                    block.markdowns().find_map(|markdown| {
+                        let passage = markdown.read(cx).selected_source()?;
+                        (!passage.trim().is_empty()).then(|| (entry_ix, passage.to_string()))
+                    })
                 })
             })
-        })
     }
 
-    /// Starts a comment on a passage of the transcript: the passage goes into
-    /// the message editor as a quote, with the cursor after it. Sending it is
-    /// an ordinary message, so the answer follows in the thread.
+    /// Starts a comment on a passage of the transcript: a card opens under
+    /// the message at `entry_ix`, with the passage quoted and an input for
+    /// the comment. Enter sends it to the agent, and the answer is shown in
+    /// the card.
     pub(crate) fn comment_on_passage(
         &mut self,
+        entry_ix: usize,
         passage: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut quote = String::new();
-        for line in passage.trim().lines() {
-            quote.push_str(if line.is_empty() { ">" } else { "> " });
-            quote.push_str(line);
-            quote.push('\n');
-        }
-        quote.push('\n');
-        self.message_editor.update(cx, |message_editor, cx| {
-            let needs_break = !message_editor.is_empty(cx);
-            if needs_break {
-                message_editor.insert_text("\n\n", window, cx);
-            }
-            message_editor.insert_text(&quote, window, cx);
-            message_editor.focus_handle(cx).focus(window, cx);
+        let input = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Comment on this passage…", window, cx);
+            editor
         });
+        let this = cx.weak_entity();
+        let input_id = input.entity_id();
+        let send_on_enter = input.update(cx, |editor, _| {
+            editor.register_action(move |_: &editor::actions::Newline, window, cx| {
+                this.update(cx, |this, cx| {
+                    let index = this
+                        .passage_comments
+                        .iter()
+                        .position(|comment| comment.input.entity_id() == input_id);
+                    if let Some(index) = index {
+                        this.send_passage_comment(index, window, cx);
+                    }
+                })
+                .ok();
+            })
+        });
+        input.focus_handle(cx).focus(window, cx);
+        self.passage_comments.push(PassageComment {
+            entry_ix,
+            passage: passage.trim().to_string().into(),
+            input,
+            comment: SharedString::default(),
+            state: PassageCommentState::Writing,
+            _send_on_enter: send_on_enter,
+        });
+        cx.notify();
+    }
+
+    /// Sends the comment typed in a passage card to the agent; the answer,
+    /// or the reason there is none, ends up in the card.
+    pub(crate) fn send_passage_comment(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(passage_comment) = self.passage_comments.get(index) else {
+            return;
+        };
+        if passage_comment.state == PassageCommentState::Waiting {
+            return;
+        }
+        let comment = passage_comment.input.read(cx).text(cx).trim().to_string();
+        if comment.is_empty() {
+            return;
+        }
+        let question = passage_comment_question(&passage_comment.passage, &comment);
+        let input = passage_comment.input.clone();
+
+        let set_state =
+            move |this: &mut Self, state: PassageCommentState, cx: &mut Context<Self>| {
+                if let Some(passage_comment) = this
+                    .passage_comments
+                    .iter_mut()
+                    .find(|passage_comment| passage_comment.input == input)
+                {
+                    passage_comment.state = state;
+                }
+                cx.notify();
+            };
+
+        // A turn in progress would end first and be taken for the answer.
+        if self.thread.read(cx).status() == ThreadStatus::Generating {
+            set_state(
+                self,
+                PassageCommentState::Failed(
+                    "The agent is still working on something else. Send again when it is done."
+                        .into(),
+                ),
+                cx,
+            );
+            return;
+        }
+
+        let thread = self.thread.clone();
+        let first_new_entry = thread.read(cx).entries().len();
+        let (answer_tx, answer_rx) = futures::channel::oneshot::channel();
+        let mut answer_tx = Some(answer_tx);
+        let subscription = cx.subscribe(&thread, move |_, thread, event, cx| {
+            let result = match event {
+                AcpThreadEvent::Stopped { .. } => {
+                    Ok(super::final_answer(thread.read(cx), first_new_entry, cx))
+                }
+                AcpThreadEvent::Error => Err("The agent stopped with an error."),
+                AcpThreadEvent::Refusal => Err("The agent refused to answer."),
+                AcpThreadEvent::ConnectionLost => Err("The agent's connection was lost."),
+                _ => return,
+            };
+            if let Some(answer_tx) = answer_tx.take() {
+                answer_tx.send(result).ok();
+            }
+        });
+
+        if let Some(passage_comment) = self.passage_comments.get_mut(index) {
+            passage_comment.comment = comment.into();
+            passage_comment.state = PassageCommentState::Waiting;
+        }
+        self.send_content(
+            Task::ready(Ok(Some((vec![question.into()], Vec::new())))),
+            false,
+            window,
+            cx,
+        );
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let _subscription = subscription;
+            let state = match answer_rx.await {
+                Ok(Ok(answer)) => PassageCommentState::Answered(answer.into()),
+                Ok(Err(error)) => PassageCommentState::Failed(error.into()),
+                Err(_) => {
+                    PassageCommentState::Failed("The thread was closed before it answered.".into())
+                }
+            };
+            this.update(cx, |this, cx| set_state(this, state, cx)).ok();
+        })
+        .detach();
     }
 
     fn agent_message_copy_index(
@@ -14349,7 +14595,9 @@ impl Render for ThreadView {
             .on_action(cx.listener(
                 |this, _: &zed_actions::agent::CommentOnTranscriptSelection, window, cx| {
                     match this.selected_transcript_passage(cx) {
-                        Some(passage) => this.comment_on_passage(&passage, window, cx),
+                        Some((entry_ix, passage)) => {
+                            this.comment_on_passage(entry_ix, &passage, window, cx)
+                        }
                         None => cx.propagate(),
                     }
                 },
@@ -15117,6 +15365,11 @@ mod tests {
             None
         );
         assert_eq!(editor_question_summary("hello"), None);
+        // A comment on a transcript passage is answered in its card.
+        assert_eq!(
+            editor_question_summary(&passage_comment_question("a passage", "Why?")).as_deref(),
+            Some("Comment on a passage, answered under it")
+        );
     }
 
     #[test]

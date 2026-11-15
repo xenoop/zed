@@ -6779,39 +6779,95 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    async fn test_comment_on_transcript_passage_quotes_it(cx: &mut TestAppContext) {
+    async fn test_comment_on_transcript_passage(cx: &mut TestAppContext) {
+        use crate::conversation_view::thread_view::{PASSAGE_COMMENT_PREFIX, PassageCommentState};
+
         init_test(cx);
 
         let connection = StubAgentConnection::new();
         let (conversation_view, cx) =
-            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
         add_to_workspace(conversation_view.clone(), cx);
         let thread_view = active_thread(&conversation_view, cx);
         let message_editor = message_editor(&conversation_view, cx);
 
+        // A finished turn to comment on.
+        let finish_first = connection.defer_next_prompt_response();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        finish_first
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
+
+        // Commenting opens a card under the message, ready to type in; the
+        // message editor is left alone.
         thread_view.update_in(cx, |view, window, cx| {
-            view.comment_on_passage("first line\n\nsecond line\n", window, cx);
+            view.comment_on_passage(0, "first line\n\nsecond line\n", window, cx);
         });
         cx.run_until_parked();
-        assert_eq!(
-            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
-            "> first line\n>\n> second line\n\n"
-        );
-        assert!(message_editor.update_in(cx, |editor, window, cx| {
-            editor.focus_handle(cx).is_focused(window)
+        let input = thread_view.read_with(cx, |view, _| {
+            assert_eq!(view.passage_comments.len(), 1);
+            let comment = &view.passage_comments[0];
+            assert_eq!(comment.entry_ix, 0);
+            assert_eq!(comment.passage.as_ref(), "first line\n\nsecond line");
+            assert_eq!(comment.state, PassageCommentState::Writing);
+            comment.input.clone()
+        });
+        assert!(input.update_in(cx, |input, window, cx| {
+            input.focus_handle(cx).is_focused(window)
         }));
-
-        // A second passage is added after what is already written.
-        message_editor.update_in(cx, |editor, window, cx| {
-            editor.insert_text("Why?", window, cx);
-        });
-        thread_view.update_in(cx, |view, window, cx| {
-            view.comment_on_passage("another", window, cx);
-        });
         assert_eq!(
             message_editor.read_with(cx, |editor, cx| editor.text(cx)),
-            "> first line\n>\n> second line\n\nWhy?\n\n> another\n\n"
+            ""
         );
+
+        // Sending passes the comment to the agent with the passage quoted.
+        let finish_answer = connection.defer_next_prompt_response();
+        input.update_in(cx, |input, window, cx| input.set_text("Why?", window, cx));
+        // (Enter in the card runs this; the test loads no keymap.)
+        thread_view.update_in(cx, |view, window, cx| {
+            view.send_passage_comment(0, window, cx)
+        });
+        cx.run_until_parked();
+        let question = thread_view.read_with(cx, |view, cx| {
+            assert_eq!(view.passage_comments[0].state, PassageCommentState::Waiting);
+            assert_eq!(view.passage_comments[0].comment.as_ref(), "Why?");
+            view.thread
+                .read(cx)
+                .entries()
+                .iter()
+                .rev()
+                .find_map(|entry| match entry {
+                    AgentThreadEntry::UserMessage(message) => Some(message.content.to_markdown(cx)),
+                    _ => None,
+                })
+                .unwrap()
+        });
+        assert!(question.starts_with(PASSAGE_COMMENT_PREFIX), "{question}");
+        assert!(
+            question.ends_with("> first line\n>\n> second line\n\nWhy?\n"),
+            "{question}"
+        );
+
+        // When the turn ends, its answer lands in the card.
+        finish_answer
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, _| {
+            assert!(
+                matches!(
+                    view.passage_comments[0].state,
+                    PassageCommentState::Answered(_)
+                ),
+                "{:?}",
+                view.passage_comments[0].state
+            );
+        });
     }
 
     #[gpui::test]
