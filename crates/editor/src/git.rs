@@ -811,7 +811,7 @@ impl Editor {
         let range = self
             .hidden_review_comment_markers
             .iter()
-            .map(|(_, marker_range)| marker_range.clone())
+            .map(|(_, marker_range, _)| marker_range.clone())
             .find(|marker_range| {
                 (marker_range.start.to_point(buffer_snapshot).row
                     ..=marker_range.end.to_point(buffer_snapshot).row)
@@ -830,7 +830,16 @@ impl Editor {
     pub fn hidden_review_comment_marker_ranges(&self) -> Vec<Range<Anchor>> {
         self.hidden_review_comment_markers
             .iter()
-            .map(|(_, range)| range.clone())
+            .map(|(_, range, _)| range.clone())
+            .collect()
+    }
+
+    /// The text of each marker shown while the boxes are hidden.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hidden_review_comment_marker_labels(&self) -> Vec<SharedString> {
+        self.hidden_review_comment_markers
+            .iter()
+            .map(|(_, _, label)| label.clone())
             .collect()
     }
 
@@ -853,7 +862,7 @@ impl Editor {
         let marker_blocks: HashSet<CustomBlockId> = self
             .hidden_review_comment_markers
             .drain(..)
-            .map(|(block_id, _)| block_id)
+            .map(|(block_id, _, _)| block_id)
             .collect();
         if !marker_blocks.is_empty() {
             self.remove_blocks(marker_blocks, None, cx);
@@ -865,19 +874,7 @@ impl Editor {
             .collect();
         if hidden {
             self.dismiss_all_diff_review_overlays(cx);
-            for range in ranges {
-                self.highlight_rows::<HiddenReviewComments>(
-                    range,
-                    |cx| {
-                        cx.theme()
-                            .colors()
-                            .editor_document_highlight_read_background
-                    },
-                    RowHighlightOptions::default(),
-                    cx,
-                );
-            }
-            self.insert_hidden_review_comment_markers(cx);
+            self.refresh_hidden_review_comment_markers(cx);
         } else {
             for range in ranges {
                 let snapshot = self.snapshot(window, cx);
@@ -892,6 +889,50 @@ impl Editor {
         cx.notify();
     }
 
+    /// While comments are hidden: puts the markers and highlights back to
+    /// match the current comments. Places whose box is open have none.
+    fn refresh_hidden_review_comment_markers(&mut self, cx: &mut Context<Self>) {
+        if !self.review_comments_hidden {
+            return;
+        }
+        self.clear_row_highlights::<HiddenReviewComments>();
+        let marker_blocks: HashSet<CustomBlockId> = self
+            .hidden_review_comment_markers
+            .drain(..)
+            .map(|(block_id, _, _)| block_id)
+            .collect();
+        if !marker_blocks.is_empty() {
+            self.remove_blocks(marker_blocks, None, cx);
+        }
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let ranges: Vec<Range<Anchor>> = self
+            .stored_review_comments
+            .iter()
+            .filter(|(hunk_key, _)| !self.has_open_review_box(hunk_key, &snapshot))
+            .flat_map(|(_, comments)| comments.iter().map(|comment| comment.range.clone()))
+            .collect();
+        for range in ranges {
+            self.highlight_rows::<HiddenReviewComments>(
+                range,
+                |cx| {
+                    cx.theme()
+                        .colors()
+                        .editor_document_highlight_read_background
+                },
+                RowHighlightOptions::default(),
+                cx,
+            );
+        }
+        self.insert_hidden_review_comment_markers(cx);
+        cx.notify();
+    }
+
+    fn has_open_review_box(&self, hunk_key: &DiffHunkKey, snapshot: &MultiBufferSnapshot) -> bool {
+        self.diff_review_overlays
+            .iter()
+            .any(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, snapshot))
+    }
+
     /// Puts a one-line marker under each place that has comments: how many,
     /// and whether the agent answered. Clicking one opens its comments.
     fn insert_hidden_review_comment_markers(&mut self, cx: &mut Context<Self>) {
@@ -899,7 +940,11 @@ impl Editor {
         let editor = cx.entity().downgrade();
         let mut blocks = Vec::new();
         let mut ranges = Vec::new();
-        for (index, (_, comments)) in self.stored_review_comments.iter().enumerate() {
+        let mut labels = Vec::new();
+        for (index, (hunk_key, comments)) in self.stored_review_comments.iter().enumerate() {
+            if self.has_open_review_box(hunk_key, &snapshot) {
+                continue;
+            }
             let Some(start) = comments
                 .iter()
                 .map(|comment| comment.range.start)
@@ -921,6 +966,7 @@ impl Editor {
                 .count();
             let label = hidden_review_comment_marker_label(count, answered);
             let range = start..end;
+            labels.push(label.clone());
             blocks.push(BlockProperties {
                 style: BlockStyle::Sticky,
                 placement: BlockPlacement::Below(end),
@@ -961,7 +1007,12 @@ impl Editor {
             ranges.push(range);
         }
         let block_ids = self.insert_blocks(blocks, None, cx);
-        self.hidden_review_comment_markers = block_ids.into_iter().zip(ranges).collect();
+        self.hidden_review_comment_markers = block_ids
+            .into_iter()
+            .zip(ranges)
+            .zip(labels)
+            .map(|((block_id, range), label)| (block_id, range, label))
+            .collect();
     }
 
     /// While comments are hidden: opens the box of the comments in `range`
@@ -988,7 +1039,7 @@ impl Editor {
         let covered = range.start.to_point(buffer_snapshot)..=range.end.to_point(buffer_snapshot);
         let mut marker_blocks = HashSet::default();
         self.hidden_review_comment_markers
-            .retain(|(block_id, marker_range)| {
+            .retain(|(block_id, marker_range, _)| {
                 let inside = covered.contains(&marker_range.start.to_point(buffer_snapshot));
                 if inside {
                     marker_blocks.insert(*block_id);
@@ -1063,16 +1114,13 @@ impl Editor {
             .map(|(prompt_editor, _)| prompt_editor)
     }
 
-    /// Like `open_diff_review_overlay`, also returning the anchors of the
-    /// requested rows. An existing box for the same start row is reused, so
-    /// this range can differ from the one the box was first opened for.
-    fn open_diff_review_overlay_with_range(
-        &mut self,
+    /// The key and anchors of a review comment on the given rows.
+    fn review_hunk_key_and_range(
+        &self,
         display_range: Range<DisplayRow>,
-        focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<(Entity<Editor>, Range<Anchor>)> {
+    ) -> (DiffHunkKey, Range<Anchor>) {
         let Range { start, end } = display_range.sorted();
 
         let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
@@ -1095,7 +1143,6 @@ impl Editor {
         let anchor_range =
             buffer_snapshot.anchor_after(start_point)..buffer_snapshot.anchor_before(line_end);
 
-        // Compute the hunk key for this display row
         let hunk_start_anchor = buffer_snapshot.anchor_before(start_point);
         // `file_at` finds no file on the very first row of a multibuffer, so
         // the file comes from the buffer that holds the start anchor.
@@ -1105,10 +1152,26 @@ impl Editor {
             .or_else(|| buffer_snapshot.file_at(start_point))
             .map(|file: &Arc<dyn language::File>| file.path().clone())
             .unwrap_or_else(|| Arc::from(util::rel_path::RelPath::empty()));
-        let new_hunk_key = DiffHunkKey {
+        let hunk_key = DiffHunkKey {
             file_path,
             hunk_start_anchor,
         };
+        (hunk_key, anchor_range)
+    }
+
+    /// Like `open_diff_review_overlay`, also returning the anchors of the
+    /// requested rows. An existing box for the same start row is reused, so
+    /// this range can differ from the one the box was first opened for.
+    fn open_diff_review_overlay_with_range(
+        &mut self,
+        display_range: Range<DisplayRow>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(Entity<Editor>, Range<Anchor>)> {
+        let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        let (new_hunk_key, anchor_range) =
+            self.review_hunk_key_and_range(display_range, window, cx);
 
         // Check if we already have an overlay for this hunk
         if let Some(existing_overlay) = self.diff_review_overlays.iter_mut().find(|overlay| {
@@ -1142,10 +1205,8 @@ impl Editor {
                 .map(|user| user.avatar_uri.clone())
         });
 
-        // Create anchor at the end of the last row so the block appears immediately below it
-        // Use multibuffer coordinates for anchor creation
-        let line_len = buffer_snapshot.line_len(end_multi_buffer_row);
-        let anchor = buffer_snapshot.anchor_after(Point::new(end_multi_buffer_row.0, line_len));
+        // The block goes right below the last row of the range.
+        let anchor = buffer_snapshot.anchor_after(anchor_range.end.to_point(&buffer_snapshot));
 
         // Use the hunk key we already computed
         let hunk_key = new_hunk_key;
@@ -1315,20 +1376,25 @@ impl Editor {
             let snapshot = self.snapshot(window, cx);
             let rows = start.to_display_point(&snapshot.display_snapshot).row()
                 ..end.to_display_point(&snapshot.display_snapshot).row();
-            let Some((prompt_editor, anchor_range)) =
-                self.open_diff_review_overlay_with_range(rows, false, window, cx)
-            else {
-                unplaced.push(saved_comment);
-                continue;
-            };
-            let Some(hunk_key) = self
-                .diff_review_overlays
-                .iter()
-                .find(|overlay| overlay.prompt_editor == prompt_editor)
-                .map(|overlay| overlay.hunk_key.clone())
-            else {
-                unplaced.push(saved_comment);
-                continue;
+            let (hunk_key, anchor_range) = if self.review_comments_hidden {
+                self.review_hunk_key_and_range(rows, window, cx)
+            } else {
+                let Some((prompt_editor, anchor_range)) =
+                    self.open_diff_review_overlay_with_range(rows, false, window, cx)
+                else {
+                    unplaced.push(saved_comment);
+                    continue;
+                };
+                let Some(hunk_key) = self
+                    .diff_review_overlays
+                    .iter()
+                    .find(|overlay| overlay.prompt_editor == prompt_editor)
+                    .map(|overlay| overlay.hunk_key.clone())
+                else {
+                    unplaced.push(saved_comment);
+                    continue;
+                };
+                (hunk_key, anchor_range)
             };
             let id =
                 self.add_review_comment(hunk_key.clone(), saved_comment.comment, anchor_range, cx);
@@ -1342,6 +1408,7 @@ impl Editor {
             }
             self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
         }
+        self.refresh_hidden_review_comment_markers(cx);
         cx.emit(EditorEvent::ReviewCommentsChanged {
             total_count: self.unsent_review_comment_count(),
         });
@@ -1835,6 +1902,7 @@ impl Editor {
         for (_, comments) in self.stored_review_comments.iter_mut() {
             if let Some(index) = comments.iter().position(|c| c.id == id) {
                 comments.remove(index);
+                self.refresh_hidden_review_comment_markers(cx);
                 cx.emit(EditorEvent::ReviewCommentsChanged {
                     total_count: self.unsent_review_comment_count(),
                 });
@@ -1909,6 +1977,7 @@ impl Editor {
 
         let new_count = self.unsent_review_comment_count();
         if new_count != original_count {
+            self.refresh_hidden_review_comment_markers(cx);
             cx.emit(EditorEvent::ReviewCommentsChanged {
                 total_count: new_count,
             });
@@ -3742,6 +3811,7 @@ impl Editor {
         for hunk_key in &changed_hunks {
             self.refresh_diff_review_overlay_height(hunk_key, window, cx);
         }
+        self.refresh_hidden_review_comment_markers(cx);
         cx.emit(EditorEvent::ReviewCommentsChanged {
             total_count: self.unsent_review_comment_count(),
         });
@@ -3816,6 +3886,7 @@ impl Editor {
         let comments = std::mem::take(&mut self.stored_review_comments);
         // Reset the ID counter since all comments have been taken
         self.next_review_comment_id = 0;
+        self.refresh_hidden_review_comment_markers(cx);
         cx.emit(EditorEvent::ReviewCommentsChanged { total_count: 0 });
         cx.notify();
         comments

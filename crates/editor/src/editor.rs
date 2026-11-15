@@ -1187,7 +1187,7 @@ pub struct Editor {
     review_comments_hidden: bool,
     /// While review comments are hidden: the one-line marker under each
     /// commented place, with the range its comments cover.
-    hidden_review_comment_markers: Vec<(CustomBlockId, Range<Anchor>)>,
+    hidden_review_comment_markers: Vec<(CustomBlockId, Range<Anchor>, SharedString)>,
     hovered_diff_hunk_row: Option<DisplayRow>,
     lsp_data_tasks: HashMap<BufferId, HashMap<LspDataKind, Shared<Task<()>>>>,
     offscreen_lsp_data_tasks: HashMap<LspDataKind, (BufferId, Task<()>)>,

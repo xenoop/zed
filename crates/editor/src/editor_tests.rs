@@ -51874,3 +51874,84 @@ fn test_second_review_comment_keeps_its_own_range(cx: &mut TestAppContext) {
         );
     });
 }
+
+async fn editor_on_file_with_one_line_comment(
+    cx: &mut TestAppContext,
+) -> (Entity<Editor>, &mut VisualTestContext) {
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/root"), json!({ "file.rs": "one\ntwo\nthree\n" }))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/root/file.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    cx.add_window_view(|window, cx| {
+        build_editor_with_project(project.clone(), multi_buffer, window, cx)
+    })
+}
+
+fn saved_comment_on_first_line() -> SavedReviewComment {
+    SavedReviewComment {
+        file_path: "file.rs".to_string(),
+        start_row: 0,
+        end_row: 0,
+        code: "one".to_string(),
+        comment: "Why?".to_string(),
+        answer: None,
+        outdated: false,
+    }
+}
+
+#[gpui::test]
+async fn test_hidden_review_comment_markers_follow_the_answers(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let (editor, cx) = editor_on_file_with_one_line_comment(cx).await;
+
+    editor.update_in(cx, |editor, window, cx| {
+        let unplaced =
+            editor.restore_review_comments(vec![saved_comment_on_first_line()], window, cx);
+        assert!(unplaced.is_empty());
+        editor.set_review_comments_hidden(true, window, cx);
+        assert_eq!(
+            editor.hidden_review_comment_marker_labels(),
+            vec![SharedString::from("1 comment, not answered yet")]
+        );
+
+        let id = editor.stored_review_comments[0].1[0].id;
+        editor.set_review_comment_replies(
+            vec![(id, AgentReply::Answered("Because.".to_string()))],
+            window,
+            cx,
+        );
+        assert_eq!(
+            editor.hidden_review_comment_marker_labels(),
+            vec![SharedString::from("1 comment, answered")]
+        );
+        assert_eq!(editor.hidden_review_comment_marker_count(cx), 1);
+    });
+}
+
+#[gpui::test]
+async fn test_restoring_review_comments_while_hidden_opens_no_box(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let (editor, cx) = editor_on_file_with_one_line_comment(cx).await;
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.set_review_comments_hidden(true, window, cx);
+        let unplaced =
+            editor.restore_review_comments(vec![saved_comment_on_first_line()], window, cx);
+        assert!(unplaced.is_empty());
+
+        assert!(editor.diff_review_overlays.is_empty());
+        assert_eq!(editor.total_review_comment_count(), 1);
+        assert_eq!(
+            editor.hidden_review_comment_marker_labels(),
+            vec![SharedString::from("1 comment, not answered yet")]
+        );
+        assert_eq!(editor.hidden_review_comment_marker_count(cx), 1);
+    });
+}
