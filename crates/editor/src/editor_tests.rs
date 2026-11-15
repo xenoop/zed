@@ -51831,3 +51831,46 @@ fn test_hidden_review_comments_leave_markers(cx: &mut TestAppContext) {
         assert_eq!(editor.diff_review_overlays.len(), 2);
     });
 }
+
+#[gpui::test]
+fn test_second_review_comment_keeps_its_own_range(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("one\ntwo\nthree\nfour\n", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    _ = editor.update(cx, |editor: &mut Editor, window, cx| {
+        for (rows, text) in [(0..0, "First"), (0..2, "Second")] {
+            let snapshot = editor.snapshot(window, cx);
+            let display_row = |row: u32| {
+                Point::new(row, 0)
+                    .to_display_point(&snapshot.display_snapshot)
+                    .row()
+            };
+            let prompt_editor = editor
+                .open_diff_review_overlay(
+                    display_row(rows.start)..display_row(rows.end),
+                    true,
+                    window,
+                    cx,
+                )
+                .expect("review box opens");
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.set_text(text, window, cx);
+            });
+            editor.submit_diff_review_comment(window, cx);
+        }
+
+        assert_eq!(editor.diff_review_overlays.len(), 1);
+        let saved = editor.saved_review_comments(cx);
+        assert_eq!(
+            saved
+                .iter()
+                .map(|comment| (comment.comment.as_str(), comment.start_row, comment.end_row))
+                .collect::<Vec<_>>(),
+            vec![("First", 0, 0), ("Second", 0, 2)]
+        );
+    });
+}

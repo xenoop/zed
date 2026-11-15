@@ -1052,13 +1052,27 @@ impl Editor {
 
     /// Opens (or focuses) the review box for the given rows and returns its
     /// input editor.
-    fn open_diff_review_overlay(
+    pub(super) fn open_diff_review_overlay(
         &mut self,
         display_range: Range<DisplayRow>,
         focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<Editor>> {
+        self.open_diff_review_overlay_with_range(display_range, focus, window, cx)
+            .map(|(prompt_editor, _)| prompt_editor)
+    }
+
+    /// Like `open_diff_review_overlay`, also returning the anchors of the
+    /// requested rows. An existing box for the same start row is reused, so
+    /// this range can differ from the one the box was first opened for.
+    fn open_diff_review_overlay_with_range(
+        &mut self,
+        display_range: Range<DisplayRow>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(Entity<Editor>, Range<Anchor>)> {
         let Range { start, end } = display_range.sorted();
 
         let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
@@ -1093,17 +1107,19 @@ impl Editor {
         };
 
         // Check if we already have an overlay for this hunk
-        if let Some(existing_overlay) = self.diff_review_overlays.iter().find(|overlay| {
+        if let Some(existing_overlay) = self.diff_review_overlays.iter_mut().find(|overlay| {
             Self::hunk_keys_match(&overlay.hunk_key, &new_hunk_key, &buffer_snapshot)
         }) {
             // Just focus the existing overlay's prompt editor
             let prompt_editor = existing_overlay.prompt_editor.clone();
             if focus {
+                // A comment submitted now belongs to the rows it was started for.
+                existing_overlay.anchor_range = anchor_range.clone();
                 let focus_handle = prompt_editor.focus_handle(cx);
                 window.focus(&focus_handle, cx);
                 cx.emit(EditorEvent::ReviewCommentBoxOpened);
             }
-            return Some(prompt_editor);
+            return Some((prompt_editor, anchor_range));
         }
 
         // Dismiss overlays that have no comments for their hunks. Restoring
@@ -1193,7 +1209,7 @@ impl Editor {
         };
 
         self.diff_review_overlays.push(DiffReviewOverlay {
-            anchor_range,
+            anchor_range: anchor_range.clone(),
             block_id,
             prompt_editor: prompt_editor.clone(),
             hunk_key,
@@ -1211,7 +1227,7 @@ impl Editor {
         }
 
         cx.notify();
-        Some(prompt_editor)
+        Some((prompt_editor, anchor_range))
     }
 
     /// The review comments in a form that survives a restart: located by file
@@ -1295,15 +1311,17 @@ impl Editor {
             let snapshot = self.snapshot(window, cx);
             let rows = start.to_display_point(&snapshot.display_snapshot).row()
                 ..end.to_display_point(&snapshot.display_snapshot).row();
-            let Some(prompt_editor) = self.open_diff_review_overlay(rows, false, window, cx) else {
+            let Some((prompt_editor, anchor_range)) =
+                self.open_diff_review_overlay_with_range(rows, false, window, cx)
+            else {
                 unplaced.push(saved_comment);
                 continue;
             };
-            let Some((hunk_key, anchor_range)) = self
+            let Some(hunk_key) = self
                 .diff_review_overlays
                 .iter()
                 .find(|overlay| overlay.prompt_editor == prompt_editor)
-                .map(|overlay| (overlay.hunk_key.clone(), overlay.anchor_range.clone()))
+                .map(|overlay| overlay.hunk_key.clone())
             else {
                 unplaced.push(saved_comment);
                 continue;
