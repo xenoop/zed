@@ -625,8 +625,9 @@ pub(crate) async fn snapshot(
          cp \"$(git rev-parse --absolute-git-dir)/index\" \"$index\" 2>/dev/null; \
          tree=$(GIT_INDEX_FILE=\"$index\" git add --all && GIT_INDEX_FILE=\"$index\" git write-tree); \
          status=$?; rm -f \"$index\"; [ $status -eq 0 ] || exit $status; \
+         if git rev-parse --verify -q HEAD >/dev/null; then set -- -p HEAD; else set --; fi; \
          git -c user.name=Zed -c user.email=zed@localhost \
-         commit-tree \"$tree\" -p HEAD -m 'Zed fork snapshot'",
+         commit-tree \"$tree\" \"$@\" -m 'Zed fork snapshot'",
         directory = quote(directory),
     );
     let sha = run_script(project, script, cx)
@@ -1510,6 +1511,35 @@ mod tests {
             "/definitely/not/here"
         );
         assert_eq!(normalize_path("/"), "/");
+    }
+
+    #[gpui::test]
+    async fn test_snapshot_of_a_repository_without_commits(cx: &mut TestAppContext) {
+        init_test(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().canonicalize().unwrap().join("repo");
+        std::fs::create_dir_all(&repository).unwrap();
+        git(&repository, &["init", "-b", "main"]);
+        std::fs::write(repository.join("a.txt"), "draft\n").unwrap();
+        let project = Project::test(
+            fs::RealFs::new(None, cx.executor()),
+            [repository.as_path()],
+            cx,
+        )
+        .await;
+
+        let mut async_cx = cx.to_async();
+        let sha = snapshot(&project, &repository.to_string_lossy(), &mut async_cx)
+            .await
+            .unwrap();
+        assert_eq!(
+            git(&repository, &["rev-list", "--parents", "-n1", &sha]),
+            sha
+        );
+        assert_eq!(
+            git(&repository, &["show", &format!("{sha}:a.txt")]),
+            "draft"
+        );
     }
 
     #[gpui::test]
