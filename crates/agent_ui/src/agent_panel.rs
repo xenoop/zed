@@ -3547,14 +3547,16 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        // Review and land forks have flows of their own.
         let mut records = self
             .working_tree_path(cx)
             .map(|path| crate::thread_fork::records_for_parent(&path, cx))
             .unwrap_or_default();
+        records.retain(|record| record.kind == crate::thread_fork::ForkKind::Fork);
         match (records.pop(), records.is_empty()) {
             (Some(record), true) => self.merge_fork(record, window, cx),
             (Some(_), false) => Task::ready(Err(anyhow!(
-                "This working tree has several forks: pick one from the Forks menu"
+                "This working tree has several forks to pull from: pick one from the Forks menu"
             ))),
             (None, _) => Task::ready(Err(anyhow!("This working tree has no forks"))),
         }
@@ -16189,6 +16191,13 @@ mod tests {
             record.parent_thread_id = None;
             crate::thread_fork::upsert_record(record, cx);
         });
+        let error = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.pull_from_only_fork(window, cx)
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no forks"), "{error:#}");
         for (panel, cx) in [(&panel, &mut cx), (&fork_panel, &mut fork_cx)] {
             let workspace = panel.read_with(cx, |panel, _| panel.workspace.upgrade().unwrap());
             workspace.update_in(cx, |workspace, window, cx| {
