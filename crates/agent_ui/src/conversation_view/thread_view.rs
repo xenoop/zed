@@ -1070,7 +1070,15 @@ impl ThreadView {
         }));
 
         let has_slash_completions = session_capabilities.read().has_slash_completions();
-        let placeholder = placeholder_text(agent_display_name.as_ref(), has_slash_completions);
+        let placeholder = match project.upgrade() {
+            Some(project) => super::message_placeholder(
+                agent_display_name.as_ref(),
+                has_slash_completions,
+                project.read(cx),
+                cx,
+            ),
+            None => placeholder_text(agent_display_name.as_ref(), has_slash_completions),
+        };
 
         let mut should_auto_submit = false;
         let mut show_external_source_prompt_warning = false;
@@ -2470,9 +2478,18 @@ impl ThreadView {
             let Some((contents, tracked_buffers)) = contents_task.await? else {
                 return Ok(());
             };
-            // Before the agent can edit anything, so the Changes view can show
-            // what this turn changed.
-            record_last_turn_snapshot(&snapshot_project, cx).await;
+            let answered_elsewhere = contents.iter().find_map(|block| match block {
+                acp_v2::ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            });
+            let answered_elsewhere = answered_elsewhere
+                .and_then(editor_question_summary)
+                .is_some_and(|question| question.answered_elsewhere);
+            if !answered_elsewhere {
+                // Before the agent can edit anything, so the Changes view can show
+                // what this turn changed.
+                record_last_turn_snapshot(&snapshot_project, cx).await;
+            }
 
             let uses_reported_activity =
                 thread.read_with(cx, |thread, _| thread.uses_reported_activity())?;
@@ -7612,16 +7629,33 @@ pub(crate) fn passage_comment_question(passage: &str, comment: &str) -> String {
     question
 }
 
-/// A one-line summary of a question asked from the editor (inline assist or
-/// review comments), or `None` for any other message.
-fn editor_question_summary(text: &str) -> Option<SharedString> {
+/// How a message Zed generated is shown in the transcript.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct EditorQuestion {
+    pub summary: SharedString,
+    /// The answer is shown outside the transcript (in the diff, the editor or
+    /// under a passage), so the whole turn collapses. Otherwise only the
+    /// message itself does, and the agent's reply stays visible.
+    pub answered_elsewhere: bool,
+}
+
+/// A one-line summary of a message Zed generated (a question asked from the
+/// editor, review comments, a fork, a verdict...), or `None` for any other
+/// message.
+fn editor_question_summary(text: &str) -> Option<EditorQuestion> {
     use super::{INLINE_QUESTION_MARKER, INLINE_QUESTION_PREFIX, REVIEW_QUESTION_MARKER};
     use crate::thread_fork::{FORK_CONTEXT_PREFIX, FORK_MARKER, marked_body};
     if marked_body(text, PASSAGE_COMMENT_MARKER).is_some() {
-        return Some("Comment on a passage, answered under it".into());
+        return Some(EditorQuestion {
+            summary: "Comment on a passage, answered under it".into(),
+            answered_elsewhere: true,
+        });
     }
     if let Some(summary) = crate::thread_fork::delivered_message_summary(text) {
-        return Some(summary.into());
+        return Some(EditorQuestion {
+            summary: summary.into(),
+            answered_elsewhere: false,
+        });
     }
     if let Some(body) = marked_body(text, FORK_MARKER) {
         let title = body
@@ -7629,11 +7663,15 @@ fn editor_question_summary(text: &str) -> Option<SharedString> {
             .and_then(|rest| rest.trim_start().strip_prefix('"'))
             .and_then(|rest| rest.split_once("\". "))
             .map(|(title, _)| title);
-        return Some(match title {
+        let summary: SharedString = match title {
             Some(title) => {
                 format!("Forked from \"{title}\", with its conversation as context").into()
             }
             None => "Forked, with the earlier conversation as context".into(),
+        };
+        return Some(EditorQuestion {
+            summary,
+            answered_elsewhere: false,
         });
     }
     if let Some(body) = marked_body(text, REVIEW_QUESTION_MARKER) {
@@ -7645,9 +7683,13 @@ fn editor_question_summary(text: &str) -> Option<SharedString> {
                     .is_some_and(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
             })
             .count();
-        return Some(match count {
+        let summary: SharedString = match count {
             1 => "Review comment, answered in the diff".into(),
             count => format!("{count} review comments, answered in the diff").into(),
+        };
+        return Some(EditorQuestion {
+            summary,
+            answered_elsewhere: true,
         });
     }
     let location = marked_body(text, INLINE_QUESTION_MARKER)?
@@ -7655,7 +7697,25 @@ fn editor_question_summary(text: &str) -> Option<SharedString> {
         .lines()
         .next()?
         .trim_end_matches(':');
-    Some(format!("Question about {location}, answered in the editor").into())
+    Some(EditorQuestion {
+        summary: format!("Question about {location}, answered in the editor").into(),
+        answered_elsewhere: true,
+    })
+}
+
+fn editor_question_for_message(entry: &AgentThreadEntry) -> Option<EditorQuestion> {
+    let AgentThreadEntry::UserMessage(message) = entry else {
+        return None;
+    };
+    let text = message
+        .content
+        .source_blocks()
+        .iter()
+        .find_map(|block| match block {
+            acp_v2::ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })?;
+    editor_question_summary(text)
 }
 
 impl ThreadView {
@@ -7770,7 +7830,7 @@ impl ThreadView {
                                     .color(Color::Muted),
                             )
                             .child(
-                                Label::new(format!("Sent this reply to {target}"))
+                                Label::new(target.clone())
                                     .size(LabelSize::Small)
                                     .color(Color::Muted)
                                     .truncate(),
@@ -7851,18 +7911,20 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let Some((question_ix, summary)) = self.editor_question_for_entry(entry_ix, cx) else {
+        let Some((question_ix, question)) = self.editor_question_for_entry(entry_ix, cx) else {
             return self.render_entry_contents(entry_ix, total_entries, entry, window, cx);
         };
         let expanded = self.expanded_editor_questions.contains(&question_ix);
         if entry_ix != question_ix {
-            return if self.collapsed_turn_hides_entry(entry_ix, question_ix, entry, cx) {
+            return if question.answered_elsewhere
+                && self.collapsed_turn_hides_entry(entry_ix, question_ix, entry, cx)
+            {
                 Empty.into_any_element()
             } else {
                 self.render_entry_contents(entry_ix, total_entries, entry, window, cx)
             };
         }
-        let header = self.render_editor_question_header(question_ix, summary, expanded, cx);
+        let header = self.render_editor_question_header(question_ix, question, expanded, cx);
         if !expanded {
             return header;
         }
@@ -7873,7 +7935,9 @@ impl ThreadView {
     }
 
     /// Whether `entry` is hidden because the editor question at `question_ix`
-    /// that started its turn is collapsed. Entries the user must act on, and
+    /// that started its turn is collapsed. Only turns whose answer is shown
+    /// elsewhere hide their entries; for the others just the message collapses.
+    /// Entries the user must act on, and
     /// every entry of a turn that is still running, stay visible so a
     /// permission prompt can never be hidden.
     pub(crate) fn collapsed_turn_hides_entry(
@@ -7884,6 +7948,16 @@ impl ThreadView {
         cx: &App,
     ) -> bool {
         if self.expanded_editor_questions.contains(&question_ix) {
+            return false;
+        }
+        let answered_elsewhere = self
+            .thread
+            .read(cx)
+            .entries()
+            .get(question_ix)
+            .and_then(editor_question_for_message)
+            .is_some_and(|question| question.answered_elsewhere);
+        if !answered_elsewhere {
             return false;
         }
         if matches!(
@@ -7907,7 +7981,7 @@ impl ThreadView {
         &self,
         entry_ix: usize,
         cx: &Context<Self>,
-    ) -> Option<(usize, SharedString)> {
+    ) -> Option<(usize, EditorQuestion)> {
         let entries = self.thread.read(cx).entries();
         let question_ix = (0..=entry_ix).rev().find(|ix| {
             matches!(
@@ -7915,24 +7989,14 @@ impl ThreadView {
                 Some(AgentThreadEntry::UserMessage(message)) if !message.indented
             )
         })?;
-        let AgentThreadEntry::UserMessage(message) = entries.get(question_ix)? else {
-            return None;
-        };
-        let text = message
-            .content
-            .source_blocks()
-            .iter()
-            .find_map(|block| match block {
-                acp_v2::ContentBlock::Text(text) => Some(text.text.as_str()),
-                _ => None,
-            })?;
-        editor_question_summary(text).map(|summary| (question_ix, summary))
+        editor_question_for_message(entries.get(question_ix)?)
+            .map(|question| (question_ix, question))
     }
 
     fn render_editor_question_header(
         &self,
         question_ix: usize,
-        summary: SharedString,
+        question: EditorQuestion,
         expanded: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -7949,7 +8013,7 @@ impl ThreadView {
                     .color(Color::Muted),
             )
             .child(
-                Label::new(summary)
+                Label::new(question.summary)
                     .size(LabelSize::Small)
                     .color(Color::Muted)
                     .truncate(),
@@ -7960,9 +8024,11 @@ impl ThreadView {
                     .size(LabelSize::Small)
                     .color(Color::Accent),
             )
-            .tooltip(Tooltip::text(
-                "Asked from the editor; the answer is shown there.",
-            ))
+            .tooltip(Tooltip::text(if question.answered_elsewhere {
+                "Asked from the editor; the answer is shown there."
+            } else {
+                "Sent by Zed; click to show the full message."
+            }))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if !this.expanded_editor_questions.remove(&question_ix) {
                     this.expanded_editor_questions.insert(question_ix);
@@ -15471,6 +15537,11 @@ mod tests {
     use util::paths::PathStyle;
     use workspace::MultiWorkspace;
 
+    fn summary_of(text: &str) -> Option<(String, bool)> {
+        editor_question_summary(text)
+            .map(|question| (question.summary.to_string(), question.answered_elsewhere))
+    }
+
     #[test]
     fn test_editor_question_summary() {
         use super::super::{
@@ -15482,8 +15553,11 @@ mod tests {
             "{INLINE_QUESTION_MARKER}\n{INLINE_QUESTION_PREFIX}`src/lib.rs` lines 18-20:\n```\nfn a() {{}}\n```\n\nWhy?\n\n{INLINE_QUESTION_SUFFIX}"
         );
         assert_eq!(
-            editor_question_summary(&inline).as_deref(),
-            Some("Question about `src/lib.rs` lines 18-20, answered in the editor")
+            summary_of(&inline),
+            Some((
+                "Question about `src/lib.rs` lines 18-20, answered in the editor".to_string(),
+                true
+            ))
         );
 
         let review = format!(
@@ -15492,8 +15566,8 @@ mod tests {
              \nR2: `b.rs` lines 3-3\n```\ny\n```\nand this?\n"
         );
         assert_eq!(
-            editor_question_summary(&review).as_deref(),
-            Some("2 review comments, answered in the diff")
+            summary_of(&review),
+            Some(("2 review comments, answered in the diff".to_string(), true))
         );
 
         // An ordinary message, even one worded the same way, stays visible.
@@ -15505,14 +15579,34 @@ mod tests {
             "[Zed: question] Question about nothing",
             &format!("{INLINE_QUESTION_PREFIX}`a.rs`:\n\nWhy?\n\n{INLINE_QUESTION_SUFFIX}"),
         ] {
-            assert_eq!(editor_question_summary(typed), None, "{typed}");
+            assert_eq!(summary_of(typed), None, "{typed}");
         }
-        assert_eq!(editor_question_summary("hello"), None);
+        assert_eq!(summary_of("hello"), None);
         // A comment on a transcript passage is answered in its card.
         assert_eq!(
-            editor_question_summary(&passage_comment_question("a passage", "Why?")).as_deref(),
-            Some("Comment on a passage, answered under it")
+            summary_of(&passage_comment_question("a passage", "Why?")),
+            Some(("Comment on a passage, answered under it".to_string(), true))
         );
+        for (message, expected) in [
+            (
+                crate::thread_fork::fork_context_message(Some("Plan"), "## User\n\nhi\n"),
+                "Forked from \"Plan\", with its conversation as context",
+            ),
+            (
+                crate::thread_fork::verdict_message(
+                    crate::thread_fork::ReviewVerdict::Approved,
+                    Some("Review"),
+                    "ok",
+                    "",
+                ),
+                "Review verdict: approved",
+            ),
+        ] {
+            let (summary, answered_elsewhere) =
+                summary_of(&message).unwrap_or_else(|| panic!("no summary for {message}"));
+            assert!(!answered_elsewhere, "{message}");
+            assert_eq!(summary, expected);
+        }
     }
 
     #[test]

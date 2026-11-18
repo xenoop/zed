@@ -2318,8 +2318,12 @@ impl ConversationView {
                         .agent_display_name(&self.agent.agent_id())
                         .unwrap_or_else(|| self.agent.agent_id().0.to_string().into());
 
-                    let new_placeholder =
-                        placeholder_text(agent_display_name.as_ref(), has_slash_completions);
+                    let new_placeholder = message_placeholder(
+                        agent_display_name.as_ref(),
+                        has_slash_completions,
+                        self.project.read(cx),
+                        cx,
+                    );
 
                     thread_view.update(cx, |thread_view, cx| {
                         let mut session_capabilities = thread_view.session_capabilities.write();
@@ -3974,6 +3978,31 @@ fn native_available_skills(
         .collect()
 }
 
+const REVIEW_PLACEHOLDER: &str = "Write your review summary, then Submit Review";
+
+/// The message editor's placeholder: the review prompt in the working tree of
+/// a review fork, otherwise the agent's.
+fn message_placeholder(
+    agent_name: &str,
+    has_commands: bool,
+    project: &Project,
+    cx: &App,
+) -> String {
+    let is_review = project
+        .visible_worktrees(cx)
+        .next()
+        .is_some_and(|worktree| {
+            let path = worktree.read(cx).abs_path().to_string_lossy().to_string();
+            crate::thread_fork::record_for_fork(&path, cx)
+                .is_some_and(|record| record.kind == crate::thread_fork::ForkKind::Review)
+        });
+    if is_review {
+        REVIEW_PLACEHOLDER.to_string()
+    } else {
+        placeholder_text(agent_name, has_commands)
+    }
+}
+
 fn placeholder_text(agent_name: &str, has_commands: bool) -> String {
     if agent_name == agent::ZED_AGENT_ID.as_ref() {
         format!(
@@ -4392,9 +4421,9 @@ pub(crate) const REVIEW_QUESTION_PREFIX: &str = "Review comments on the diff.";
 /// [`split_review_answer`] can put each answer under its comment.
 pub(crate) fn review_question(comments: &[ReviewCommentForAgent], cx: &App) -> String {
     let mut question = format!(
-        "{REVIEW_QUESTION_MARKER}\n{REVIEW_QUESTION_PREFIX} Answer each comment in its own section that \
-         starts with its ID alone on a line, like `R1:`. Answer in text; only change \
-         files where a comment asks for a change.\n",
+        "{REVIEW_QUESTION_MARKER}\n{REVIEW_QUESTION_PREFIX} Answer each comment in its own R<n> section, \
+         starting with its ID alone on a line, like `R1:`. If a comment asks for a \
+         change, make it and say what you changed.\n",
     );
     for comment in comments {
         let path = comment.file_path.as_unix_str();
@@ -6784,6 +6813,132 @@ pub(crate) mod tests {
         cx.run_until_parked();
         let second = last_turn_snapshot(cx).expect("each send should snapshot again");
         assert_ne!(first, second);
+    }
+
+    #[gpui::test]
+    async fn test_only_answered_elsewhere_turns_hide_the_agent_reply(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+
+        let review_comments = format!(
+            "{REVIEW_QUESTION_MARKER}\n{REVIEW_QUESTION_PREFIX} Answer each comment.\n\nR1: `a.rs` lines 1-1\n```\nx\n```\nWhy?\n"
+        );
+        let messages = [
+            (
+                crate::thread_fork::fork_context_message(Some("Plan"), "## User\n\nhi\n"),
+                false,
+            ),
+            (
+                crate::thread_fork::verdict_message(
+                    crate::thread_fork::ReviewVerdict::ChangesRequested,
+                    Some("Review: Plan"),
+                    "Rename it.",
+                    "",
+                ),
+                false,
+            ),
+            (crate::thread_fork::land_message(Some("Plan"), None), false),
+            (
+                crate::thread_fork::thread_message(Some("Review: Plan"), "All good."),
+                false,
+            ),
+            (review_comments, true),
+        ];
+        for (message, hides_reply) in messages {
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new("Reply".into()),
+            )]);
+            message_editor.update_in(cx, |editor, window, cx| {
+                editor.set_text(&message, window, cx);
+            });
+            thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+            cx.run_until_parked();
+
+            thread_view.read_with(cx, |view, cx| {
+                let entries = view.thread.read(cx).entries();
+                let question_ix = entries
+                    .iter()
+                    .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+                    .expect("the message should be in the thread");
+                let reply_ix = question_ix + 1;
+                assert!(
+                    matches!(
+                        entries.get(reply_ix),
+                        Some(AgentThreadEntry::AssistantMessage(_))
+                    ),
+                    "{message}"
+                );
+                assert_eq!(
+                    view.collapsed_turn_hides_entry(reply_ix, question_ix, &entries[reply_ix], cx),
+                    hides_reply,
+                    "{message}"
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn test_review_comments_do_not_replace_the_last_turn_snapshot(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            serde_json::json!({ ".git": {}, "a.txt": "one" }),
+        )
+        .await;
+        let project = Project::test(fs, [std::path::Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) = setup_conversation_view_in_project(
+            StubAgentServer::new(connection.clone()),
+            project.clone(),
+            None,
+            cx,
+        )
+        .await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+        let last_turn_snapshot = |cx: &mut VisualTestContext| {
+            project.read_with(cx, |project, cx| {
+                let repository = project.active_repository(cx)?;
+                project
+                    .git_store()
+                    .read(cx)
+                    .last_turn_snapshot(repository.read(cx).id)
+            })
+        };
+
+        let review_comments = format!(
+            "{REVIEW_QUESTION_MARKER}\n{REVIEW_QUESTION_PREFIX} Answer each comment.\n\nR1: `a.rs` lines 1-1\n```\nx\n```\nWhy?\n"
+        );
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text(&review_comments, window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert_eq!(last_turn_snapshot(cx), None);
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Change it", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        let ordinary = last_turn_snapshot(cx).expect("an ordinary prompt should snapshot");
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text(&review_comments, window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert_eq!(last_turn_snapshot(cx), Some(ordinary));
     }
 
     #[gpui::test]
