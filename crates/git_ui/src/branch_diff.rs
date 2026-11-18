@@ -1196,7 +1196,7 @@ impl Render for BranchDiffToolbar {
                     )
                 });
         };
-        let selected_base_ref = base_ref.clone();
+        let selected_base_ref = base_ref;
         let repository = branch_diff.read(cx).repo(cx);
         let workspace = branch_diff.read(cx).workspace.clone();
         let project = branch_diff.read(cx).project.clone();
