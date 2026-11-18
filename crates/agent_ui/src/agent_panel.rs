@@ -3533,6 +3533,9 @@ impl AgentPanel {
                         multi_workspace.activate(fork_workspace.clone(), None, window, cx);
                     })?;
                 }
+                fork_workspace.update_in(cx, |workspace, window, cx| {
+                    workspace.focus_panel::<AgentPanel>(window, cx);
+                })?;
                 Ok(())
             }
             .await;
@@ -4011,10 +4014,15 @@ impl AgentPanel {
                     .unwrap_or_else(|| "the other thread".to_string());
                 (self.send_to_thread(thread_id, message, window, cx), name)
             }
-            ReplyTarget::WorkingTree(path) => (
-                self.deliver_to_working_tree(&path, None, message, window, cx),
-                path,
-            ),
+            ReplyTarget::WorkingTree(path) => {
+                let name = crate::thread_fork::record_for_fork(&path, cx)
+                    .map(|record| record.display_name())
+                    .unwrap_or_else(|| path.clone());
+                (
+                    self.deliver_to_working_tree(&path, None, message, window, cx),
+                    name,
+                )
+            }
         };
         if result.is_ok() {
             self.record_sent_note(target_name.clone(), cx);
@@ -4284,10 +4292,10 @@ impl AgentPanel {
                     }),
                 Tooltip::text(match review_verdict {
                     Some(crate::thread_fork::ReviewVerdict::Approved) => {
-                        "Forks and Reviews (review approved)"
+                        "Forks and Reviews (Approved)"
                     }
                     Some(crate::thread_fork::ReviewVerdict::ChangesRequested) => {
-                        "Forks and Reviews (review requested changes)"
+                        "Forks and Reviews (Changes requested)"
                     }
                     None => "Forks and Reviews",
                 }),
@@ -4355,7 +4363,7 @@ impl AgentPanel {
                             });
                         }
                         for record in forks.clone() {
-                            menu = menu.entry(format!("Fork {}", record.display_name()), None, {
+                            menu = menu.entry(record.display_name(), None, {
                                 let panel = panel.clone();
                                 let workspace = workspace.clone();
                                 move |window, cx| {
@@ -4382,10 +4390,10 @@ impl AgentPanel {
                     for record in forks {
                         let name = match (&record.kind, record.verdict) {
                             (_, Some(crate::thread_fork::ReviewVerdict::Approved)) => {
-                                format!("{} (approved)", record.display_name())
+                                format!("{} (Approved)", record.display_name())
                             }
                             (_, Some(crate::thread_fork::ReviewVerdict::ChangesRequested)) => {
-                                format!("{} (changes requested)", record.display_name())
+                                format!("{} (Changes requested)", record.display_name())
                             }
                             (crate::thread_fork::ForkKind::Review, None) => {
                                 format!("{} (review)", record.display_name())
@@ -4406,19 +4414,23 @@ impl AgentPanel {
                                 }
                             }
                         });
-                        menu = menu.entry(format!("Remove {name} (if merged)"), None, {
-                            let panel = panel.clone();
-                            let workspace = workspace.clone();
-                            move |window, cx| {
-                                if let Some(panel) = panel.upgrade() {
-                                    panel
-                                        .update(cx, |panel, cx| {
-                                            panel.remove_fork(record.clone(), window, cx)
-                                        })
-                                        .detach_and_notify_err(workspace.clone(), window, cx);
+                        menu = menu.entry(
+                            format!("Remove {name} (only if merged and clean)"),
+                            None,
+                            {
+                                let panel = panel.clone();
+                                let workspace = workspace.clone();
+                                move |window, cx| {
+                                    if let Some(panel) = panel.upgrade() {
+                                        panel
+                                            .update(cx, |panel, cx| {
+                                                panel.remove_fork(record.clone(), window, cx)
+                                            })
+                                            .detach_and_notify_err(workspace.clone(), window, cx);
+                                    }
                                 }
-                            }
-                        });
+                            },
+                        );
                     }
                     menu
                 }))
@@ -16144,6 +16156,42 @@ mod tests {
                 text, "Existing work in workspace B",
                 "destination panel's content should be preserved"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_fork_thread_keeps_its_title_over_the_marker_message(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let _stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        panel.update(&mut cx, |panel, _cx| {
+            panel.selected_agent = Agent::Stub;
+        });
+
+        let message = crate::thread_fork::fork_context_message(Some("Plan"), "## User\n\nhi\n");
+        let thread_id = panel.update_in(&mut cx, |panel, window, cx| {
+            panel.create_thread_with_options(
+                CreateThreadOptions {
+                    title: Some("Fork: Plan".into()),
+                    initial_content: Some(AgentInitialContent::ContentBlock {
+                        blocks: vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(message))],
+                        auto_submit: true,
+                    }),
+                    ..CreateThreadOptions::default()
+                },
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            let view = panel
+                .conversation_view_for_thread(thread_id, cx)
+                .expect("the fork's thread is open");
+            let title = view.read(cx).title(cx);
+            assert_eq!(title.as_ref(), "Fork: Plan");
         });
     }
 

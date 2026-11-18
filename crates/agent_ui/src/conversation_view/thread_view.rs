@@ -2522,20 +2522,7 @@ impl ThreadView {
                 })
             });
             if is_first_message && thread.read_with(cx, |thread, _cx| thread.title().is_none())? {
-                let text: String = contents
-                    .iter()
-                    .filter_map(|block| match block {
-                        acp_v2::ContentBlock::Text(text_content) => Some(text_content.text.clone()),
-                        acp_v2::ContentBlock::ResourceLink(resource_link) => {
-                            Some(format!("@{}", resource_link.name))
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let text = text.lines().next().unwrap_or("").trim();
-                if !text.is_empty() {
-                    let title: SharedString = util::truncate_and_trailoff(text, 200).into();
+                if let Some(title) = provisional_title_for_first_message(&contents) {
                     thread.update(cx, |thread, cx| {
                         thread.set_provisional_title(title, cx);
                     })?;
@@ -7590,7 +7577,8 @@ async fn record_last_turn_snapshot(
 /// with: the thread view shows such a turn collapsed, since the answer is shown
 /// under the passage.
 pub(crate) const PASSAGE_COMMENT_MARKER: &str = "[Zed: passage comment]";
-const PASSAGE_COMMENT_PREFIX: &str = "Comment on a passage of your reply above.";
+const PASSAGE_COMMENT_PREFIX: &str =
+    "Comment on a passage of one of your earlier replies, quoted below.";
 
 /// A comment on a passage of one of the agent's messages.
 pub(crate) struct PassageComment {
@@ -7701,6 +7689,31 @@ fn editor_question_summary(text: &str) -> Option<EditorQuestion> {
         summary: format!("Question about {location}, answered in the editor").into(),
         answered_elsewhere: true,
     })
+}
+
+/// The title a thread gets from its first message, which is a one-line
+/// summary for a message Zed generated, never its marker line.
+fn provisional_title_for_first_message(contents: &[acp_v2::ContentBlock]) -> Option<SharedString> {
+    let first_text = contents.iter().find_map(|block| match block {
+        acp_v2::ContentBlock::Text(text) => Some(text.text.as_str()),
+        _ => None,
+    });
+    if let Some(question) = first_text.and_then(editor_question_summary) {
+        return Some(question.summary);
+    }
+    let text: String = contents
+        .iter()
+        .filter_map(|block| match block {
+            acp_v2::ContentBlock::Text(text_content) => Some(text_content.text.clone()),
+            acp_v2::ContentBlock::ResourceLink(resource_link) => {
+                Some(format!("@{}", resource_link.name))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text = text.lines().next().unwrap_or("").trim();
+    (!text.is_empty()).then(|| util::truncate_and_trailoff(text, 200).into())
 }
 
 fn editor_question_for_message(entry: &AgentThreadEntry) -> Option<EditorQuestion> {
@@ -7893,11 +7906,13 @@ impl ThreadView {
                 .child(sent_comment())
                 .child(Label::new(answer.clone()).size(LabelSize::Small)),
             PassageCommentState::Failed(error) => card
-                .child(
-                    Label::new(error.clone())
-                        .size(LabelSize::Small)
-                        .color(Color::Error),
-                )
+                .child(Label::new(error.clone()).size(LabelSize::Small).color(
+                    if error.as_ref() == editor::AGENT_BUSY_MESSAGE {
+                        Color::Muted
+                    } else {
+                        Color::Error
+                    },
+                ))
                 .child(comment.input.clone()),
         }
         .into_any_element()
@@ -9755,10 +9770,7 @@ impl ThreadView {
         if self.thread.read(cx).status() == ThreadStatus::Generating || self.is_loading_contents {
             set_state(
                 self,
-                PassageCommentState::Failed(
-                    "The agent is still working on something else. Send again when it is done."
-                        .into(),
-                ),
+                PassageCommentState::Failed(editor::AGENT_BUSY_MESSAGE.into()),
                 cx,
             );
             return;
@@ -15575,7 +15587,7 @@ mod tests {
             "Question about the build failure",
             "Review comments on the diff. R1: looks fine",
             "This thread is a fork of \"x\". Ready?",
-            "Comment on a passage of your reply above. Why?",
+            "Comment on a passage of one of your earlier replies, quoted below. Why?",
             "[Zed: question] Question about nothing",
             &format!("{INLINE_QUESTION_PREFIX}`a.rs`:\n\nWhy?\n\n{INLINE_QUESTION_SUFFIX}"),
         ] {
@@ -15606,6 +15618,29 @@ mod tests {
                 summary_of(&message).unwrap_or_else(|| panic!("no summary for {message}"));
             assert!(!answered_elsewhere, "{message}");
             assert_eq!(summary, expected);
+        }
+    }
+
+    #[test]
+    fn test_provisional_title_never_is_a_marker_line() {
+        let title_of = |text: &str| {
+            provisional_title_for_first_message(&[text.to_string().into()])
+                .map(|title| title.to_string())
+        };
+        assert_eq!(
+            title_of("Fix the parser\nplease"),
+            Some("Fix the parser".into())
+        );
+        let fork = crate::thread_fork::fork_context_message(Some("Plan"), "## User\n\nhi\n");
+        let verdict = crate::thread_fork::verdict_message(
+            crate::thread_fork::ReviewVerdict::Approved,
+            Some("Review"),
+            "ok",
+            "",
+        );
+        for message in [fork, verdict] {
+            let title = title_of(&message).expect("a title");
+            assert!(!title.starts_with("[Zed:"), "{title}");
         }
     }
 

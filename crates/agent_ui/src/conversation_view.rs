@@ -1401,6 +1401,7 @@ impl ConversationView {
                 thread_location = thread_location
             );
 
+            let new_session_title = resume_session_id.is_none().then(|| title.clone()).flatten();
             let mut resumed_without_history = false;
             let Some(recovering) = this
                 .read_with(cx, |this, _| this.recovery.is_some())
@@ -1474,6 +1475,11 @@ impl ConversationView {
                             });
                         }
                         this.clear_resolved_request_elicitations_for_connection(&connection, cx);
+                        if let Some(new_session_title) = new_session_title {
+                            thread
+                                .update(cx, |thread, cx| thread.set_title(new_session_title, cx))
+                                .detach_and_log_err(cx);
+                        }
                         let root_session_id = thread.read(cx).session_id().clone();
 
                         let conversation = cx.new(|cx| {
@@ -3821,9 +3827,7 @@ impl ConversationView {
         if thread.read(cx).status() == ThreadStatus::Generating
             || thread_view.read(cx).is_loading_contents
         {
-            return Err(anyhow!(
-                "The agent is still working on something else. Ask again when it is done."
-            ));
+            return Err(anyhow!(editor::AGENT_BUSY_MESSAGE));
         }
         let first_new_entry = thread.read(cx).entries().len();
 

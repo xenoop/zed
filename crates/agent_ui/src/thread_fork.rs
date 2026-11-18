@@ -68,18 +68,20 @@ impl ForkRecord {
         self
     }
 
-    /// A short name for menus: the last component of the fork's directory
-    /// that is not the repository name repeated.
+    /// The title of the fork's thread, for menus and messages. Without a
+    /// parent title, the last components of the fork's directory tell forks
+    /// apart.
     pub fn display_name(&self) -> String {
+        let title = fork_thread_title(&self.kind, self.parent_title.as_deref());
+        if self.parent_title.is_some() {
+            return title;
+        }
         let mut components = self
             .fork_path
             .rsplit(['/', '\\'])
             .filter(|part| !part.is_empty());
         let last = components.next().unwrap_or(&self.fork_path);
-        match components.next() {
-            Some(previous) => format!("{previous}/{last}"),
-            None => last.to_string(),
-        }
+        format!("{title} ({last})")
     }
 }
 
@@ -554,7 +556,8 @@ pub(crate) fn thread_message(sender_title: Option<&str>, text: &str) -> String {
     // shortened, and without quotes that would end the quoted title early.
     let title = quote_safe_title(sender_title, "another thread");
     format!(
-        "{THREAD_MESSAGE_MARKER}\n{THREAD_MESSAGE_PREFIX} \"{title}\":\n\n{}\n",
+        "{THREAD_MESSAGE_MARKER}\n{THREAD_MESSAGE_PREFIX} \"{title}\":\n\n{}\n\n\
+         Act on it if it is relevant to your task.\n",
         clipped(text.trim())
     )
 }
@@ -1462,7 +1465,7 @@ mod tests {
         let forwarded = thread_message(Some("Review: Fix the parser"), "All good.");
         assert_eq!(
             forwarded,
-            "[Zed: message from another thread]\nMessage from thread \"Review: Fix the parser\":\n\nAll good.\n"
+            "[Zed: message from another thread]\nMessage from thread \"Review: Fix the parser\":\n\nAll good.\n\nAct on it if it is relevant to your task.\n"
         );
         assert_eq!(
             delivered_message_summary(&forwarded).as_deref(),
