@@ -6920,19 +6920,29 @@ pub(crate) mod tests {
         let review_comments = format!(
             "{REVIEW_QUESTION_MARKER}\n{REVIEW_QUESTION_PREFIX} Answer each comment.\n\nR1: `a.rs` lines 1-1\n```\nx\n```\nWhy?\n"
         );
+        let finish_review = connection.defer_next_prompt_response();
         message_editor.update_in(cx, |editor, window, cx| {
             editor.set_text(&review_comments, window, cx);
         });
         thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
         cx.run_until_parked();
         assert_eq!(last_turn_snapshot(cx), None);
+        finish_review
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
 
+        let finish_ordinary = connection.defer_next_prompt_response();
         message_editor.update_in(cx, |editor, window, cx| {
             editor.set_text("Change it", window, cx);
         });
         thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
         cx.run_until_parked();
         let ordinary = last_turn_snapshot(cx).expect("an ordinary prompt should snapshot");
+        finish_ordinary
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
 
         message_editor.update_in(cx, |editor, window, cx| {
             editor.set_text(&review_comments, window, cx);

@@ -1417,7 +1417,7 @@ mod tests {
             "0123456789abcdef",
         );
         assert!(review.starts_with("[Zed: fork]\nThis thread is a fork of"));
-        assert!(review.contains("Write a change guide"));
+        assert!(review.contains("write a change guide"));
         assert!(!review.contains("reply with one short line"));
         assert!(review.contains("HEAD commit 0123456789ab"));
         assert!(review.contains("risk summary and the top 3 points"));
