@@ -51936,6 +51936,38 @@ async fn test_hidden_review_comment_markers_follow_the_answers(cx: &mut TestAppC
 }
 
 #[gpui::test]
+async fn test_hiding_review_comments_collapses_the_box_at_the_cursor(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let (editor, cx) = editor_on_file_with_one_line_comment(cx).await;
+
+    editor.update_in(cx, |editor, window, cx| {
+        let unplaced =
+            editor.restore_review_comments(vec![saved_comment_on_first_line()], window, cx);
+        assert!(unplaced.is_empty());
+        assert_eq!(editor.diff_review_overlays.len(), 1);
+
+        editor.set_review_comments_hidden(true, window, cx);
+        assert!(editor.diff_review_overlays.is_empty());
+        assert_eq!(editor.hidden_review_comment_marker_ranges().len(), 1);
+
+        let marker = editor.hidden_review_comment_marker_ranges()[0].clone();
+        assert!(editor.open_hidden_review_comments(&marker, window, cx));
+        editor.set_review_comments_hidden(true, window, cx);
+        assert!(editor.diff_review_overlays.is_empty());
+        assert_eq!(editor.hidden_review_comment_marker_ranges().len(), 1);
+
+        assert!(editor.open_hidden_review_comments(&marker, window, cx));
+        let prompt_editor = editor.diff_review_overlays[0].prompt_editor.clone();
+        prompt_editor.update(cx, |prompt_editor, cx| {
+            prompt_editor.set_text("Half-written", window, cx);
+        });
+        editor.set_review_comments_hidden(true, window, cx);
+        assert_eq!(editor.diff_review_overlays.len(), 1);
+        assert!(editor.hidden_review_comment_marker_ranges().is_empty());
+    });
+}
+
+#[gpui::test]
 async fn test_restoring_review_comments_while_hidden_opens_no_box(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
     let (editor, cx) = editor_on_file_with_one_line_comment(cx).await;

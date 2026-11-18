@@ -778,8 +778,14 @@ impl Editor {
             cx.propagate();
             return;
         }
-        if self.review_comments_hidden && self.reopen_hidden_comment_at_cursor(window, cx) {
-            return;
+        if self.review_comments_hidden {
+            if self.reopen_hidden_comment_at_cursor(window, cx) {
+                return;
+            }
+            if !self.diff_review_overlays.is_empty() {
+                self.set_review_comments_hidden(true, window, cx);
+                return;
+            }
         }
         self.set_review_comments_hidden(!self.review_comments_hidden, window, cx);
     }
@@ -854,7 +860,8 @@ impl Editor {
     }
 
     /// Hides the review boxes, leaving a highlight on each commented range
-    /// as a marker, or opens a box for every range with comments again.
+    /// as a marker, or opens a box for every range with comments again. A
+    /// box holding text that was not sent yet stays open when hiding.
     pub fn set_review_comments_hidden(
         &mut self,
         hidden: bool,
@@ -877,7 +884,7 @@ impl Editor {
             .flat_map(|(_, comments)| comments.iter().map(|comment| comment.range.clone()))
             .collect();
         if hidden {
-            self.dismiss_all_diff_review_overlays(cx);
+            self.dismiss_diff_review_overlays_without_unsent_text(cx);
             self.refresh_hidden_review_comment_markers(cx);
         } else {
             for range in ranges {
@@ -1852,6 +1859,24 @@ impl Editor {
     pub(super) fn cancel_diff_review_drag(&mut self, cx: &mut Context<Self>) {
         self.diff_review_drag_state = None;
         cx.notify();
+    }
+
+    /// Dismisses the diff review overlays whose input is empty.
+    fn dismiss_diff_review_overlays_without_unsent_text(&mut self, cx: &mut Context<Self>) {
+        let mut block_ids = HashSet::default();
+        let mut kept = Vec::new();
+        for overlay in self.diff_review_overlays.drain(..) {
+            if overlay.prompt_editor.read(cx).text(cx).trim().is_empty() {
+                block_ids.insert(overlay.block_id);
+            } else {
+                kept.push(overlay);
+            }
+        }
+        self.diff_review_overlays = kept;
+        if !block_ids.is_empty() {
+            self.remove_blocks(block_ids, None, cx);
+            cx.notify();
+        }
     }
 
     /// Dismisses all diff review overlays.
