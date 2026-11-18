@@ -1161,40 +1161,54 @@ impl Render for BranchDiffToolbar {
         let DiffBase::Merge { base_ref } = diff_base else {
             // Snapshot comparisons ("Last Commit", "Last Turn") have no base
             // branch to pick and cannot be sent for review as a branch diff.
+            let send_review = (review_count > 0).then(|| {
+                render_send_review_to_agent_button(review_count, &focus_handle).on_click(
+                    cx.listener(|this, _, window, cx| {
+                        this.dispatch_action(&SendReviewToAgent, window, cx)
+                    }),
+                )
+            });
+            let has_changes = !branch_diff
+                .read(cx)
+                .diff
+                .read(cx)
+                .multibuffer()
+                .read(cx)
+                .is_empty();
             return h_flex()
                 .my_neg_1()
                 .py_1()
                 .gap_1p5()
-                .when(
-                    !branch_diff
-                        .read(cx)
-                        .diff
-                        .read(cx)
-                        .multibuffer()
-                        .read(cx)
-                        .is_empty(),
-                    |this| {
-                        this.child(DiffStat::new(
-                            "branch-diff-stat",
-                            additions as usize,
-                            deletions as usize,
-                        ))
-                    },
-                )
-                .children(render_seen_progress(&branch_diff, cx))
-                .child(Divider::vertical().ml_1())
-                .child(compare_menu)
-                .child(render_comment_mode_toggle(&branch_diff, cx))
-                .child(render_comments_hidden_toggle(&branch_diff, cx))
-                .when(review_count > 0, |this| {
-                    this.child(Divider::vertical()).child(
-                        render_send_review_to_agent_button(review_count, &focus_handle).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.dispatch_action(&SendReviewToAgent, window, cx)
-                            }),
-                        ),
-                    )
-                });
+                .min_w_0()
+                .overflow_hidden()
+                .when_some(send_review, |this, send_review| {
+                    this.child(div().flex_none().child(send_review))
+                        .child(Divider::vertical())
+                })
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .when(has_changes, |this| {
+                            this.child(DiffStat::new(
+                                "branch-diff-stat",
+                                additions as usize,
+                                deletions as usize,
+                            ))
+                        })
+                        .children(render_seen_progress(&branch_diff, cx))
+                        .child(Divider::vertical().ml_1())
+                        .child(
+                            div()
+                                .min_w_0()
+                                .max_w_48()
+                                .overflow_hidden()
+                                .child(compare_menu),
+                        )
+                        .child(render_comment_mode_toggle(&branch_diff, cx))
+                        .child(render_comments_hidden_toggle(&branch_diff, cx)),
+                );
         };
         let selected_base_ref = base_ref;
         let repository = branch_diff.read(cx).repo(cx);
@@ -1222,32 +1236,55 @@ impl Render for BranchDiffToolbar {
 
         let show_review_button = !is_multibuffer_empty && is_ai_enabled;
 
+        let send_review = (review_count > 0).then(|| {
+            render_send_review_to_agent_button(review_count, &focus_handle).on_click(cx.listener(
+                |this, _, window, cx| this.dispatch_action(&SendReviewToAgent, window, cx),
+            ))
+        });
+        let review_focus_handle = focus_handle.clone();
+
         h_flex()
             .my_neg_1()
             .py_1()
             .gap_1p5()
-            .flex_wrap()
-            .justify_between()
-            .when(!is_multibuffer_empty, |this| {
-                this.child(DiffStat::new(
-                    "branch-diff-stat",
-                    additions as usize,
-                    deletions as usize,
-                ))
+            .min_w_0()
+            .overflow_hidden()
+            .when_some(send_review, |this, send_review| {
+                this.child(div().flex_none().child(send_review))
+                    .child(Divider::vertical())
             })
-            .children(render_seen_progress(&branch_diff, cx))
-            .child(Divider::vertical().ml_1())
-            .child(compare_menu)
-            .child(render_comment_mode_toggle(&branch_diff, cx))
-            .child(render_comments_hidden_toggle(&branch_diff, cx))
             .child(
-                PopoverMenu::new("branch-diff-base-branch-picker")
-                    .menu(move |window, cx| {
-                        let view_for_picker = view_for_picker.clone();
-                        let workspace_for_select = workspace.clone();
-                        let repository_for_select = repository.clone();
-                        let project = project.clone();
-                        let on_select = Arc::new(
+                h_flex()
+                    .gap_1p5()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .when(!is_multibuffer_empty, |this| {
+                        this.child(DiffStat::new(
+                            "branch-diff-stat",
+                            additions as usize,
+                            deletions as usize,
+                        ))
+                    })
+                    .children(render_seen_progress(&branch_diff, cx))
+                    .child(Divider::vertical().ml_1())
+                    .child(
+                        div()
+                            .min_w_0()
+                            .max_w_48()
+                            .overflow_hidden()
+                            .child(compare_menu),
+                    )
+                    .child(render_comment_mode_toggle(&branch_diff, cx))
+                    .child(render_comments_hidden_toggle(&branch_diff, cx))
+                    .child(
+                        div().flex_none().child(
+                            PopoverMenu::new("branch-diff-base-branch-picker")
+                                .menu(move |window, cx| {
+                                    let view_for_picker = view_for_picker.clone();
+                                    let workspace_for_select = workspace.clone();
+                                    let repository_for_select = repository.clone();
+                                    let project = project.clone();
+                                    let on_select = Arc::new(
                             move |branch: git::repository::Branch,
                                   window: &mut Window,
                                   cx: &mut App| {
@@ -1281,56 +1318,45 @@ impl Render for BranchDiffToolbar {
                             },
                         );
 
-                        Some(branch_picker::select_popover(
-                            workspace.clone(),
-                            repository.clone(),
-                            Some(selected_base_ref.clone()),
-                            on_select,
-                            window,
-                            cx,
-                        ))
-                    })
-                    .trigger_with_tooltip(
-                        Button::new("branch-diff-base-branch", "Change base…").end_icon(
-                            Icon::new(IconName::ChevronDown)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
+                                    Some(branch_picker::select_popover(
+                                        workspace.clone(),
+                                        repository.clone(),
+                                        Some(selected_base_ref.clone()),
+                                        on_select,
+                                        window,
+                                        cx,
+                                    ))
+                                })
+                                .trigger_with_tooltip(
+                                    Button::new("branch-diff-base-branch", "Change base…")
+                                        .end_icon(
+                                            Icon::new(IconName::ChevronDown)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Muted),
+                                        ),
+                                    Tooltip::text("Select Base Branch"),
+                                ),
                         ),
-                        Tooltip::text("Select Base Branch"),
-                    ),
-            )
-            .when(show_review_button, |this| {
-                let focus_handle = focus_handle.clone();
-                this.child(Divider::vertical()).child(
-                    Button::new("review-diff", "Ask Agent to Review")
-                        .start_icon(
-                            Icon::new(IconName::Sparkle)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
+                    )
+                    .when(show_review_button, |this| {
+                        this.child(
+                            IconButton::new("review-diff", IconName::Sparkle)
+                                .icon_size(IconSize::Small)
+                                .tooltip(move |_, cx| {
+                                    Tooltip::with_meta_in(
+                                        "Ask Agent to Review",
+                                        Some(&ReviewDiff),
+                                        "Send this diff for your last agent to review.",
+                                        &review_focus_handle,
+                                        cx,
+                                    )
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.dispatch_action(&ReviewDiff, window, cx);
+                                })),
                         )
-                        .tooltip(move |_, cx| {
-                            Tooltip::with_meta_in(
-                                "Ask Agent to Review",
-                                Some(&ReviewDiff),
-                                "Send this diff for your last agent to review.",
-                                &focus_handle,
-                                cx,
-                            )
-                        })
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.dispatch_action(&ReviewDiff, window, cx);
-                        })),
-                )
-            })
-            .when(review_count > 0, |this| {
-                this.child(Divider::vertical()).child(
-                    render_send_review_to_agent_button(review_count, &focus_handle).on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.dispatch_action(&SendReviewToAgent, window, cx)
-                        }),
-                    ),
-                )
-            })
+                    }),
+            )
     }
 }
 
