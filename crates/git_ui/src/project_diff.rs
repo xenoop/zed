@@ -753,10 +753,7 @@ impl ProjectDiffToolbar {
         if let Some(project_diff) = self.project_diff(cx) {
             project_diff.focus_handle(cx).focus(window, cx);
         }
-        let action = action.boxed_clone();
-        cx.defer(move |cx| {
-            cx.dispatch_action(action.as_ref());
-        })
+        window.dispatch_action(action.boxed_clone(), cx);
     }
 
     fn stage_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -980,20 +977,17 @@ pub(crate) fn render_send_review_to_agent_button(
     review_count: usize,
     focus_handle: &FocusHandle,
 ) -> Button {
-    Button::new(
-        "send-review",
-        format!("Send Review to Agent ({})", review_count),
-    )
-    .start_icon(
-        Icon::new(IconName::ZedAssistant)
-            .size(IconSize::Small)
-            .color(Color::Muted),
-    )
-    .tooltip(Tooltip::for_action_title_in(
-        "Send all review comments to the Agent panel",
-        &SendReviewToAgent,
-        focus_handle,
-    ))
+    Button::new("send-review", format!("Send Review ({})", review_count))
+        .start_icon(
+            Icon::new(IconName::Send)
+                .size(IconSize::Small)
+                .color(Color::Muted),
+        )
+        .tooltip(Tooltip::for_action_title_in(
+            "Ask the agent; answers appear under each comment",
+            &SendReviewToAgent,
+            focus_handle,
+        ))
 }
 
 #[cfg(test)]

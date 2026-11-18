@@ -390,12 +390,26 @@ impl BranchDiff {
         let diff_base = DiffBase::Snapshot { commit, label };
         let existing = workspace.items_of_type::<Self>(cx).find(|item| {
             let item = item.read(cx);
-            item.diff_base(cx) == &diff_base
+            let same_comparison = match (item.diff_base(cx), &diff_base) {
+                (
+                    DiffBase::Snapshot {
+                        label: existing, ..
+                    },
+                    DiffBase::Snapshot { label: wanted, .. },
+                ) => existing == wanted,
+                _ => false,
+            };
+            same_comparison
                 && item
                     .repo(cx)
                     .is_some_and(|repo| repo.read(cx).id == repository.read(cx).id)
         });
         if let Some(existing) = existing {
+            existing.update(cx, |existing, cx| {
+                if existing.diff_base(cx) != &diff_base {
+                    existing.set_diff_base(diff_base, cx);
+                }
+            });
             workspace.activate_item(&existing, true, true, window, cx);
             return;
         }
@@ -484,6 +498,7 @@ impl BranchDiff {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let empty_label = empty_changes_label(&diff_base);
         let branch_diff = branch_diff.unwrap_or_else(|| {
             let git_store = project.read(cx).git_store().clone();
             cx.new(|cx| diff_buffer_list::DiffBufferList::new(diff_base, git_store, repo, cx))
@@ -493,7 +508,7 @@ impl BranchDiff {
             DiffMultibuffer::new(
                 branch_diff,
                 Capability::ReadWrite,
-                "No changes",
+                empty_label,
                 move |editor, cx| {
                     editor.set_diff_hunk_renderer(Some(Arc::new(HiddenDiffHunkRenderer)), cx);
                     editor.rhs_editor().update(cx, move |rhs_editor, cx| {
@@ -730,9 +745,14 @@ impl BranchDiff {
     }
 
     fn set_merge_base(&mut self, base_ref: SharedString, cx: &mut Context<Self>) {
+        self.set_diff_base(DiffBase::Merge { base_ref }, cx);
+    }
+
+    fn set_diff_base(&mut self, diff_base: DiffBase, cx: &mut Context<Self>) {
         self.diff.update(cx, |diff, cx| {
+            diff.set_empty_label(empty_changes_label(&diff_base), cx);
             diff.branch_diff().update(cx, |branch_diff, cx| {
-                branch_diff.set_diff_base(DiffBase::Merge { base_ref }, cx);
+                branch_diff.set_diff_base(diff_base, cx);
             });
         });
     }
@@ -1086,10 +1106,7 @@ impl BranchDiffToolbar {
         if let Some(branch_diff) = self.branch_diff(cx) {
             branch_diff.focus_handle(cx).focus(window, cx);
         }
-        let action = action.boxed_clone();
-        cx.defer(move |cx| {
-            cx.dispatch_action(action.as_ref());
-        })
+        window.dispatch_action(action.boxed_clone(), cx);
     }
 }
 
@@ -1180,7 +1197,6 @@ impl Render for BranchDiffToolbar {
                 });
         };
         let selected_base_ref = base_ref.clone();
-        let base_ref_label = format!("Base: {base_ref}");
         let repository = branch_diff.read(cx).repo(cx);
         let workspace = branch_diff.read(cx).workspace.clone();
         let project = branch_diff.read(cx).project.clone();
@@ -1275,7 +1291,7 @@ impl Render for BranchDiffToolbar {
                         ))
                     })
                     .trigger_with_tooltip(
-                        Button::new("branch-diff-base-branch", base_ref_label).end_icon(
+                        Button::new("branch-diff-base-branch", "Change base…").end_icon(
                             Icon::new(IconName::ChevronDown)
                                 .size(IconSize::XSmall)
                                 .color(Color::Muted),
@@ -1286,15 +1302,15 @@ impl Render for BranchDiffToolbar {
             .when(show_review_button, |this| {
                 let focus_handle = focus_handle.clone();
                 this.child(Divider::vertical()).child(
-                    Button::new("review-diff", "Review Diff")
+                    Button::new("review-diff", "Ask Agent to Review")
                         .start_icon(
-                            Icon::new(IconName::ZedAssistant)
+                            Icon::new(IconName::Sparkle)
                                 .size(IconSize::Small)
                                 .color(Color::Muted),
                         )
                         .tooltip(move |_, cx| {
                             Tooltip::with_meta_in(
-                                "Review Diff",
+                                "Ask Agent to Review",
                                 Some(&ReviewDiff),
                                 "Send this diff for your last agent to review.",
                                 &focus_handle,
@@ -1323,16 +1339,18 @@ impl Render for BranchDiffToolbar {
 fn render_comment_mode_toggle(branch_diff: &Entity<BranchDiff>, cx: &App) -> impl IntoElement {
     let editor = branch_diff.read(cx).rhs_editor(cx);
     let comment_mode = editor.read(cx).comment_mode();
+    let focus_handle = branch_diff.focus_handle(cx);
     IconButton::new("comment-mode", IconName::Chat)
         .icon_size(IconSize::Small)
         .toggle_state(comment_mode)
-        .tooltip(Tooltip::for_action_title(
+        .tooltip(Tooltip::for_action_title_in(
             if comment_mode {
                 "Comment Mode: typing starts a comment"
             } else {
                 "Edit Mode: typing edits the file"
             },
             &ToggleCommentMode,
+            &focus_handle,
         ))
         .on_click(move |_, _, cx| {
             editor.update(cx, |editor, cx| {
@@ -1345,6 +1363,7 @@ fn render_comment_mode_toggle(branch_diff: &Entity<BranchDiff>, cx: &App) -> imp
 fn render_comments_hidden_toggle(branch_diff: &Entity<BranchDiff>, cx: &App) -> impl IntoElement {
     let editor = branch_diff.read(cx).rhs_editor(cx);
     let hidden = editor.read(cx).review_comments_hidden();
+    let focus_handle = branch_diff.focus_handle(cx);
     IconButton::new(
         "comments-hidden",
         if hidden {
@@ -1354,13 +1373,14 @@ fn render_comments_hidden_toggle(branch_diff: &Entity<BranchDiff>, cx: &App) -> 
         },
     )
     .icon_size(IconSize::Small)
-    .tooltip(Tooltip::for_action_title(
+    .tooltip(Tooltip::for_action_title_in(
         if hidden {
             "Show Comments"
         } else {
             "Hide Comments"
         },
         &ToggleReviewCommentsHidden,
+        &focus_handle,
     ))
     .on_click(move |_, window, cx| {
         editor.update(cx, |editor, cx| {
@@ -1393,7 +1413,7 @@ fn render_compare_menu(
     cx: &App,
 ) -> impl IntoElement + use<> {
     let label: SharedString = match diff_base {
-        DiffBase::Merge { .. } => "Compare: Branch".into(),
+        DiffBase::Merge { base_ref } => format!("Compare: {base_ref}").into(),
         DiffBase::Snapshot { label, .. } => format!("Compare: {label}").into(),
         DiffBase::Head | DiffBase::Index | DiffBase::Staged => "Compare".into(),
     };
@@ -1440,8 +1460,12 @@ fn render_compare_menu(
                 let is_snapshot = |wanted: &str| {
                     matches!(&current, DiffBase::Snapshot { label, .. } if label.as_ref() == wanted)
                 };
+                let branch_base_label: SharedString = match &current {
+                    DiffBase::Merge { base_ref } => format!("Branch base ({base_ref})").into(),
+                    _ => "Branch base".into(),
+                };
                 menu.toggleable_entry(
-                    "Branch base",
+                    branch_base_label,
                     matches!(current, DiffBase::Merge { .. }),
                     IconPosition::Start,
                     None,
@@ -1464,7 +1488,11 @@ fn render_compare_menu(
                     deploy_snapshot("HEAD".into(), LAST_COMMIT_LABEL),
                 )
                 .toggleable_entry_disabled_when(
-                    LAST_TURN_LABEL,
+                    if last_turn.is_some() {
+                        LAST_TURN_LABEL.to_string()
+                    } else {
+                        format!("{LAST_TURN_LABEL} (send a prompt first)")
+                    },
                     is_snapshot(LAST_TURN_LABEL),
                     last_turn.is_none(),
                     IconPosition::Start,
@@ -1481,6 +1509,18 @@ fn render_compare_menu(
             ),
             Tooltip::text("Compare with the branch base, the last commit, or the start of the last agent turn"),
         )
+}
+
+fn empty_changes_label(diff_base: &DiffBase) -> String {
+    match diff_base {
+        DiffBase::Merge { base_ref } => {
+            format!("No changes since {base_ref}. Try Compare → Last Commit or Last Turn.")
+        }
+        DiffBase::Snapshot { label, .. } => {
+            format!("No changes since {label}. Try Compare → Branch base.")
+        }
+        DiffBase::Head | DiffBase::Index | DiffBase::Staged => "No changes".to_string(),
+    }
 }
 
 const LAST_COMMIT_LABEL: &str = "Last Commit";
@@ -1924,6 +1964,117 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_last_turn_item_is_pointed_at_the_latest_snapshot(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "changed",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+        let repository = project
+            .read_with(cx, |project, cx| project.active_repository(cx))
+            .expect("test project has a repository");
+
+        for commit in ["turn-one", "turn-two"] {
+            workspace.update_in(cx, |workspace, window, cx| {
+                BranchDiff::deploy_snapshot_diff(
+                    workspace,
+                    repository.clone(),
+                    commit.into(),
+                    LAST_TURN_LABEL.into(),
+                    window,
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+        }
+
+        workspace.update(cx, |workspace, cx| {
+            let bases = workspace
+                .items_of_type::<BranchDiff>(cx)
+                .map(|item| item.read(cx).diff_base(cx).clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                bases,
+                vec![DiffBase::Snapshot {
+                    commit: "turn-two".into(),
+                    label: LAST_TURN_LABEL.into(),
+                }]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_toolbar_dispatches_actions_through_the_changes_view(cx: &mut TestAppContext) {
+        init_test(cx);
+        bind_default_keymap(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "one\ntwo\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "one\n".into())],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "one\n".into())],
+        );
+        cx.run_until_parked();
+
+        let sent_reviews = Rc::new(Cell::new(0));
+        workspace.update(cx, |workspace, _| {
+            let sent_reviews = sent_reviews.clone();
+            workspace.register_action(move |_, _: &SendReviewToAgent, _, _| {
+                sent_reviews.set(sent_reviews.get() + 1);
+            });
+        });
+
+        cx.focus(&workspace);
+        cx.simulate_keystrokes("alt-shift-d");
+        cx.run_until_parked();
+        let diff = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_item_as::<BranchDiff>(cx)
+            })
+            .unwrap();
+
+        let toolbar = cx.new(|cx| BranchDiffToolbar::new(cx));
+        toolbar.update_in(cx, |toolbar, window, cx| {
+            toolbar.set_active_pane_item(Some(&diff), window, cx);
+        });
+        // Nothing else has focus, as when the toolbar button is clicked.
+        cx.update(|window, cx| window.blur(cx));
+        toolbar.update_in(cx, |toolbar, window, cx| {
+            toolbar.dispatch_action(&SendReviewToAgent, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(sent_reviews.get(), 1);
+    }
+
+    #[gpui::test]
     async fn test_seen_marks_fold_files_and_clear_on_edit(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -2139,9 +2290,7 @@ mod tests {
             ("b.txt".to_string(), Some("two\n".to_string())),
             ("new.txt".to_string(), None),
         ];
-        wait_for(cx, last_turn_files, |cx| {
-            shown_files(&last_turn, cx)
-        });
+        wait_for(cx, last_turn_files, |cx| shown_files(&last_turn, cx));
         // `scratch.txt` was in the snapshot and has not changed since, so the
         // file list leaves it out.
         let listed_files = |cx: &mut VisualTestContext| {
