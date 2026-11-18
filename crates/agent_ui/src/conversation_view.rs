@@ -3978,7 +3978,8 @@ fn native_available_skills(
         .collect()
 }
 
-const REVIEW_PLACEHOLDER: &str = "Write your review summary, then Submit Review";
+const REVIEW_PLACEHOLDER: &str =
+    "Ask the reviewer, or write your review summary here and use Submit Review in the Forks menu";
 
 /// The message editor's placeholder: the review prompt in the working tree of
 /// a review fork, otherwise the agent's.

@@ -514,7 +514,13 @@ pub(crate) fn verdict_message(
     reviewer_notes: &str,
 ) -> String {
     let (label, next_step) = match verdict {
-        ReviewVerdict::Approved => ("approved", "No changes are needed. Reply briefly and stop."),
+        ReviewVerdict::Approved if instructions.trim().is_empty() => {
+            ("approved", "No changes are needed. Reply briefly and stop.")
+        }
+        ReviewVerdict::Approved => (
+            "approved",
+            "Do what the user's instructions above ask, if anything, then reply briefly.",
+        ),
         ReviewVerdict::ChangesRequested => (
             "changes requested",
             "Make these changes in this working tree, then summarise what you changed.",
