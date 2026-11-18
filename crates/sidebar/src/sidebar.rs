@@ -202,6 +202,7 @@ impl ActiveEntry {
 
 #[derive(Clone, Debug)]
 struct ActiveThreadInfo {
+    thread_id: ThreadId,
     session_id: acp::SessionId,
     title: SharedString,
     status: AgentThreadStatus,
@@ -1785,7 +1786,9 @@ impl Sidebar {
 
                 // Build a lookup from live_infos and compute running/waiting
                 // counts in a single pass.
-                let mut live_info_by_session: HashMap<acp::SessionId, ActiveThreadInfo> =
+                // Keyed by thread: agents are free to hand out the same session
+                // id to several threads, and each must keep its own title.
+                let mut live_info_by_thread: HashMap<ThreadId, ActiveThreadInfo> =
                     HashMap::new();
                 for info in live_infos {
                     if info.status == AgentThreadStatus::Running {
@@ -1794,14 +1797,14 @@ impl Sidebar {
                     if info.status == AgentThreadStatus::WaitingForConfirmation {
                         waiting_thread_count += 1;
                     }
-                    live_info_by_session.insert(info.session_id.clone(), info);
+                    live_info_by_thread.insert(info.thread_id, info);
                 }
 
                 // Merge live info into threads and update notification state
                 // in a single pass.
                 for thread in &mut threads {
                     if let Some(session_id) = thread.metadata.session_id.clone() {
-                        if let Some(info) = live_info_by_session.get(&session_id) {
+                        if let Some(info) = live_info_by_thread.get(&thread.metadata.thread_id) {
                             let status = info.status;
                             let thread_id = thread.metadata.thread_id;
                             Arc::make_mut(thread).apply_active_info(info);
@@ -8189,6 +8192,7 @@ fn all_thread_infos_for_workspace(
             let diff_stats = thread.action_log().read(cx).diff_stats(cx);
 
             Some(ActiveThreadInfo {
+                thread_id: conversation_thread_id,
                 session_id,
                 title,
                 status,

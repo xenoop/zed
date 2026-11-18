@@ -6262,6 +6262,55 @@ async fn test_thread_title_update_propagates_to_sidebar(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
+async fn test_threads_sharing_a_session_id_keep_their_own_titles(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    open_thread_with_connection(&panel, StubAgentConnection::new(), cx);
+    send_message(&panel, cx);
+    let parent_session_id = active_session_id(&panel, cx);
+    let parent_thread = panel.read_with(cx, |panel, cx| panel.active_agent_thread(cx).unwrap());
+    parent_thread.update(cx, |thread, cx| {
+        thread.set_title("Add parser module".into(), cx).detach();
+    });
+    cx.run_until_parked();
+
+    let session_number: usize = parent_session_id.0.parse().unwrap();
+    cx.update(|_, cx| {
+        cx.set_global(acp_thread::StubSessionCounter(
+            std::sync::atomic::AtomicUsize::new(session_number),
+        ));
+    });
+    open_thread_with_connection(&panel, StubAgentConnection::new(), cx);
+    send_message(&panel, cx);
+    assert_eq!(active_session_id(&panel, cx), parent_session_id);
+    let review_thread = panel.read_with(cx, |panel, cx| panel.active_agent_thread(cx).unwrap());
+    review_thread.update(cx, |thread, cx| {
+        thread
+            .set_title("Review: Add parser module".into(), cx)
+            .detach();
+    });
+    cx.run_until_parked();
+
+    let entries = visible_entries_as_strings(&sidebar, cx);
+    assert_eq!(entries.len(), 3, "{entries:?}");
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.starts_with("  Add parser module")),
+        "{entries:?}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.starts_with("  Review: Add parser module")),
+        "{entries:?}"
+    );
+}
+
+#[gpui::test]
 async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
