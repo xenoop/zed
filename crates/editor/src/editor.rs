@@ -113,9 +113,9 @@ pub use element::{
 };
 pub use git::blame::{BlameRenderer, GitBlame, MAX_RELATIVE_TIMESTAMP};
 pub use git::{
-    AgentReply, DefaultDiffHunkRenderer, DiffHunkRenderer, HiddenDiffHunkRenderer,
-    HiddenUnstagedDiffHunkRenderer, ReviewCommentCode, ReviewCommentForAgent, SavedReviewComment,
-    render_diff_hunk_controls, set_blame_renderer,
+    AGENT_BUSY_MESSAGE, AgentReply, DefaultDiffHunkRenderer, DiffHunkRenderer,
+    HiddenDiffHunkRenderer, HiddenUnstagedDiffHunkRenderer, ReviewCommentCode,
+    ReviewCommentForAgent, SavedReviewComment, render_diff_hunk_controls, set_blame_renderer,
 };
 pub(crate) use git::{DiffHunkKey, StoredReviewComment};
 use git::{DiffReviewDragState, DiffReviewOverlay, InlineBlamePopover};

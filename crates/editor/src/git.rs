@@ -271,6 +271,10 @@ fn agent_reply_height(reply: &AgentReply) -> u32 {
     }
 }
 
+/// The reason shown, muted and without a "Not answered" prefix, when a review
+/// comment could not be sent because the agent was in the middle of a turn.
+pub const AGENT_BUSY_MESSAGE: &str = "Agent is busy; press Send again when it's done.";
+
 /// Where a review comment is in its exchange with the agent thread.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum AgentReply {
@@ -1214,7 +1218,16 @@ impl Editor {
         // Create the prompt editor for the review input
         let prompt_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Add a review comment or reply...", window, cx);
+            let send_key = if cfg!(target_os = "macos") {
+                "Cmd+Enter"
+            } else {
+                "Ctrl+Enter"
+            };
+            editor.set_placeholder_text(
+                &format!("Comment… Enter adds, {send_key} sends all to the agent"),
+                window,
+                cx,
+            );
             editor
         });
 
@@ -3341,7 +3354,19 @@ impl Editor {
                     el
                 }
             })
-            // Top row: editable input with user's avatar
+            // Expandable comments section (only shown when there are comments)
+            .when(comment_count > 0, |el| {
+                el.child(Self::render_comments_section(
+                    comments,
+                    comments_expanded,
+                    inline_editors,
+                    user_avatar_uri.clone(),
+                    avatar_size,
+                    action_icon_size,
+                    colors,
+                ))
+            })
+            // Input row, below the comments and their answers
             .child(
                 h_flex()
                     .w_full()
@@ -3397,7 +3422,17 @@ impl Editor {
                                 IconButton::new("diff-review-add", IconName::Return)
                                     .icon_color(ui::Color::Muted)
                                     .icon_size(action_icon_size)
-                                    .tooltip(Tooltip::text("Add comment"))
+                                    .tooltip({
+                                        let focus_handle = prompt_editor.focus_handle(cx);
+                                        move |_window, cx| {
+                                            Tooltip::for_action_in(
+                                                "Add comment",
+                                                &crate::actions::Newline,
+                                                &focus_handle,
+                                                cx,
+                                            )
+                                        }
+                                    })
                                     .on_click(|_, window, cx| {
                                         window.dispatch_action(
                                             Box::new(crate::actions::SubmitDiffReviewComment),
@@ -3407,18 +3442,6 @@ impl Editor {
                             ),
                     ),
             )
-            // Expandable comments section (only shown when there are comments)
-            .when(comment_count > 0, |el| {
-                el.child(Self::render_comments_section(
-                    comments,
-                    comments_expanded,
-                    inline_editors,
-                    user_avatar_uri,
-                    avatar_size,
-                    action_icon_size,
-                    colors,
-                ))
-            })
             .into_any_element()
     }
 
@@ -3542,6 +3565,7 @@ impl Editor {
                 // Display mode: show the comment text
                 h_flex()
                     .flex_1()
+                    .min_w_0()
                     .gap_1p5()
                     .text_sm()
                     .text_color(colors.text)
@@ -3552,7 +3576,7 @@ impl Editor {
                                 .color(Color::Warning),
                         )
                     })
-                    .child(comment.comment)
+                    .child(div().min_w_0().child(comment.comment))
                     .into_any_element()
             })
             .child(if is_editing {
@@ -3623,6 +3647,9 @@ impl Editor {
             AgentReply::NotSent => (String::new(), Color::Muted, false),
             AgentReply::Waiting => ("Waiting for the agent…".to_string(), Color::Muted, false),
             AgentReply::Answered(text) => (text, Color::Default, true),
+            AgentReply::Failed(reason) if reason == AGENT_BUSY_MESSAGE => {
+                (reason, Color::Muted, false)
+            }
             AgentReply::Failed(reason) => (
                 format!("Not answered: {reason} It will be sent again with the next review."),
                 Color::Error,
@@ -3630,7 +3657,6 @@ impl Editor {
             ),
         };
         h_flex()
-            .w_full()
             .items_start()
             .gap_2()
             .ml_6()
@@ -3647,6 +3673,7 @@ impl Editor {
                 div()
                     .id(("agent-reply", comment_id))
                     .flex_1()
+                    .min_w_0()
                     .max_h(rems(MAX_AGENT_REPLY_LINES as f32 * 1.25))
                     .overflow_y_scroll()
                     .text_sm()
@@ -3657,7 +3684,7 @@ impl Editor {
                     IconButton::new(("resolve-review-comment", comment_id), IconName::Check)
                         .icon_color(Color::Muted)
                         .icon_size(action_icon_size)
-                        .tooltip(Tooltip::text("Resolve (removes the comment)"))
+                        .tooltip(Tooltip::text("Resolve and remove"))
                         .on_click(move |_, window, cx| {
                             window.dispatch_action(
                                 Box::new(crate::actions::DeleteReviewComment { id: comment_id }),
