@@ -778,14 +778,8 @@ impl Editor {
             cx.propagate();
             return;
         }
-        if self.review_comments_hidden {
-            if self.reopen_hidden_comment_at_cursor(window, cx) {
-                return;
-            }
-            if !self.diff_review_overlays.is_empty() {
-                self.set_review_comments_hidden(true, window, cx);
-                return;
-            }
+        if self.review_comments_hidden && self.reopen_hidden_comment_at_cursor(window, cx) {
+            return;
         }
         self.set_review_comments_hidden(!self.review_comments_hidden, window, cx);
     }
