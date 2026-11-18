@@ -3535,6 +3535,14 @@ impl AgentPanel {
                 }
                 fork_workspace.update_in(cx, |workspace, window, cx| {
                     workspace.focus_panel::<AgentPanel>(window, cx);
+                    if kind == thread_fork::ForkKind::Review {
+                        // Dispatched from inside the fork's workspace so that its
+                        // Changes view opens, not the parent's.
+                        window.dispatch_action(
+                            zed_actions::agent::OpenThreadChanges.boxed_clone(),
+                            cx,
+                        );
+                    }
                 })?;
                 Ok(())
             }
@@ -3816,8 +3824,7 @@ impl AgentPanel {
                                 if let Err(error) = went {
                                     log::error!("could not go to the parent thread: {error:#}");
                                 }
-                            })
-                            .autohide(),
+                            }),
                             cx,
                         );
                     })
