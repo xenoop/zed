@@ -357,30 +357,73 @@ pub(crate) fn marked_body<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
 /// How the fork message continues after its marker.
 pub(crate) const FORK_CONTEXT_PREFIX: &str = "This thread is a fork of";
 
-/// How much of the parent's transcript a fork receives, counted from its end.
+/// How much of the parent's transcript a fork receives.
 const MAX_TRANSCRIPT_BYTES: usize = 60_000;
+
+/// The start offsets of the messages of a transcript, which are the
+/// `## User` / `## Assistant` headings of `AcpThread::to_markdown`.
+fn message_starts(transcript: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut offset = 0;
+    for line in transcript.split_inclusive('\n') {
+        if line.starts_with("## ") {
+            starts.push(offset);
+        }
+        offset += line.len();
+    }
+    starts
+}
+
+/// The transcript cut to `MAX_TRANSCRIPT_BYTES`: its first message (the prompt
+/// that set the thread's task) and as many of the most recent messages as fit,
+/// cut on message boundaries.
+fn truncated_transcript(transcript: &str) -> String {
+    if transcript.len() <= MAX_TRANSCRIPT_BYTES {
+        return transcript.to_string();
+    }
+    let starts = message_starts(transcript);
+    let first_end = starts.get(1).copied().unwrap_or(transcript.len());
+    let first_message = &transcript[..first_end];
+    let tail_budget = MAX_TRANSCRIPT_BYTES.saturating_sub(first_message.len());
+    let mut tail_start = transcript.len();
+    let mut kept_messages = 0;
+    for start in starts.iter().skip(1).rev() {
+        if transcript.len() - start > tail_budget {
+            break;
+        }
+        tail_start = *start;
+        kept_messages += 1;
+    }
+    let message_count = starts.len();
+    if first_message.len() >= MAX_TRANSCRIPT_BYTES / 2 || kept_messages == 0 {
+        let mut start = transcript.len() - MAX_TRANSCRIPT_BYTES;
+        while !transcript.is_char_boundary(start) {
+            start += 1;
+        }
+        return format!("(earlier part omitted)\n{}", &transcript[start..]);
+    }
+    let omitted = message_count.saturating_sub(1 + kept_messages);
+    if omitted == 0 {
+        return transcript.to_string();
+    }
+    format!(
+        "{first_message}\n[… {omitted} earlier messages omitted …]\n\n{}",
+        &transcript[tail_start..]
+    )
+}
 
 /// The first message of a fork. Agents cannot import another thread's
 /// history, so the parent's transcript is passed as text.
 pub(crate) fn fork_context_message(parent_title: Option<&str>, transcript: &str) -> String {
     let title = parent_title.unwrap_or("an earlier thread");
-    let mut start = transcript.len().saturating_sub(MAX_TRANSCRIPT_BYTES);
-    while !transcript.is_char_boundary(start) {
-        start += 1;
-    }
-    let truncated = if start > 0 {
-        "(earlier part omitted)\n"
-    } else {
-        ""
-    };
+    let transcript = truncated_transcript(transcript);
     format!(
         "{FORK_MARKER}\n{FORK_CONTEXT_PREFIX} \"{title}\". Its conversation so far is below, for context. \
          You are working in a separate git worktree that started as a copy of that \
          thread's working tree, including uncommitted changes; what you change here \
          reaches the original only when I merge it. Do not act on the conversation \
          yet: reply with one short line saying you are ready.\n\n\
-         <conversation>\n{truncated}{}\n</conversation>\n",
-        &transcript[start..]
+         <conversation>\n{transcript}\n</conversation>\n",
     )
 }
 
@@ -401,24 +444,34 @@ pub(crate) fn first_message(
     kind: &ForkKind,
     parent_title: Option<&str>,
     transcript: &str,
+    base_sha: &str,
 ) -> String {
     let context = fork_context_message(parent_title, transcript);
     match kind {
         ForkKind::Fork | ForkKind::Land => context,
-        ForkKind::Review => context.replace(
-            "Do not act on the conversation yet: reply with one short line saying you are ready.",
-            REVIEW_INSTRUCTIONS,
-        ),
+        ForkKind::Review => context
+            .replace("; what you change here reaches the original only when I merge it.", ".")
+            .replace(
+                "Do not act on the conversation yet: reply with one short line saying you are ready.",
+                &review_instructions(base_sha),
+            ),
     }
 }
 
-const REVIEW_INSTRUCTIONS: &str = "You are the reviewer of that thread's work. The work is \
-     everything between the repository's default branch and this worktree's HEAD commit, \
-     which is a snapshot that includes the uncommitted changes. Do not change any files. \
-     Write a change guide: an ordered walkthrough of the change for a reader who has not \
-     seen it, one step per logical change, each naming the files and lines involved and \
-     saying what changed and why it matters, with anything risky, unclear or untested \
-     called out. I will then comment and give a verdict.";
+fn review_instructions(base_sha: &str) -> String {
+    let short_sha: String = base_sha.chars().take(12).collect();
+    format!(
+        "You are the reviewer of that thread's work. The work is everything between the \
+         repository's default branch (find it with `git symbolic-ref --short \
+         refs/remotes/origin/HEAD`, or use `main` or `master`) and this worktree's HEAD \
+         commit {short_sha}, which is a snapshot that includes the uncommitted changes. Do \
+         not change any files. First reply with a short risk summary and the top 3 points \
+         I should check. Then write a change guide: an ordered walkthrough of the change for \
+         a reader who has not seen it, one step per logical change, each naming the files \
+         and lines involved and saying what changed and why it matters, with anything risky, \
+         unclear or untested called out. I will then comment and give a verdict."
+    )
+}
 
 const VERDICT_PREFIX: &str = "Review verdict:";
 const THREAD_MESSAGE_PREFIX: &str = "Message from thread";
@@ -434,33 +487,58 @@ fn clipped(text: &str) -> &str {
     &text[..end]
 }
 
+/// `text` cut to `MAX_FORWARDED_BYTES`, and whether it was cut.
+fn clipped_with_flag(text: &str) -> (&str, bool) {
+    let clipped_text = clipped(text);
+    (clipped_text, clipped_text.len() < text.len())
+}
+
+fn quote_safe_title(title: Option<&str>, fallback: &str) -> String {
+    title
+        .unwrap_or(fallback)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| *c != '"')
+        .take(60)
+        .collect()
+}
+
 /// The message a review's verdict reaches the reviewed thread with: the
-/// verdict, what the user added, and the reviewer's last findings.
+/// verdict, what the user wrote (which decides), and the reviewer's notes.
 pub(crate) fn verdict_message(
     verdict: ReviewVerdict,
-    note: &str,
-    reviewer_findings: &str,
+    review_title: Option<&str>,
+    instructions: &str,
+    reviewer_notes: &str,
 ) -> String {
-    let (label, instruction) = match verdict {
-        ReviewVerdict::Approved => (
-            "approved",
-            "No changes are required. Take note of the findings below, if any.",
-        ),
+    let (label, next_step) = match verdict {
+        ReviewVerdict::Approved => ("approved", "No changes are needed. Reply briefly and stop."),
         ReviewVerdict::ChangesRequested => (
             "changes requested",
-            "Address what is asked below, then say what you changed.",
+            "Make these changes in this working tree, then summarise what you changed.",
         ),
     };
-    let mut message = format!("{VERDICT_MARKER}\n{VERDICT_PREFIX} {label}. {instruction}\n");
-    if !note.trim().is_empty() {
-        message.push_str(&format!("\nFrom me:\n{}\n", note.trim()));
+    let title = quote_safe_title(review_title, "the review thread");
+    let mut message = format!(
+        "{VERDICT_MARKER}\n{VERDICT_PREFIX} {label}. From the review thread \"{title}\".\n"
+    );
+    for (heading, text) in [
+        ("Instructions from the user (authoritative):", instructions),
+        ("Reviewer notes:", reviewer_notes),
+    ] {
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let (body, was_cut) = clipped_with_flag(text);
+        message.push_str(&format!("\n{heading}\n{body}\n"));
+        if was_cut {
+            message.push_str("(truncated)\n");
+        }
     }
-    if !reviewer_findings.trim().is_empty() {
-        message.push_str(&format!(
-            "\nThe reviewer's findings:\n{}\n",
-            clipped(reviewer_findings.trim())
-        ));
-    }
+    message.push_str(&format!("\nNext step: {next_step}\n"));
     message
 }
 
@@ -468,15 +546,7 @@ pub(crate) fn verdict_message(
 pub(crate) fn thread_message(sender_title: Option<&str>, text: &str) -> String {
     // A title can be a thread's whole first message: keep its first line,
     // shortened, and without quotes that would end the quoted title early.
-    let title: String = sender_title
-        .unwrap_or("another thread")
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .chars()
-        .filter(|c| *c != '"')
-        .take(60)
-        .collect();
+    let title = quote_safe_title(sender_title, "another thread");
     format!(
         "{THREAD_MESSAGE_MARKER}\n{THREAD_MESSAGE_PREFIX} \"{title}\":\n\n{}\n",
         clipped(text.trim())
@@ -1281,12 +1351,36 @@ mod tests {
         assert!(message.contains("\"Fix the parser\""));
         assert!(message.contains("<conversation>\n## User\nhello\n\n</conversation>"));
 
-        // A long transcript keeps its end.
+        // A transcript without message headings keeps its end.
         let long = format!("{}THE END", "x".repeat(MAX_TRANSCRIPT_BYTES * 2));
         let message = fork_context_message(None, &long);
         assert!(message.contains("(earlier part omitted)"));
         assert!(message.contains("THE END"));
         assert!(message.len() < MAX_TRANSCRIPT_BYTES + 2_000);
+
+        // A long conversation keeps its first message and its recent ones, cut
+        // on message boundaries.
+        let mut conversation = String::from("## User\n\nTHE ARCHITECT PROMPT\n\n");
+        for index in 0..400 {
+            conversation.push_str(&format!(
+                "## Assistant\n\nreply {index} {}\n\n",
+                "y".repeat(400)
+            ));
+        }
+        conversation.push_str("## User\n\nLAST QUESTION\n\n");
+        let message = fork_context_message(None, &conversation);
+        assert!(message.contains("THE ARCHITECT PROMPT"));
+        assert!(message.contains("LAST QUESTION"));
+        assert!(message.contains("reply 399 "));
+        assert!(!message.contains("reply 0 "));
+        assert!(
+            message.contains("earlier messages omitted …]"),
+            "{}",
+            &message[..400]
+        );
+        assert!(message.len() < MAX_TRANSCRIPT_BYTES + 2_000);
+        let kept = message.matches("## Assistant").count();
+        assert!(message.contains(&format!("[… {} earlier messages omitted …]", 400 - kept)));
 
         assert_eq!(
             fork_thread_title(&ForkKind::Fork, Some("Fix the parser")),
@@ -1310,27 +1404,50 @@ mod tests {
 
     #[test]
     fn test_review_land_and_thread_messages() {
-        let review = first_message(&ForkKind::Review, Some("Fix the parser"), "hello");
+        let review = first_message(
+            &ForkKind::Review,
+            Some("Fix the parser"),
+            "hello",
+            "0123456789abcdef",
+        );
         assert!(review.starts_with("[Zed: fork]\nThis thread is a fork of"));
         assert!(review.contains("Write a change guide"));
         assert!(!review.contains("reply with one short line"));
+        assert!(review.contains("HEAD commit 0123456789ab"));
+        assert!(review.contains("risk summary and the top 3 points"));
+        assert!(!review.contains("reaches the original"));
+        let fork = first_message(
+            &ForkKind::Fork,
+            Some("Fix the parser"),
+            "hello",
+            "0123456789abcdef",
+        );
+        assert!(fork.contains("reaches the original only when I merge it"));
 
         let verdict = verdict_message(
             ReviewVerdict::ChangesRequested,
+            Some("Review: Fix the parser"),
             "Rename the helper.\n",
             "1. The parser drops the last token.",
         );
         assert_eq!(
             verdict,
-            "[Zed: review verdict]\nReview verdict: changes requested. Address what is asked below, then say what you \
-             changed.\n\nFrom me:\nRename the helper.\n\nThe reviewer's findings:\n\
-             1. The parser drops the last token.\n"
+            "[Zed: review verdict]\nReview verdict: changes requested. From the review thread \
+             \"Review: Fix the parser\".\n\nInstructions from the user (authoritative):\n\
+             Rename the helper.\n\nReviewer notes:\n1. The parser drops the last token.\n\n\
+             Next step: Make these changes in this working tree, then summarise what you \
+             changed.\n"
         );
         assert_eq!(
             delivered_message_summary(&verdict).as_deref(),
             Some("Review verdict: changes requested")
         );
-        let approved = verdict_message(ReviewVerdict::Approved, "", "");
+        let approved = verdict_message(ReviewVerdict::Approved, None, "", "");
+        assert!(approved.contains("Next step: No changes are needed. Reply briefly and stop."));
+        assert!(!approved.contains("Instructions from the user"));
+        let long_note = "n".repeat(MAX_FORWARDED_BYTES + 10);
+        let truncated = verdict_message(ReviewVerdict::Approved, None, &long_note, "");
+        assert!(truncated.contains("\n(truncated)\n"));
         assert_eq!(
             delivered_message_summary(&approved).as_deref(),
             Some("Review verdict: approved")

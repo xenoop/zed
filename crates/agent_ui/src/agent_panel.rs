@@ -3488,7 +3488,7 @@ impl AgentPanel {
                     id,
                     fork_path,
                     parent_path,
-                    base_sha,
+                    base_sha: base_sha.clone(),
                     merged_sha: None,
                     kind: kind.clone(),
                     parent_title: parent_title.clone(),
@@ -3501,8 +3501,12 @@ impl AgentPanel {
                     .read_with(cx, |workspace, cx| workspace.panel::<AgentPanel>(cx))
                     .context("the fork's workspace has no agent panel")?;
                 let title = thread_fork::fork_thread_title(&kind, parent_title.as_deref());
-                let message =
-                    thread_fork::first_message(&kind, parent_title.as_deref(), &transcript);
+                let message = thread_fork::first_message(
+                    &kind,
+                    parent_title.as_deref(),
+                    &transcript,
+                    &base_sha,
+                );
                 let options = CreateThreadOptions {
                     title: Some(title.into()),
                     initial_content: Some(AgentInitialContent::ContentBlock {
@@ -3729,7 +3733,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        use crate::thread_fork::{self, ForkKind};
+        use crate::thread_fork::{self, ForkKind, ReviewVerdict};
         let record = self
             .working_tree_path(cx)
             .and_then(|path| thread_fork::record_for_fork(&path, cx))
@@ -3739,10 +3743,19 @@ impl AgentPanel {
                 "This thread is not a review of another thread"
             )));
         };
-        let Some((_, findings, note)) = self.active_thread_summary(cx) else {
+        let Some((review_title, findings, note)) = self.active_thread_summary(cx) else {
             return Task::ready(Err(anyhow!("The review thread is not ready yet")));
         };
-        let message = thread_fork::verdict_message(verdict, &note, &findings);
+        if verdict == ReviewVerdict::ChangesRequested
+            && note.trim().is_empty()
+            && !self.has_sent_review_comments(cx)
+        {
+            return Task::ready(Err(anyhow!(
+                "Write what should change first (in the message box), then Request Changes."
+            )));
+        }
+        let message =
+            thread_fork::verdict_message(verdict, review_title.as_deref(), &note, &findings);
         let result = self.deliver_to_working_tree(
             &record.parent_path.clone(),
             record.parent_thread_id,
@@ -3751,15 +3764,89 @@ impl AgentPanel {
             cx,
         );
         if result.is_ok() {
+            let parent_title = record
+                .parent_title
+                .clone()
+                .unwrap_or_else(|| "the parent thread".to_string());
+            let outcome = match verdict {
+                ReviewVerdict::Approved => "approved",
+                ReviewVerdict::ChangesRequested => "changes requested",
+            };
             record.verdict = Some(verdict);
+            let parent_path = record.parent_path.clone();
+            let parent_thread_id = record.parent_thread_id;
             thread_fork::upsert_record(record, cx);
             if let Some(thread_view) = self.active_thread_view(cx) {
                 let message_editor = thread_view.read(cx).message_editor.clone();
                 message_editor.update(cx, |editor, cx| editor.clear(window, cx));
             }
+            self.record_note(
+                format!("Sent review to \u{201c}{parent_title}\u{201d}: {outcome}"),
+                cx,
+            );
+            let workspace = self.workspace.clone();
+            let panel = cx.weak_entity();
+            // The action that got here runs while the workspace is being
+            // updated.
+            cx.defer(move |cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        struct ReviewSentToast;
+                        workspace.show_toast(
+                            workspace::Toast::new(
+                                workspace::notifications::NotificationId::unique::<ReviewSentToast>(
+                                ),
+                                format!("Review sent to \u{201c}{parent_title}\u{201d}: {outcome}"),
+                            )
+                            .on_click("Go to Parent", move |window, cx| {
+                                let Some(panel) = panel.upgrade() else {
+                                    return;
+                                };
+                                let went = panel.update(cx, |panel, cx| {
+                                    panel.go_to_working_tree_thread(
+                                        &parent_path,
+                                        parent_thread_id,
+                                        window,
+                                        cx,
+                                    )
+                                });
+                                if let Err(error) = went {
+                                    log::error!("could not go to the parent thread: {error:#}");
+                                }
+                            })
+                            .autohide(),
+                            cx,
+                        );
+                    })
+                    .log_err();
+            });
             cx.notify();
         }
         Task::ready(result)
+    }
+
+    /// Whether the active thread has been sent review comments from the
+    /// Changes view.
+    fn has_sent_review_comments(&self, cx: &App) -> bool {
+        let Some(thread) = self.active_agent_thread(cx) else {
+            return false;
+        };
+        thread.read(cx).entries().iter().any(|entry| {
+            let acp_thread::AgentThreadEntry::UserMessage(message) = entry else {
+                return false;
+            };
+            message.content.source_blocks().iter().any(|block| {
+                matches!(
+                    block,
+                    acp_v2::ContentBlock::Text(text)
+                        if crate::thread_fork::marked_body(
+                            &text.text,
+                            crate::conversation_view::REVIEW_QUESTION_MARKER,
+                        )
+                        .is_some()
+                )
+            })
+        })
     }
 
     /// Sends the agent's last reply in the active thread to the thread it
@@ -3807,12 +3894,78 @@ impl AgentPanel {
     /// Notes in the active thread's transcript that its last reply was
     /// sent on.
     fn record_sent_note(&mut self, target: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let target = target.into();
+        self.record_note(format!("Sent this reply to {target}"), cx);
+    }
+
+    fn record_note(&mut self, note: impl Into<SharedString>, cx: &mut Context<Self>) {
         if let Some(thread_view) = self.active_thread_view(cx) {
-            let target = target.into();
-            thread_view.update(cx, |thread_view, cx| {
-                thread_view.record_sent_note(target, cx)
+            let note = note.into();
+            thread_view.update(cx, |thread_view, cx| thread_view.record_sent_note(note, cx));
+        }
+    }
+
+    /// Shows the thread working in the working tree at `path`, in whichever
+    /// window has it open.
+    fn go_to_working_tree_thread(
+        &mut self,
+        path: &str,
+        thread_id: Option<ThreadId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let own_workspace_id = self.workspace.entity_id();
+        let find = |multi_workspace: &MultiWorkspace, cx: &App| {
+            multi_workspace.workspaces().find_map(|workspace| {
+                // This panel's workspace may be mid-update, and reading it
+                // then panics.
+                if workspace.entity_id() == own_workspace_id {
+                    return None;
+                }
+                let panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
+                (panel.read(cx).working_tree_path(cx).as_deref() == Some(path))
+                    .then(|| (workspace.clone(), panel))
+            })
+        };
+        let show_thread = |panel: &Entity<AgentPanel>, window: &mut Window, cx: &mut App| {
+            if let Some(thread_id) = thread_id {
+                panel.update(cx, |panel, cx| {
+                    panel.activate_retained_thread(thread_id, true, window, cx)
+                });
+            }
+        };
+
+        if let Some(Some(multi_workspace)) = window.root::<MultiWorkspace>()
+            && let Some((workspace, panel)) = find(multi_workspace.read(cx), cx)
+        {
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace.activate(workspace, None, window, cx)
+            });
+            show_thread(&panel, window, cx);
+            return Ok(());
+        }
+        let current_window = window.window_handle();
+        for other_window in cx.windows() {
+            if other_window == current_window {
+                continue;
+            }
+            let Some(handle) = other_window.downcast::<MultiWorkspace>() else {
+                continue;
+            };
+            let Some((workspace, panel)) = handle
+                .read(cx)
+                .ok()
+                .and_then(|multi_workspace| find(multi_workspace, cx))
+            else {
+                continue;
+            };
+            return handle.update(cx, |multi_workspace, window, cx| {
+                multi_workspace.activate(workspace, None, window, cx);
+                show_thread(&panel, window, cx);
+                window.activate_window();
             });
         }
+        Err(anyhow!("The workspace of {path} is not open"))
     }
 
     /// Hands a message to a thread this panel has loaded. Unlike
@@ -4161,11 +4314,11 @@ impl AgentPanel {
                         if own_record.kind == crate::thread_fork::ForkKind::Review {
                             menu = menu
                                 .action(
-                                    "Submit Review: Approve",
+                                    "Approve and Send to Parent",
                                     Box::new(zed_actions::agent::ApproveReview),
                                 )
                                 .action(
-                                    "Submit Review: Request Changes",
+                                    "Request Changes and Send to Parent",
                                     Box::new(zed_actions::agent::RequestReviewChanges),
                                 );
                         }
@@ -16221,6 +16374,28 @@ mod tests {
             });
             open_thread_with_connection(panel, StubAgentConnection::new(), cx);
         }
+        let refused = fork_panel
+            .update_in(&mut fork_cx, |panel, window, cx| {
+                panel.submit_review(
+                    crate::thread_fork::ReviewVerdict::ChangesRequested,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("Write what should change first"),
+            "{refused:#}"
+        );
+        assert!(
+            cx.update(|_, cx| crate::thread_fork::record_for_fork(&record.fork_path, cx))
+                .and_then(|record| record.verdict)
+                .is_none()
+        );
+
         crate::test_support::type_draft_prompt(&fork_panel, "Rename the helper.", &mut fork_cx);
         fork_panel
             .update_in(&mut fork_cx, |panel, window, cx| {
@@ -16257,6 +16432,22 @@ mod tests {
             thread_view.read(cx).message_editor.read(cx).text(cx)
         });
         assert_eq!(draft, "");
+        let review_notes = fork_panel.read_with(&fork_cx, |panel, cx| {
+            panel
+                .active_thread_view(cx)
+                .unwrap()
+                .read(cx)
+                .sent_notes()
+                .iter()
+                .map(|(_, note)| note.to_string())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(review_notes.len(), 1, "{review_notes:?}");
+        assert!(
+            review_notes[0].starts_with("Sent review to \u{201c}")
+                && review_notes[0].ends_with("\u{201d}: changes requested"),
+            "{review_notes:?}"
+        );
 
         // The same through the registered action, which runs while the
         // review's own workspace is being updated.
@@ -16472,7 +16663,10 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         assert_eq!(notes.len(), 2, "{notes:?}");
-        assert_eq!(notes[0], "the thread this one lands changes for");
+        assert_eq!(
+            notes[0],
+            "Sent this reply to the thread this one lands changes for"
+        );
     }
 
     #[gpui::test]
@@ -16599,7 +16793,7 @@ mod tests {
                 .iter()
                 .map(|(_, target)| target.to_string())
                 .collect::<Vec<_>>();
-            assert_eq!(notes, vec!["Third".to_string()]);
+            assert_eq!(notes, vec!["Sent this reply to Third".to_string()]);
         });
 
         // A thread that does not exist is refused, and nothing is sent.
