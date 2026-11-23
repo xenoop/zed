@@ -1241,7 +1241,7 @@ impl Render for BranchDiffToolbar {
                 |this, _, window, cx| this.dispatch_action(&SendReviewToAgent, window, cx),
             ))
         });
-        let review_focus_handle = focus_handle.clone();
+        let review_focus_handle = focus_handle;
 
         h_flex()
             .my_neg_1()
