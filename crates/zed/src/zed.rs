@@ -1519,6 +1519,8 @@ fn initialize_pane(
             let highlights_tree_item =
                 cx.new(|_| language_tools::HighlightsTreeToolbarItemView::new());
             toolbar.add_item(highlights_tree_item, window, cx);
+            let strata_toolbar = cx.new(|_| strata_view::StrataToolbar::new());
+            toolbar.add_item(strata_toolbar, window, cx);
             let project_diff_toolbar = cx.new(|cx| ProjectDiffToolbar::new(workspace, cx));
             toolbar.add_item(project_diff_toolbar, window, cx);
             let staged_diff_toolbar = cx.new(|cx| StagedDiffToolbar::new(workspace, cx));

@@ -3,12 +3,14 @@ mod painter;
 mod scene;
 mod strata_item;
 mod strata_panel;
+mod strata_toolbar;
 
 use gpui::{App, actions};
 use workspace::Workspace;
 
 pub use strata_item::{RELOAD_DEBOUNCE, SPEEDS, StrataView, StrataViewEvent};
 pub use strata_panel::StrataPanel;
+pub use strata_toolbar::StrataToolbar;
 
 actions!(
     strata,
