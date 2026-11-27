@@ -1,0 +1,902 @@
+{
+  "version": 1,
+  "repo": "https://github.example.com/acme/cells",
+  "title": "Local backends for cells",
+  "steps": [
+    {
+      "id": "main",
+      "title": "Model at main",
+      "revision": "2f28896fe9",
+      "notes": {
+        "hosted": "Two reconcilers each carry their own docker calls."
+      },
+      "elements": [
+        {
+          "id": "dev",
+          "kind": "person",
+          "label": "Developer",
+          "description": "Runs cell commands"
+        },
+        {
+          "id": "platform",
+          "kind": "system",
+          "label": "Cell platform",
+          "description": "Runs developer cells locally and hosted"
+        },
+        {
+          "id": "local",
+          "kind": "container",
+          "parent": "platform",
+          "label": "Local CLI",
+          "technology": "Rust",
+          "files": ["src/cli", "src/config"]
+        },
+        {
+          "id": "hosted",
+          "kind": "container",
+          "parent": "platform",
+          "label": "Hosted reconciliation",
+          "technology": "Rust",
+          "files": ["src/hosted"]
+        },
+        {
+          "id": "deploy",
+          "kind": "container",
+          "parent": "platform",
+          "label": "Deployment",
+          "technology": "Compose",
+          "files": ["deploy"]
+        },
+        {
+          "id": "celllife",
+          "kind": "container",
+          "parent": "hosted",
+          "label": "Cell lifecycle"
+        },
+        {
+          "id": "projlife",
+          "kind": "container",
+          "parent": "hosted",
+          "label": "Project lifecycle"
+        },
+        {
+          "id": "cli",
+          "kind": "component",
+          "parent": "local",
+          "label": "CellCommand",
+          "description": "CLI entrypoint for cell operations",
+          "technology": "Rust",
+          "files": ["src/cli/cell_command.rs"]
+        },
+        {
+          "id": "config",
+          "kind": "component",
+          "parent": "local",
+          "label": "ConfigLoader",
+          "description": "Reads cell and project config",
+          "technology": "TOML",
+          "files": ["src/config/loader.rs"]
+        },
+        {
+          "id": "cell",
+          "kind": "component",
+          "parent": "celllife",
+          "label": "LocalCellReconciliation",
+          "description": "Hosted Compose lifecycle",
+          "files": ["src/hosted/cell/reconciliation.rs"]
+        },
+        {
+          "id": "loop",
+          "kind": "component",
+          "parent": "celllife",
+          "label": "ReconcileLoop",
+          "description": "Observe, then act",
+          "files": ["src/hosted/cell/reconcile_loop.rs"]
+        },
+        {
+          "id": "celldocker",
+          "kind": "component",
+          "parent": "celllife",
+          "label": "CellDockerOps",
+          "description": "Compose up/down via docker CLI",
+          "files": ["src/hosted/cell/docker_ops.rs"]
+        },
+        {
+          "id": "project",
+          "kind": "component",
+          "parent": "projlife",
+          "label": "ProjectReconciliation",
+          "description": "Per-project lifecycle",
+          "files": ["src/hosted/project/reconciliation.rs"]
+        },
+        {
+          "id": "projdocker",
+          "kind": "component",
+          "parent": "projlife",
+          "label": "ProjectDockerOps",
+          "description": "Duplicate docker calls",
+          "files": ["src/hosted/project/docker_ops.rs"]
+        },
+        {
+          "id": "state",
+          "kind": "store",
+          "parent": "hosted",
+          "label": "CellState",
+          "description": "Observed cell status",
+          "technology": "SQLite"
+        },
+        {
+          "id": "docker",
+          "kind": "component",
+          "parent": "deploy",
+          "label": "DockerCli",
+          "description": "Shells out to docker",
+          "files": ["deploy/docker.rs"]
+        },
+        {
+          "id": "stack",
+          "kind": "component",
+          "parent": "deploy",
+          "label": "ComposeStack",
+          "description": "docker-compose.yml on the host",
+          "files": ["deploy/compose.rs"]
+        }
+      ],
+      "relationships": [
+        {
+          "from": "dev",
+          "to": "local",
+          "kind": "calls",
+          "label": "uses"
+        },
+        {
+          "from": "cli",
+          "to": "config",
+          "kind": "calls"
+        },
+        {
+          "from": "cli",
+          "to": "cell",
+          "kind": "calls"
+        },
+        {
+          "from": "cell",
+          "to": "loop",
+          "kind": "calls"
+        },
+        {
+          "from": "project",
+          "to": "loop",
+          "kind": "calls"
+        },
+        {
+          "from": "loop",
+          "to": "state",
+          "kind": "calls",
+          "label": "reads and writes",
+          "technology": "rusqlite"
+        },
+        {
+          "from": "cell",
+          "to": "celldocker",
+          "kind": "injects"
+        },
+        {
+          "from": "project",
+          "to": "projdocker",
+          "kind": "injects"
+        },
+        {
+          "from": "celldocker",
+          "to": "docker",
+          "kind": "calls"
+        },
+        {
+          "from": "projdocker",
+          "to": "docker",
+          "kind": "calls"
+        },
+        {
+          "from": "celldocker",
+          "to": "stack",
+          "kind": "calls"
+        }
+      ]
+    },
+    {
+      "id": "349",
+      "title": "Shared Docker workload operations",
+      "status": "ready",
+      "base": "2f28896fe9",
+      "head": "4a54d9ced4",
+      "pr": 349,
+      "summary": "Both reconcilers now share one DockerWorkloadOps instead of two copies of the docker calls.",
+      "takeaway": "Cell and project lifecycles no longer know how docker is invoked; the duplicated Ops classes are gone.",
+      "notes": {
+        "hosted": "CellDockerOps and ProjectDockerOps are replaced by a single DockerWorkloadOps."
+      },
+      "elements": [
+        {
+          "id": "dev",
+          "kind": "person",
+          "label": "Developer",
+          "description": "Runs cell commands"
+        },
+        {
+          "id": "platform",
+          "kind": "system",
+          "label": "Cell platform",
+          "description": "Runs developer cells locally and hosted"
+        },
+        {
+          "id": "local",
+          "kind": "container",
+          "parent": "platform",
+          "label": "Local CLI",
+          "technology": "Rust",
+          "files": ["src/cli", "src/config"]
+        },
+        {
+          "id": "hosted",
+          "kind": "container",
+          "parent": "platform",
+          "label": "Hosted reconciliation",
+          "technology": "Rust",
+          "files": ["src/hosted"]
+        },
+        {
+          "id": "deploy",
+          "kind": "container",
+          "parent": "platform",
+          "label": "Deployment",
+          "technology": "Compose",
+          "files": ["deploy"]
+        },
+        {
+          "id": "celllife",
+          "kind": "container",
+          "parent": "hosted",
+          "label": "Cell lifecycle"
+        },
+        {
+          "id": "projlife",
+          "kind": "container",
+          "parent": "hosted",
+          "label": "Project lifecycle"
+        },
+        {
+          "id": "cli",
+          "kind": "component",
+          "parent": "local",
+          "label": "CellCommand",
+          "description": "CLI entrypoint for cell operations",
+          "technology": "Rust",
+          "files": ["src/cli/cell_command.rs"]
+        },
+        {
+          "id": "config",
+          "kind": "component",
+          "parent": "local",
+          "label": "ConfigLoader",
+          "description": "Reads cell and project config",
+          "technology": "TOML",
+          "files": ["src/config/loader.rs"]
+        },
+        {
+          "id": "cell",
+          "kind": "component",
+          "parent": "celllife",
+          "label": "LocalCellReconciliation",
+          "description": "Hosted Compose lifecycle",
+          "files": ["src/hosted/cell/reconciliation.rs"]
+        },
+        {
+          "id": "loop",
+          "kind": "component",
+          "parent": "celllife",
+          "label": "ReconcileLoop",
+          "description": "Observe, then act",
+          "files": ["src/hosted/cell/reconcile_loop.rs"]
+        },
+        {
+          "id": "project",
+          "kind": "component",
+          "parent": "projlife",
+          "label": "ProjectReconciliation",
+          "description": "Per-project lifecycle",
+          "files": ["src/hosted/project/reconciliation.rs"]
+        },
+        {
+          "id": "state",
+          "kind": "store",
+          "parent": "hosted",
+          "label": "CellState",
+          "description": "Observed cell status",
+          "technology": "SQLite"
+        },
+        {
+          "id": "docker",
+          "kind": "component",
+          "parent": "deploy",
+          "label": "DockerCli",
+          "description": "Single process runner",
+          "files": ["deploy/docker.rs"]
+        },
+        {
+          "id": "stack",
+          "kind": "component",
+          "parent": "deploy",
+          "label": "ComposeStack",
+          "description": "docker-compose.yml on the host",
+          "files": ["deploy/compose.rs"]
+        },
+        {
+          "id": "ops",
+          "kind": "container",
+          "parent": "hosted",
+          "label": "Workload operations",
+          "technology": "Rust",
+          "files": ["src/workload"]
+        },
+        {
+          "id": "workload",
+          "kind": "component",
+          "parent": "ops",
+          "label": "DockerWorkloads",
+          "description": "Shared compose, run and stop",
+          "files": ["src/workload/ops.rs"]
+        }
+      ],
+      "relationships": [
+        {
+          "from": "dev",
+          "to": "local",
+          "kind": "calls",
+          "label": "uses"
+        },
+        {
+          "from": "cli",
+          "to": "config",
+          "kind": "calls"
+        },
+        {
+          "from": "cli",
+          "to": "cell",
+          "kind": "calls"
+        },
+        {
+          "from": "cell",
+          "to": "loop",
+          "kind": "calls"
+        },
+        {
+          "from": "project",
+          "to": "loop",
+          "kind": "calls"
+        },
+        {
+          "from": "loop",
+          "to": "state",
+          "kind": "calls",
+          "label": "reads and writes",
+          "technology": "rusqlite"
+        },
+        {
+          "from": "cell",
+          "to": "workload",
+          "kind": "injects"
+        },
+        {
+          "from": "project",
+          "to": "workload",
+          "kind": "injects"
+        },
+        {
+          "from": "workload",
+          "to": "docker",
+          "kind": "calls"
+        },
+        {
+          "from": "workload",
+          "to": "stack",
+          "kind": "calls"
+        }
+      ]
+    },
+    {
+      "id": "350",
+      "title": "Extract WorkloadOps trait",
+      "status": "ready",
+      "base": "4a54d9ced4",
+      "head": "9b1c07e7aa",
+      "pr": 350,
+      "summary": "Reconcilers depend on a WorkloadOps trait; docker becomes one implementation.",
+      "takeaway": "Dependency now points at the abstraction, so a second backend or a fake needs no reconciler changes.",
+      "notes": {
+        "hosted": "Reconcilers inject the trait. DockerWorkloadOps and a fake implement it.",
+        "deploy": "DockerCli is only reachable through DockerWorkloadOps."
+      },
+      "elements": [
+        {
+          "id": "dev",
+          "kind": "person",
+          "label": "Developer",
+          "description": "Runs cell commands"
+        },
+        {
+          "id": "platform",
+          "kind": "system",
+          "label": "Cell platform",
+          "description": "Runs developer cells locally and hosted"
+        },
+        {
+          "id": "local",
+          "kind": "container",
+          "parent": "platform",
+          "label": "Local CLI",
+          "technology": "Rust",
+          "files": ["src/cli", "src/config"]
+        },
+        {
+          "id": "hosted",
+          "kind": "container",
+          "parent": "platform",
+          "label": "Hosted reconciliation",
+          "technology": "Rust",
+          "files": ["src/hosted"]
+        },
+        {
+          "id": "deploy",
+          "kind": "container",
+          "parent": "platform",
+          "label": "Deployment",
+          "technology": "Compose",
+          "files": ["deploy"]
+        },
+        {
+          "id": "celllife",
+          "kind": "container",
+          "parent": "hosted",
+          "label": "Cell lifecycle"
+        },
+        {
+          "id": "projlife",
+          "kind": "container",
+          "parent": "hosted",
+          "label": "Project lifecycle"
+        },
+        {
+          "id": "cli",
+          "kind": "component",
+          "parent": "local",
+          "label": "CellCommand",
+          "description": "CLI entrypoint for cell operations",
+          "technology": "Rust",
+          "files": ["src/cli/cell_command.rs"]
+        },
+        {
+          "id": "config",
+          "kind": "component",
+          "parent": "local",
+          "label": "ConfigLoader",
+          "description": "Reads cell and project config",
+          "technology": "TOML",
+          "files": ["src/config/loader.rs"]
+        },
+        {
+          "id": "cell",
+          "kind": "component",
+          "parent": "celllife",
+          "label": "LocalCellReconciliation",
+          "description": "Hosted Compose lifecycle",
+          "files": ["src/hosted/cell/reconciliation.rs"]
+        },
+        {
+          "id": "loop",
+          "kind": "component",
+          "parent": "celllife",
+          "label": "ReconcileLoop",
+          "description": "Observe, then act",
+          "files": ["src/hosted/cell/reconcile_loop.rs"]
+        },
+        {
+          "id": "project",
+          "kind": "component",
+          "parent": "projlife",
+          "label": "ProjectReconciliation",
+          "description": "Per-project lifecycle",
+          "files": ["src/hosted/project/reconciliation.rs"]
+        },
+        {
+          "id": "state",
+          "kind": "store",
+          "parent": "hosted",
+          "label": "CellState",
+          "description": "Observed cell status",
+          "technology": "SQLite"
+        },
+        {
+          "id": "docker",
+          "kind": "component",
+          "parent": "deploy",
+          "label": "DockerCli",
+          "description": "Single process runner",
+          "files": ["deploy/docker.rs"]
+        },
+        {
+          "id": "stack",
+          "kind": "component",
+          "parent": "deploy",
+          "label": "ComposeStack",
+          "description": "docker-compose.yml on the host",
+          "files": ["deploy/compose.rs"]
+        },
+        {
+          "id": "ops",
+          "kind": "container",
+          "parent": "hosted",
+          "label": "Workload operations",
+          "technology": "Rust",
+          "files": ["src/workload"]
+        },
+        {
+          "id": "workload",
+          "kind": "component",
+          "parent": "ops",
+          "label": "DockerWorkloadOps",
+          "description": "Docker implementation of WorkloadOps",
+          "files": ["src/workload/ops.rs", "src/workload/docker.rs"]
+        },
+        {
+          "id": "trait",
+          "kind": "component",
+          "parent": "ops",
+          "label": "WorkloadOps",
+          "description": "Trait: compose, run, stop",
+          "technology": "Rust trait",
+          "files": ["src/workload/traits.rs"]
+        },
+        {
+          "id": "fake",
+          "kind": "component",
+          "parent": "ops",
+          "label": "FakeWorkloadOps",
+          "description": "In-memory test double",
+          "files": ["src/workload/fake.rs"]
+        }
+      ],
+      "relationships": [
+        {
+          "from": "dev",
+          "to": "local",
+          "kind": "calls",
+          "label": "uses"
+        },
+        {
+          "from": "cli",
+          "to": "config",
+          "kind": "calls"
+        },
+        {
+          "from": "cli",
+          "to": "cell",
+          "kind": "calls"
+        },
+        {
+          "from": "cell",
+          "to": "loop",
+          "kind": "calls"
+        },
+        {
+          "from": "project",
+          "to": "loop",
+          "kind": "calls"
+        },
+        {
+          "from": "loop",
+          "to": "state",
+          "kind": "calls",
+          "label": "reads and writes",
+          "technology": "rusqlite"
+        },
+        {
+          "from": "workload",
+          "to": "docker",
+          "kind": "calls"
+        },
+        {
+          "from": "workload",
+          "to": "stack",
+          "kind": "calls"
+        },
+        {
+          "from": "cell",
+          "to": "trait",
+          "kind": "injects"
+        },
+        {
+          "from": "project",
+          "to": "trait",
+          "kind": "injects"
+        },
+        {
+          "from": "workload",
+          "to": "trait",
+          "kind": "implements"
+        },
+        {
+          "from": "fake",
+          "to": "trait",
+          "kind": "implements"
+        }
+      ]
+    },
+    {
+      "id": "351",
+      "title": "Local backend and project-owned stack",
+      "status": "draft",
+      "base": "9b1c07e7aa",
+      "head": "c3d5e8f102",
+      "pr": 351,
+      "summary": "Adds a local WorkloadOps backed by podman and moves the compose stack under the project lifecycle.",
+      "takeaway": "The same trait now serves local and hosted, so workload operations moved out of Hosted reconciliation; ComposeStack changed parent because the project, not the deployment, owns it.",
+      "notes": {
+        "local": "The CLI picks a backend; flag parsing replaces the config loader.",
+        "deploy": "ComposeStack left this container."
+      },
+      "elements": [
+        {
+          "id": "dev",
+          "kind": "person",
+          "label": "Developer",
+          "description": "Runs cell commands"
+        },
+        {
+          "id": "platform",
+          "kind": "system",
+          "label": "Cell platform",
+          "description": "Runs developer cells locally and hosted"
+        },
+        {
+          "id": "local",
+          "kind": "container",
+          "parent": "platform",
+          "label": "Local CLI",
+          "technology": "Rust",
+          "files": ["src/cli", "src/config"]
+        },
+        {
+          "id": "hosted",
+          "kind": "container",
+          "parent": "platform",
+          "label": "Hosted reconciliation",
+          "technology": "Rust",
+          "files": ["src/hosted"]
+        },
+        {
+          "id": "deploy",
+          "kind": "container",
+          "parent": "platform",
+          "label": "Deployment",
+          "technology": "Compose",
+          "files": ["deploy"]
+        },
+        {
+          "id": "celllife",
+          "kind": "container",
+          "parent": "hosted",
+          "label": "Cell lifecycle"
+        },
+        {
+          "id": "projlife",
+          "kind": "container",
+          "parent": "hosted",
+          "label": "Project lifecycle"
+        },
+        {
+          "id": "cli",
+          "kind": "component",
+          "parent": "local",
+          "label": "CellCommand",
+          "description": "CLI entrypoint; picks local or hosted backend",
+          "technology": "Rust, clap",
+          "files": ["src/cli/cell_command.rs"]
+        },
+        {
+          "id": "cell",
+          "kind": "component",
+          "parent": "celllife",
+          "label": "LocalCellReconciliation",
+          "description": "Hosted Compose lifecycle",
+          "files": ["src/hosted/cell/reconciliation.rs"]
+        },
+        {
+          "id": "loop",
+          "kind": "component",
+          "parent": "celllife",
+          "label": "ReconcileLoop",
+          "description": "Observe, then act",
+          "files": ["src/hosted/cell/reconcile_loop.rs"]
+        },
+        {
+          "id": "project",
+          "kind": "component",
+          "parent": "projlife",
+          "label": "ProjectReconciliation",
+          "description": "Per-project lifecycle",
+          "files": ["src/hosted/project/reconciliation.rs"]
+        },
+        {
+          "id": "state",
+          "kind": "store",
+          "parent": "hosted",
+          "label": "CellState",
+          "description": "Observed cell status",
+          "technology": "SQLite"
+        },
+        {
+          "id": "docker",
+          "kind": "component",
+          "parent": "deploy",
+          "label": "DockerCli",
+          "description": "Single process runner",
+          "files": ["deploy/docker.rs"]
+        },
+        {
+          "id": "stack",
+          "kind": "component",
+          "parent": "projlife",
+          "label": "ComposeStack",
+          "description": "docker-compose.yml, owned by the project",
+          "files": ["deploy/compose.rs"]
+        },
+        {
+          "id": "ops",
+          "kind": "container",
+          "parent": "platform",
+          "label": "Workload operations",
+          "technology": "Rust",
+          "files": ["src/workload"]
+        },
+        {
+          "id": "workload",
+          "kind": "component",
+          "parent": "ops",
+          "label": "DockerWorkloadOps",
+          "description": "Docker implementation of WorkloadOps",
+          "files": ["src/workload/docker.rs"]
+        },
+        {
+          "id": "trait",
+          "kind": "component",
+          "parent": "ops",
+          "label": "WorkloadOps",
+          "description": "Trait: compose, run, stop",
+          "technology": "Rust trait",
+          "files": ["src/workload/traits.rs"]
+        },
+        {
+          "id": "fake",
+          "kind": "component",
+          "parent": "ops",
+          "label": "FakeWorkloadOps",
+          "description": "In-memory test double",
+          "files": ["src/workload/fake.rs"]
+        },
+        {
+          "id": "localops",
+          "kind": "component",
+          "parent": "local",
+          "label": "LocalWorkloadOps",
+          "description": "Runs workloads on the developer machine",
+          "files": ["src/workload/local.rs"]
+        },
+        {
+          "id": "podman",
+          "kind": "component",
+          "parent": "deploy",
+          "label": "PodmanCli",
+          "description": "Shells out to podman",
+          "files": ["deploy/podman.rs"]
+        },
+        {
+          "id": "flags",
+          "kind": "component",
+          "parent": "local",
+          "label": "FlagParser",
+          "description": "Parses cell command flags",
+          "technology": "clap",
+          "files": ["src/cli/flags.rs"]
+        }
+      ],
+      "relationships": [
+        {
+          "from": "dev",
+          "to": "local",
+          "kind": "calls",
+          "label": "uses"
+        },
+        {
+          "from": "cli",
+          "to": "cell",
+          "kind": "calls"
+        },
+        {
+          "from": "cell",
+          "to": "loop",
+          "kind": "calls"
+        },
+        {
+          "from": "project",
+          "to": "loop",
+          "kind": "calls"
+        },
+        {
+          "from": "loop",
+          "to": "state",
+          "kind": "calls",
+          "label": "reads and writes",
+          "technology": "rusqlite"
+        },
+        {
+          "from": "workload",
+          "to": "docker",
+          "kind": "calls"
+        },
+        {
+          "from": "workload",
+          "to": "stack",
+          "kind": "calls"
+        },
+        {
+          "from": "cell",
+          "to": "trait",
+          "kind": "injects"
+        },
+        {
+          "from": "project",
+          "to": "trait",
+          "kind": "injects"
+        },
+        {
+          "from": "workload",
+          "to": "trait",
+          "kind": "implements"
+        },
+        {
+          "from": "fake",
+          "to": "trait",
+          "kind": "implements"
+        },
+        {
+          "from": "ops",
+          "to": "deploy",
+          "kind": "calls",
+          "label": "runs on"
+        },
+        {
+          "from": "cli",
+          "to": "flags",
+          "kind": "calls"
+        },
+        {
+          "from": "cli",
+          "to": "localops",
+          "kind": "injects",
+          "label": "selects backend",
+          "technology": "runtime flag"
+        },
+        {
+          "from": "localops",
+          "to": "trait",
+          "kind": "implements"
+        },
+        {
+          "from": "localops",
+          "to": "podman",
+          "kind": "calls"
+        }
+      ]
+    }
+  ]
+}

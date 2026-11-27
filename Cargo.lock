@@ -17313,6 +17313,48 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "strata-core"
+version = "0.1.0"
+source = "git+https://github.com/xenoop/strata?rev=d044a8209218418173fbd52eca07723eb7ce8a82#d044a8209218418173fbd52eca07723eb7ce8a82"
+dependencies = [
+ "anyhow",
+ "dugong",
+ "serde_json",
+ "strata-spec",
+]
+
+[[package]]
+name = "strata-spec"
+version = "0.1.0"
+source = "git+https://github.com/xenoop/strata?rev=d044a8209218418173fbd52eca07723eb7ce8a82#d044a8209218418173fbd52eca07723eb7ce8a82"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "strata_view"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "language",
+ "log",
+ "multi_buffer",
+ "project",
+ "serde_json",
+ "settings",
+ "strata-core",
+ "strata-spec",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22633,6 +22675,7 @@ dependencies = [
  "smol",
  "snippet_provider",
  "snippets_ui",
+ "strata_view",
  "svg_preview",
  "sysinfo 0.39.6",
  "system_specs",
