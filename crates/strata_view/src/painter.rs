@@ -4,38 +4,18 @@ use std::rc::Rc;
 
 use gpui::{
     BorderStyle, Bounds, BoxShadow, Corners, Font, FontWeight, Hsla, PathBuilder, Pixels,
-    SharedString, TextAlign, TextRun, Window, WindowTextSystem, WrappedLine, px, rgb, size,
+    SharedString, TextAlign, TextRun, Window, WindowTextSystem, WrappedLine, px, size,
 };
 use strata_core::easing::CubicBezier;
 use strata_core::layout::{self, EstimatedText, Rect, TextMeasure, TextRole};
 use strata_core::timeline::partial_path;
 use strata_spec::{Element, ElementKind, Step};
 
-use crate::diagram_theme as theme;
-use crate::scene::{BoundaryItem, EdgeItem, LabelItem, Look, Mark, NodeItem, NodeText, Scene};
+use crate::diagram_theme::{self as theme, DiagramColors};
+use crate::scene::{BoundaryItem, EdgeItem, LabelItem, Look, NodeItem, NodeText, Scene};
 
 pub const MIN_SCALE: f32 = 0.05;
 pub const MAX_SCALE: f32 = 4.0;
-
-/// The mark colors come from the Zed theme (`created`, `modified`, `deleted`
-/// status colors), so the diagram follows the user's theme where it marks changes.
-#[derive(Clone, Copy)]
-pub struct MarkColors {
-    pub created: Hsla,
-    pub modified: Hsla,
-    pub deleted: Hsla,
-    pub selection_ring: Hsla,
-}
-
-impl MarkColors {
-    fn of(&self, mark: Mark) -> Hsla {
-        match mark {
-            Mark::Added => self.created,
-            Mark::Changed => self.modified,
-            Mark::Removed => self.deleted,
-        }
-    }
-}
 
 pub fn font_with_weight(font: &Font, weight: f32) -> Font {
     Font {
@@ -186,22 +166,9 @@ impl TextCache {
     }
 }
 
-fn color(hex: u32) -> Hsla {
-    rgb(hex).into()
-}
-
 /// Mark rings scale with zoom but never get thinner than a couple of pixels.
 fn mark_width(scale: f32) -> f32 {
     (theme::MARK_WIDTH * scale).max(theme::MARK_MIN_SCREEN_WIDTH)
-}
-
-fn mix(first: u32, second: u32, weight_of_first: f32) -> u32 {
-    let channel = |shift: u32| {
-        let a = ((first >> shift) & 0xff) as f32;
-        let b = ((second >> shift) & 0xff) as f32;
-        (a * weight_of_first + b * (1.0 - weight_of_first)).round() as u32
-    };
-    (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
 
 /// Maps layout coordinates to window pixels.
@@ -240,7 +207,7 @@ struct Painter<'a> {
     transform: Transform,
     viewport: Bounds<Pixels>,
     cache: &'a mut TextCache,
-    marks: MarkColors,
+    colors: DiagramColors,
     /// Opacity of the item being painted.
     alpha: f32,
     /// Saturation multiplier of the item being painted (focus grays out).
@@ -252,10 +219,6 @@ struct Painter<'a> {
 
 impl Painter<'_> {
     /// A theme color faded and grayed for the current item.
-    fn tint(&self, hex: u32) -> Hsla {
-        self.tint_color(color(hex))
-    }
-
     fn tint_color(&self, source: Hsla) -> Hsla {
         let mut tinted = source.opacity(self.alpha);
         tinted.s *= self.saturation;
@@ -313,9 +276,8 @@ impl Painter<'_> {
         }
         let scale = self.scale();
         let bounds = self.transform.bounds(&item.rect);
-        let depth = (item.depth.clamp(1, 5) - 1) as usize;
-        let (fill, stroke) = theme::COMPOUND_COLORS[depth];
-        let mark = item.look.mark.map(|mark| self.marks.of(mark));
+        let fill = self.colors.boundary_fill;
+        let mark = item.look.mark.map(|mark| self.colors.mark(mark));
         let (fill, border, border_width, border_style) = match (mark, item.look.ghost) {
             (Some(mark), true) => (
                 self.tint_color(mark).opacity(theme::GHOST_FILL_OPACITY),
@@ -324,14 +286,14 @@ impl Painter<'_> {
                 BorderStyle::Dashed,
             ),
             (Some(mark), false) => (
-                self.tint(fill).opacity(theme::COMPOUND_OPACITY),
+                self.tint_color(fill),
                 self.tint_color(mark),
                 mark_width(scale),
                 BorderStyle::Solid,
             ),
             (None, _) => (
-                self.tint(fill).opacity(theme::COMPOUND_OPACITY),
-                self.tint(stroke).opacity(theme::COMPOUND_BORDER_OPACITY),
+                self.tint_color(fill),
+                self.tint_color(self.colors.boundary_border),
                 theme::COMPOUND_BORDER_WIDTH * scale,
                 BorderStyle::Dashed,
             ),
@@ -349,7 +311,7 @@ impl Painter<'_> {
             theme::COMPOUND_TITLE_TOP + (theme::COMPOUND_TITLE_MIN_HEIGHT - size_px) / 2.0;
         let title_color = match (mark, item.look.ghost) {
             (Some(mark), true) => mark,
-            _ => color(theme::COMPOUND_TITLE_COLOR),
+            _ => self.colors.boundary_title,
         };
         let (alpha, saturation) = (self.alpha, self.saturation);
         let mut titles = Vec::with_capacity(2);
@@ -399,8 +361,8 @@ impl Painter<'_> {
             None => theme::EDGE_WIDTH,
         } * scale);
         let edge_color = match item.look.mark {
-            Some(mark) => self.tint_color(self.marks.of(mark)),
-            None => self.tint(theme::EDGE_COLOR),
+            Some(mark) => self.tint_color(self.colors.mark(mark)),
+            None => self.tint_color(self.colors.edge),
         };
         let mut builder = PathBuilder::stroke(width);
         if let Some(flow) = self.flow {
@@ -493,8 +455,7 @@ impl Painter<'_> {
         window.paint_quad(gpui::quad(
             bounds,
             Corners::all(px(theme::EDGE_LABEL_RADIUS * scale)),
-            self.tint(theme::EDGE_LABEL_BG)
-                .opacity(theme::EDGE_LABEL_BG_OPACITY),
+            self.tint_color(self.colors.label_background),
             0.0,
             gpui::transparent_black(),
             BorderStyle::default(),
@@ -505,7 +466,7 @@ impl Painter<'_> {
         let x = f32::from(bounds.origin.x) + metrics * scale;
         if let Some(text) = &item.text {
             let role = TextRole::EdgeLabel;
-            let tint = self.tint(theme::EDGE_LABEL_TEXT);
+            let tint = self.tint_color(self.colors.label_text);
             if let Some(block) = self.shape_colored(text, role, inner_width, tint, window) {
                 Self::paint_block(
                     &block,
@@ -524,7 +485,7 @@ impl Painter<'_> {
         if let Some(technology) = &item.technology {
             let role = TextRole::EdgeTechnology;
             let tint = self
-                .tint(theme::EDGE_LABEL_TEXT)
+                .tint_color(self.colors.label_text)
                 .opacity(theme::EDGE_LABEL_TECHNOLOGY_OPACITY);
             if let Some(block) = self.shape_colored(technology, role, inner_width, tint, window) {
                 Self::paint_block(
@@ -568,9 +529,8 @@ impl Painter<'_> {
         }
         let scale = self.scale();
         let bounds = self.transform.bounds(&item.rect);
-        let palette = theme::palette_for(item.kind);
         let radii = Corners::all(px(theme::NODE_RADIUS * scale));
-        let mark = item.look.mark.map(|mark| self.marks.of(mark));
+        let mark = item.look.mark.map(|mark| self.colors.mark(mark));
         if let (Some(mark), true) = (mark, item.look.ghost) {
             window.paint_quad(gpui::quad(
                 bounds,
@@ -585,8 +545,14 @@ impl Painter<'_> {
         }
         let shadows: Vec<BoxShadow> = theme::NODE_SHADOWS
             .iter()
-            .map(|(offset_y, blur, shadow_color, alpha)| BoxShadow {
-                color: self.tint(*shadow_color).opacity(*alpha),
+            .map(|(offset_y, blur, alpha, accent)| BoxShadow {
+                color: self
+                    .tint_color(if *accent {
+                        self.colors.accent
+                    } else {
+                        self.colors.shadow
+                    })
+                    .opacity(*alpha),
                 offset: gpui::point(px(0.0), px(offset_y * scale)),
                 blur_radius: px(blur * scale),
                 spread_radius: px(0.0),
@@ -596,26 +562,26 @@ impl Painter<'_> {
         window.paint_drop_shadows(bounds, radii, &shadows);
 
         match item.kind {
-            ElementKind::Store => self.paint_cylinder(&item.rect, palette, window),
+            ElementKind::Store => self.paint_cylinder(&item.rect, window),
             ElementKind::Person => {
                 window.paint_quad(gpui::quad(
                     bounds,
                     radii,
-                    self.tint(palette.fill),
-                    0.0,
-                    gpui::transparent_black(),
-                    BorderStyle::default(),
+                    self.tint_color(self.colors.node_fill),
+                    px(theme::NODE_BORDER_WIDTH),
+                    self.tint_color(self.colors.node_border),
+                    BorderStyle::Solid,
                 ));
-                self.paint_person_icon(&item.rect, palette, window);
+                self.paint_person_icon(&item.rect, window);
             }
             ElementKind::System | ElementKind::Container | ElementKind::Component => {
                 window.paint_quad(gpui::quad(
                     bounds,
                     radii,
-                    self.tint(palette.fill),
-                    0.0,
-                    gpui::transparent_black(),
-                    BorderStyle::default(),
+                    self.tint_color(self.colors.node_fill),
+                    px(theme::NODE_BORDER_WIDTH),
+                    self.tint_color(self.colors.node_border),
+                    BorderStyle::Solid,
                 ));
             }
         }
@@ -677,16 +643,15 @@ impl Painter<'_> {
         cx: &mut gpui::App,
     ) {
         use layout::metrics::*;
-        let palette = theme::palette_for(item.kind);
         let scale = self.scale();
         let (top, right, bottom, left) = layout::node_paddings(item.kind);
         let text_width = item.rect.w - left - right;
         let title_tint = ghost_color.map_or_else(
-            || self.tint(palette.hi_contrast),
+            || self.tint_color(self.colors.node_title),
             |ghost| self.tint_color(ghost),
         );
         let secondary = ghost_color.map_or_else(
-            || self.tint(palette.lo_contrast),
+            || self.tint_color(self.colors.node_secondary),
             |ghost| self.tint_color(ghost),
         );
         let technology_tint = secondary.opacity(theme::TECHNOLOGY_OPACITY);
@@ -775,12 +740,12 @@ impl Painter<'_> {
             Corners::all(px(theme::NODE_RADIUS * scale + gap)),
             gpui::transparent_black(),
             px(theme::SELECTION_WIDTH),
-            self.tint_color(self.marks.selection_ring),
+            self.tint_color(self.colors.selection_ring),
             BorderStyle::Solid,
         ));
     }
 
-    fn paint_person_icon(&mut self, rect: &Rect, palette: &theme::Palette, window: &mut Window) {
+    fn paint_person_icon(&mut self, rect: &Rect, window: &mut Window) {
         let origin = layout::Point {
             x: rect.x + rect.w - theme::PERSON_ICON_WIDTH - theme::PERSON_ICON_RIGHT_MARGIN,
             y: rect.y + rect.h - theme::PERSON_ICON_HEIGHT,
@@ -816,14 +781,14 @@ impl Painter<'_> {
             );
         }
         builder.close();
-        let tint = self.tint(mix(palette.stroke, palette.fill, theme::SHAPE_MIX_STROKE));
+        let tint = self.tint_color(self.colors.node_detail);
         match builder.build() {
             Ok(path) => window.paint_path(path, tint),
             Err(error) => log::error!("strata: could not tessellate person icon: {error}"),
         }
     }
 
-    fn paint_cylinder(&mut self, rect: &Rect, palette: &theme::Palette, window: &mut Window) {
+    fn paint_cylinder(&mut self, rect: &Rect, window: &mut Window) {
         let scale = self.scale();
         let radius_x = (rect.w / 2.0).round();
         let radius_y = (theme::CYLINDER_TILT * radius_x).round();
@@ -852,13 +817,13 @@ impl Painter<'_> {
         let mut fill = PathBuilder::fill();
         build_body(&mut fill);
         match fill.build() {
-            Ok(path) => window.paint_path(path, self.tint(palette.fill)),
+            Ok(path) => window.paint_path(path, self.tint_color(self.colors.node_fill)),
             Err(error) => log::error!("strata: could not tessellate cylinder: {error}"),
         }
         let mut outline = PathBuilder::stroke(px(theme::CYLINDER_STROKE_WIDTH * scale));
         build_body(&mut outline);
         match outline.build() {
-            Ok(path) => window.paint_path(path, self.tint(palette.stroke)),
+            Ok(path) => window.paint_path(path, self.tint_color(self.colors.node_border)),
             Err(error) => log::error!("strata: could not tessellate cylinder outline: {error}"),
         }
 
@@ -883,7 +848,7 @@ impl Painter<'_> {
         };
         let mut cap = PathBuilder::fill();
         build_cap(&mut cap);
-        let tint = self.tint(mix(palette.stroke, palette.fill, theme::SHAPE_MIX_STROKE));
+        let tint = self.tint_color(self.colors.node_detail);
         match cap.build() {
             Ok(path) => window.paint_path(path, tint),
             Err(error) => log::error!("strata: could not tessellate cylinder cap: {error}"),
@@ -891,7 +856,7 @@ impl Painter<'_> {
         let mut cap_outline = PathBuilder::stroke(px(theme::CYLINDER_STROKE_WIDTH * scale));
         build_cap(&mut cap_outline);
         match cap_outline.build() {
-            Ok(path) => window.paint_path(path, self.tint(palette.stroke)),
+            Ok(path) => window.paint_path(path, self.tint_color(self.colors.node_border)),
             Err(error) => log::error!("strata: could not tessellate cylinder cap outline: {error}"),
         }
     }
@@ -977,7 +942,7 @@ pub fn paint_scene(
     bounds: Bounds<Pixels>,
     cache: &Rc<RefCell<TextCache>>,
     font: &Font,
-    marks: MarkColors,
+    colors: DiagramColors,
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
@@ -991,7 +956,7 @@ pub fn paint_scene(
         },
         viewport: bounds,
         cache: &mut cache,
-        marks,
+        colors,
         alpha: 1.0,
         saturation: 1.0,
         flow: None,

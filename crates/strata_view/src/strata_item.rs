@@ -9,7 +9,7 @@ use gpui::{
     AnyElement, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Font,
     IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
     Render, ScrollEvent, SharedString, Styled, Subscription, Task, WeakEntity, Window, canvas, div,
-    point, prelude::*, px, rgb, size,
+    point, prelude::*, px, size,
 };
 use language::{Buffer, BufferEvent};
 use multi_buffer::MultiBuffer;
@@ -25,10 +25,10 @@ use util::ResultExt;
 use workspace::item::{Item, ItemEvent};
 use workspace::{Pane, Workspace};
 
-use crate::diagram_theme;
+use crate::diagram_theme::{self, DiagramColors};
 use crate::painter::{
-    FOCUS_EASING, Focus, Highlight, MAX_SCALE, MIN_SCALE, MarkColors, TextCache, ViewState,
-    WindowText, has_ancestor, paint_scene,
+    FOCUS_EASING, Focus, Highlight, MAX_SCALE, MIN_SCALE, TextCache, ViewState, WindowText,
+    has_ancestor, paint_scene,
 };
 use crate::scene::{NodeItem, Phase, Scene};
 use crate::{
@@ -788,16 +788,6 @@ impl StrataView {
         cx.notify();
     }
 
-    fn mark_colors(cx: &App) -> MarkColors {
-        let status = cx.theme().status();
-        MarkColors {
-            created: status.created,
-            modified: status.modified,
-            deleted: status.deleted,
-            selection_ring: cx.theme().colors().border_focused,
-        }
-    }
-
     fn render_canvas(
         &mut self,
         viewport: gpui::Size<Pixels>,
@@ -822,7 +812,7 @@ impl StrataView {
                     window.request_animation_frame();
                 }
                 let cache = self.text_cache.clone();
-                let marks = Self::mark_colors(cx);
+                let colors = DiagramColors::from_theme(cx);
                 canvas(
                     |_, _, _| {},
                     move |bounds: Bounds<Pixels>, _, window, cx| {
@@ -837,7 +827,7 @@ impl StrataView {
                                 bounds,
                                 &cache,
                                 &font,
-                                marks,
+                                colors,
                                 window,
                                 cx,
                             );
@@ -1304,7 +1294,7 @@ impl Render for StrataView {
             .flex_1()
             .w_full()
             .overflow_hidden()
-            .bg(rgb(diagram_theme::CANVAS))
+            .bg(cx.theme().colors().editor_background)
             .child(
                 canvas(
                     move |bounds, _, _| bounds_cell.set(Some(bounds)),
