@@ -2,11 +2,13 @@ mod diagram_theme;
 mod painter;
 mod scene;
 mod strata_item;
+mod strata_panel;
 
 use gpui::{App, actions};
 use workspace::Workspace;
 
 pub use strata_item::{RELOAD_DEBOUNCE, SPEEDS, StrataView, StrataViewEvent};
+pub use strata_panel::StrataPanel;
 
 actions!(
     strata,
@@ -17,6 +19,8 @@ actions!(
         OpenPreviewToTheSide,
         /// Prompts for a stack spec file, opens it in the project and previews it.
         OpenStack,
+        /// Toggles focus on the stack panel.
+        ToggleFocus,
         /// Plays the previous step of the stack.
         PreviousStep,
         /// Plays the next step of the stack.
@@ -46,6 +50,7 @@ pub fn init(cx: &mut App) {
             return;
         };
         StrataView::register(workspace, window, cx);
+        StrataPanel::register(workspace, window, cx);
     })
     .detach();
 }
