@@ -15,6 +15,7 @@ use crate::scene::Phase;
 use crate::strata_item::{SPEEDS, StrataView};
 
 const SCRUBBER_WIDTH: f32 = 160.0;
+const SCRUBBER_MIN_WIDTH: f32 = 48.0;
 
 /// The bar above a stack view: breadcrumbs and links on the left, playback
 /// and the before/after toggle on the right.
@@ -171,9 +172,11 @@ impl Render for StrataToolbar {
                 move |_, _, cx| view.update(cx, |view, _| view.end_scrub())
             })
             .child(
-                Label::new(stack_name)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
+                div().min_w_0().truncate().child(
+                    Label::new(stack_name)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
             )
             .child(separator())
             .child(
@@ -223,6 +226,7 @@ impl Render for StrataToolbar {
                     .id("strata-scrubber")
                     .relative()
                     .w(px(SCRUBBER_WIDTH))
+                    .min_w(px(SCRUBBER_MIN_WIDTH))
                     .h(px(20.))
                     .cursor_pointer()
                     .child(
@@ -283,32 +287,34 @@ impl Render for StrataToolbar {
                     }),
             )
             .child(
-                ToggleButtonGroup::single_row(
-                    "strata-phase",
-                    [
-                        ToggleButtonSimple::new("Before", {
-                            let view = view_entity.clone();
-                            move |_, _, cx| {
-                                if has_before {
+                div().flex_none().child(
+                    ToggleButtonGroup::single_row(
+                        "strata-phase",
+                        [
+                            ToggleButtonSimple::new("Before", {
+                                let view = view_entity.clone();
+                                move |_, _, cx| {
+                                    if has_before {
+                                        view.update(cx, |view, cx| {
+                                            view.go_to(view.step_index(), Phase::Before, cx)
+                                        });
+                                    }
+                                }
+                            }),
+                            ToggleButtonSimple::new("After", {
+                                let view = view_entity.clone();
+                                move |_, _, cx| {
                                     view.update(cx, |view, cx| {
-                                        view.go_to(view.step_index(), Phase::Before, cx)
+                                        view.go_to(view.step_index(), Phase::After, cx)
                                     });
                                 }
-                            }
-                        }),
-                        ToggleButtonSimple::new("After", {
-                            let view = view_entity.clone();
-                            move |_, _, cx| {
-                                view.update(cx, |view, cx| {
-                                    view.go_to(view.step_index(), Phase::After, cx)
-                                });
-                            }
-                        }),
-                    ],
-                )
-                .style(ToggleButtonGroupStyle::Outlined)
-                .auto_width()
-                .selected_index(selected_phase),
+                            }),
+                        ],
+                    )
+                    .style(ToggleButtonGroupStyle::Outlined)
+                    .auto_width()
+                    .selected_index(selected_phase),
+                ),
             )
             .into_any_element()
     }

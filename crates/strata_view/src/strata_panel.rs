@@ -53,10 +53,15 @@ impl StrataPanel {
             Some(entity) => cx.subscribe_in(
                 &entity,
                 window,
-                |this, _workspace, event: &workspace::Event, _window, cx| {
-                    if matches!(event, workspace::Event::ActiveItemChanged) {
-                        this.follow_active_item(cx);
+                |this, _workspace, event: &workspace::Event, _window, cx| match event {
+                    workspace::Event::ActiveItemChanged => this.follow_active_item(cx),
+                    // A preview opened to the side does not always become the
+                    // active item, so a newly added stack is shown as well.
+                    workspace::Event::ItemAdded { item } => {
+                        this.show_view(item.downcast::<StrataView>(), cx)
                     }
+                    workspace::Event::ItemRemoved { .. } => this.show_any_open_stack(cx),
+                    _ => {}
                 },
             ),
             None => cx.observe_self(|_, _| {}),
@@ -69,7 +74,12 @@ impl StrataPanel {
             view_subscription: None,
             _workspace_subscription: workspace_subscription,
         };
-        this.follow_active_item(cx);
+        // The workspace is mid-update while it builds its panels, so the
+        // active item comes from the reference rather than the entity.
+        let active_view = workspace
+            .active_item(cx)
+            .and_then(|item| item.downcast::<StrataView>());
+        this.show_view(active_view, cx);
         this
     }
 
@@ -83,11 +93,26 @@ impl StrataPanel {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        let Some(view) = workspace
+        let active_view = workspace
             .read(cx)
             .active_item(cx)
-            .and_then(|item| item.downcast::<StrataView>())
-        else {
+            .and_then(|item| item.downcast::<StrataView>());
+        self.show_view(active_view, cx);
+    }
+
+    fn show_any_open_stack(&mut self, cx: &mut Context<Self>) {
+        if self.view().is_some() {
+            return;
+        }
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let open_view = workspace.read(cx).items_of_type::<StrataView>(cx).next();
+        self.show_view(open_view, cx);
+    }
+
+    fn show_view(&mut self, view: Option<Entity<StrataView>>, cx: &mut Context<Self>) {
+        let Some(view) = view else {
             return;
         };
         if self.view().as_ref() == Some(&view) {
