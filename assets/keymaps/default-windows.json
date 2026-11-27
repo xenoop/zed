@@ -1449,6 +1449,21 @@
     },
   },
   {
+    "context": "StrataView",
+    "bindings": {
+      "left": "strata::PreviousStep",
+      "right": "strata::NextStep",
+      "space": "strata::TogglePlayback",
+      "shift-left": "strata::ScrubBackward",
+      "shift-right": "strata::ScrubForward",
+      "[": "strata::SlowDown",
+      "]": "strata::SpeedUp",
+      "b": "strata::ShowBefore",
+      "a": "strata::ShowAfter",
+      "escape": "strata::CloseDetails",
+    },
+  },
+  {
     "context": "MarkdownPreview",
     "use_key_equivalents": true,
     "bindings": {
