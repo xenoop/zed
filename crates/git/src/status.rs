@@ -510,6 +510,11 @@ pub enum DiffTreeType {
         base: SharedString,
         head: SharedString,
     },
+    /// The working tree (including untracked files) against exactly `base`,
+    /// without taking a merge base: changes since a snapshot commit.
+    SinceWithWorktree {
+        base: SharedString,
+    },
 }
 
 #[derive(Debug, PartialEq)]

@@ -64,6 +64,15 @@ pub struct DiffMultibuffer {
 }
 
 impl DiffMultibuffer {
+    pub(crate) fn set_empty_label(
+        &mut self,
+        label: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.empty_label = label.into();
+        cx.notify();
+    }
+
     pub(crate) fn new(
         branch_diff: Entity<diff_buffer_list::DiffBufferList>,
         multibuffer_capability: Capability,

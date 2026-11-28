@@ -230,6 +230,8 @@
   {
     "context": "vim_mode == normal",
     "bindings": {
+      // Review comment on the current line.
+      "g m": "editor::CommentOnSelection",
       "i": "vim::InsertBefore",
       "a": "vim::InsertAfter",
       "ctrl-[": "editor::Cancel",
@@ -277,6 +279,8 @@
   {
     "context": "vim_mode == visual",
     "bindings": {
+      // Review comment on the selected lines.
+      "g m": "editor::CommentOnSelection",
       ":": "vim::VisualCommand",
       "u": "vim::ConvertToLowerCase",
       "shift-u": "vim::ConvertToUpperCase",

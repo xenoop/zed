@@ -800,7 +800,7 @@ impl Vim {
     ) {
         self.record_current_action(cx);
         self.update_editor(cx, |vim, editor, cx| {
-            if editor.read_only(cx) {
+            if editor.blocks_user_edits(cx) {
                 return;
             }
             let selected_register = vim.selected_register.take();

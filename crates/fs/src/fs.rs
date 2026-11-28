@@ -2550,6 +2550,14 @@ impl FakeFs {
         .unwrap();
     }
 
+    /// Makes the repository's `create_archive_checkpoint` never finish.
+    pub fn set_archive_checkpoint_hangs(&self, dot_git: &Path, hangs: bool) {
+        self.with_git_state(dot_git, false, |state| {
+            state.simulated_archive_checkpoint_hang = hangs;
+        })
+        .unwrap();
+    }
+
     pub fn set_graph_error(&self, dot_git: &Path, error: Option<String>) {
         self.with_git_state(dot_git, true, |state| {
             state.simulated_graph_error = error;

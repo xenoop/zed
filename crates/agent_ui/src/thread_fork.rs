@@ -1,0 +1,1919 @@
+//! Thread forks: a copy of a thread's working tree in its own git worktree,
+//! whose changes can later be merged back into the tree it was forked from.
+//!
+//! Git runs through the project's shell, so this works for remote projects
+//! too. Merging never moves the parent's `HEAD` or touches its index: both
+//! trees are captured as commits, merged with `git merge-tree`, and the
+//! result is applied to the parent's files as a patch.
+
+use anyhow::{Context as _, Result, anyhow};
+use collections::{HashMap, HashSet};
+use db::kvp::KeyValueStore;
+use gpui::{App, AsyncApp, Entity, Global};
+use project::Project;
+use serde::{Deserialize, Serialize};
+use util::ResultExt as _;
+
+/// The most forks of one working tree that may exist at a time. Each fork is
+/// a full checkout, so an unbounded number fills the disk and slows git.
+pub(crate) const MAX_LIVE_FORKS: usize = 8;
+
+const FORKS_KEY: &str = "agent_thread_forks";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ForkKind {
+    Fork,
+    Review,
+    Land,
+}
+
+/// A fork of a working tree, as remembered between sessions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ForkRecord {
+    /// Names the git refs that keep this fork's snapshot commits alive. Empty
+    /// for records made before those refs existed.
+    #[serde(default)]
+    pub id: String,
+    /// The fork's worktree directory.
+    pub fork_path: String,
+    /// The directory of the working tree it was forked from.
+    pub parent_path: String,
+    /// Commit capturing the parent's working tree when the fork was made.
+    pub base_sha: String,
+    /// Commit capturing the fork's working tree at the last merge into the
+    /// parent: later merges only carry what changed since.
+    pub merged_sha: Option<String>,
+    pub kind: ForkKind,
+    /// Title of the thread that was forked, for menus.
+    pub parent_title: Option<String>,
+    /// The verdict of a review fork, once submitted.
+    #[serde(default)]
+    pub verdict: Option<ReviewVerdict>,
+    /// The thread that was forked, so messages back reach it rather than
+    /// whichever thread its workspace shows.
+    #[serde(default)]
+    pub parent_thread_id: Option<crate::thread_metadata_store::ThreadId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ReviewVerdict {
+    Approved,
+    ChangesRequested,
+}
+
+impl ForkRecord {
+    fn normalized(mut self) -> Self {
+        self.fork_path = normalize_path(&self.fork_path);
+        self.parent_path = normalize_path(&self.parent_path);
+        self
+    }
+
+    /// The title of the fork's thread, for menus and messages. Without a
+    /// parent title, the last components of the fork's directory tell forks
+    /// apart.
+    pub fn display_name(&self) -> String {
+        let title = fork_thread_title(&self.kind, self.parent_title.as_deref());
+        if self.parent_title.is_some() {
+            return title;
+        }
+        let mut components = self
+            .fork_path
+            .rsplit(['/', '\\'])
+            .filter(|part| !part.is_empty());
+        let last = components.next().unwrap_or(&self.fork_path);
+        format!("{title} ({last})")
+    }
+}
+
+const LAND_PARENTS_KEY: &str = "agent_land_thread_parents";
+
+type ThreadId = crate::thread_metadata_store::ThreadId;
+
+/// For threads started to land another thread's changes: that thread. Held
+/// in memory once read, like the fork records.
+#[derive(Default)]
+struct LandParents(Vec<(ThreadId, ThreadId)>);
+
+impl gpui::Global for LandParents {}
+
+fn load_land_parents(cx: &App) -> Vec<(ThreadId, ThreadId)> {
+    if let Some(parents) = cx.try_global::<LandParents>() {
+        return parents.0.clone();
+    }
+    KeyValueStore::global(cx)
+        .read_kvp(LAND_PARENTS_KEY)
+        .log_err()
+        .flatten()
+        .and_then(|json| serde_json::from_str(&json).log_err())
+        .unwrap_or_default()
+}
+
+/// The thread whose changes `land_thread` was started to land.
+pub(crate) fn land_parent(land_thread: ThreadId, cx: &App) -> Option<ThreadId> {
+    load_land_parents(cx)
+        .into_iter()
+        .find(|(thread, _)| *thread == land_thread)
+        .map(|(_, parent)| parent)
+}
+
+pub(crate) fn set_land_parent(land_thread: ThreadId, parent: ThreadId, cx: &mut App) {
+    let mut parents = load_land_parents(cx);
+    parents.retain(|(thread, _)| *thread != land_thread);
+    parents.push((land_thread, parent));
+    cx.set_global(LandParents(parents.clone()));
+    let store = KeyValueStore::global(cx);
+    db::write_and_log(cx, move || async move {
+        store
+            .write_kvp(
+                LAND_PARENTS_KEY.to_string(),
+                serde_json::to_string(&parents)?,
+            )
+            .await
+    });
+}
+
+/// How a fork's working tree relates to the one it was forked from, for views
+/// that list threads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForkLink {
+    pub fork_path: std::path::PathBuf,
+    pub parent_path: std::path::PathBuf,
+    pub parent_thread_id: Option<crate::thread_metadata_store::ThreadId>,
+}
+
+impl ForkLink {
+    /// Whether any of `folder_paths` is this fork's directory, however the
+    /// path is spelled.
+    pub fn is_among(&self, folder_paths: &[std::path::PathBuf]) -> bool {
+        folder_paths
+            .iter()
+            .any(|path| normalize_fork_path(path) == self.fork_path)
+    }
+}
+
+/// Every known fork, with its parent.
+pub fn fork_links(cx: &App) -> Vec<ForkLink> {
+    load_records(cx)
+        .into_iter()
+        .map(|record| ForkLink {
+            fork_path: record.fork_path.into(),
+            parent_path: record.parent_path.into(),
+            parent_thread_id: record.parent_thread_id,
+        })
+        .collect()
+}
+
+/// What a thread list needs to know about one of its thread rows to place
+/// forks under their parents.
+pub struct ForkListRow {
+    pub thread_id: crate::thread_metadata_store::ThreadId,
+    /// The folders the thread works in.
+    pub folder_paths: Vec<std::path::PathBuf>,
+    /// Set when the thread works in a fork.
+    pub fork_parent: Option<ForkLink>,
+}
+
+/// Moves each row of a thread that works in a fork to just below the thread
+/// it was forked from: the recorded thread, or failing that the first
+/// listed thread of the parent working tree. A fork whose parent is not in
+/// the list stays where it is. `describe` returns `None` for rows that are
+/// not threads.
+pub fn nest_forks_under_parents<T>(
+    rows: Vec<T>,
+    describe: impl Fn(&T) -> Option<ForkListRow>,
+) -> Vec<T> {
+    struct Entry<T> {
+        row: T,
+        info: Option<ForkListRow>,
+        original_index: usize,
+    }
+
+    let mut entries: Vec<Entry<T>> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(original_index, row)| {
+            let info = describe(&row).map(|mut info| {
+                for path in &mut info.folder_paths {
+                    *path = normalize_fork_path(path);
+                }
+                info
+            });
+            Entry {
+                row,
+                info,
+                original_index,
+            }
+        })
+        .collect();
+    let forks: Vec<(crate::thread_metadata_store::ThreadId, ForkLink)> = entries
+        .iter()
+        .filter_map(|entry| {
+            let info = entry.info.as_ref()?;
+            Some((info.thread_id, info.fork_parent.clone()?))
+        })
+        .collect();
+
+    // A fork whose parent is itself a fork can be placed before that parent
+    // moves, so placing repeats until the order settles.
+    for _ in 0..=entries.len() {
+        let order_before: Vec<usize> = entries.iter().map(|entry| entry.original_index).collect();
+        for (fork_id, link) in &forks {
+            let position = |entries: &[Entry<T>], matches: &dyn Fn(&ForkListRow) -> bool| {
+                entries
+                    .iter()
+                    .position(|entry| entry.info.as_ref().is_some_and(matches))
+            };
+            let parent_index = position(&entries, &|info| {
+                info.thread_id != *fork_id && Some(info.thread_id) == link.parent_thread_id
+            })
+            .or_else(|| {
+                position(&entries, &|info| {
+                    info.thread_id != *fork_id && info.folder_paths.contains(&link.parent_path)
+                })
+            });
+            let fork_index = position(&entries, &|info| info.thread_id == *fork_id);
+            let (Some(parent_index), Some(fork_index)) = (parent_index, fork_index) else {
+                continue;
+            };
+            let fork_entry = entries.remove(fork_index);
+            let parent_index = if fork_index < parent_index {
+                parent_index - 1
+            } else {
+                parent_index
+            };
+            // After the forks already placed under this parent, so siblings
+            // keep their order.
+            let mut insert_at = parent_index + 1;
+            while entries.get(insert_at).is_some_and(|entry| {
+                entry
+                    .info
+                    .as_ref()
+                    .and_then(|info| info.fork_parent.as_ref())
+                    .is_some_and(|other| other.parent_path == link.parent_path)
+            }) {
+                insert_at += 1;
+            }
+            entries.insert(insert_at, fork_entry);
+        }
+        let order_after: Vec<usize> = entries.iter().map(|entry| entry.original_index).collect();
+        if order_after == order_before {
+            break;
+        }
+    }
+    entries.into_iter().map(|entry| entry.row).collect()
+}
+
+/// A path in the form git reports it and records compare it in: symlinks
+/// resolved and no trailing separator. Paths that cannot be resolved here,
+/// such as those of a remote project, are only trimmed.
+pub(crate) fn normalize_path(path: &str) -> String {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => canonical.to_string_lossy().to_string(),
+        Err(_) => {
+            let trimmed = path.trim_end_matches(['/', '\\']);
+            if trimmed.is_empty() {
+                path.to_string()
+            } else {
+                trimmed.to_string()
+            }
+        }
+    }
+}
+
+/// [`normalize_path`] for views that hold `PathBuf`s.
+pub(crate) fn normalize_fork_path(path: &std::path::Path) -> std::path::PathBuf {
+    normalize_path(&path.to_string_lossy()).into()
+}
+
+/// The fork records, held in memory once read: the database write is
+/// asynchronous, so reading back from it right after a change could miss it.
+#[derive(Default)]
+struct ForkRecords(Vec<ForkRecord>);
+
+impl gpui::Global for ForkRecords {}
+
+pub(crate) fn load_records(cx: &App) -> Vec<ForkRecord> {
+    if let Some(records) = cx.try_global::<ForkRecords>() {
+        return records.0.clone();
+    }
+    // Records saved by earlier versions may hold paths as Zed spelled them.
+    KeyValueStore::global(cx)
+        .read_kvp(FORKS_KEY)
+        .log_err()
+        .flatten()
+        .and_then(|json| serde_json::from_str::<Vec<ForkRecord>>(&json).log_err())
+        .unwrap_or_default()
+        .into_iter()
+        .map(ForkRecord::normalized)
+        .collect()
+}
+
+pub(crate) fn save_records(records: Vec<ForkRecord>, cx: &mut App) {
+    cx.set_global(ForkRecords(records.clone()));
+    let store = KeyValueStore::global(cx);
+    db::write_and_log(cx, move || async move {
+        store
+            .write_kvp(FORKS_KEY.to_string(), serde_json::to_string(&records)?)
+            .await
+    });
+}
+
+/// Adds or replaces the record for a fork directory.
+pub(crate) fn upsert_record(record: ForkRecord, cx: &mut App) {
+    let record = record.normalized();
+    let mut records = load_records(cx);
+    records.retain(|existing| existing.fork_path != record.fork_path);
+    records.push(record);
+    save_records(records, cx);
+}
+
+pub(crate) fn record_for_fork(fork_path: &str, cx: &App) -> Option<ForkRecord> {
+    let fork_path = normalize_path(fork_path);
+    load_records(cx)
+        .into_iter()
+        .find(|record| record.fork_path == fork_path)
+}
+
+pub(crate) fn records_for_parent(parent_path: &str, cx: &App) -> Vec<ForkRecord> {
+    let parent_path = normalize_path(parent_path);
+    load_records(cx)
+        .into_iter()
+        .filter(|record| record.parent_path == parent_path)
+        .collect()
+}
+
+/// Zed-generated messages start with one of these marker lines, which the
+/// thread view uses to show them collapsed to one line. A person would not type
+/// them, unlike the wording of the message itself.
+pub(crate) const FORK_MARKER: &str = "[Zed: fork]";
+pub(crate) const VERDICT_MARKER: &str = "[Zed: review verdict]";
+pub(crate) const THREAD_MESSAGE_MARKER: &str = "[Zed: message from another thread]";
+pub(crate) const LAND_MARKER: &str = "[Zed: land]";
+
+/// The message text after `marker` and its line break, when `text` starts with
+/// the marker alone on its first line.
+pub(crate) fn marked_body<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+    text.strip_prefix(marker)?.strip_prefix('\n')
+}
+
+/// How the fork message continues after its marker.
+pub(crate) const FORK_CONTEXT_PREFIX: &str = "This thread is a fork of";
+
+/// How much of the parent's transcript a fork receives.
+const MAX_TRANSCRIPT_BYTES: usize = 60_000;
+
+/// The start offsets of the messages of a transcript, which are the
+/// `## User` / `## Assistant` headings of `AcpThread::to_markdown`.
+fn message_starts(transcript: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut offset = 0;
+    for line in transcript.split_inclusive('\n') {
+        if line.starts_with("## ") {
+            starts.push(offset);
+        }
+        offset += line.len();
+    }
+    starts
+}
+
+/// The transcript cut to `MAX_TRANSCRIPT_BYTES`: its first message (the prompt
+/// that set the thread's task) and as many of the most recent messages as fit,
+/// cut on message boundaries.
+fn truncated_transcript(transcript: &str) -> String {
+    if transcript.len() <= MAX_TRANSCRIPT_BYTES {
+        return transcript.to_string();
+    }
+    let starts = message_starts(transcript);
+    let first_end = starts.get(1).copied().unwrap_or(transcript.len());
+    let first_message = &transcript[..first_end];
+    let tail_budget = MAX_TRANSCRIPT_BYTES.saturating_sub(first_message.len());
+    let mut tail_start = transcript.len();
+    let mut kept_messages = 0;
+    for start in starts.iter().skip(1).rev() {
+        if transcript.len() - start > tail_budget {
+            break;
+        }
+        tail_start = *start;
+        kept_messages += 1;
+    }
+    let message_count = starts.len();
+    if first_message.len() >= MAX_TRANSCRIPT_BYTES / 2 || kept_messages == 0 {
+        let mut start = transcript.len() - MAX_TRANSCRIPT_BYTES;
+        while !transcript.is_char_boundary(start) {
+            start += 1;
+        }
+        return format!("(earlier part omitted)\n{}", &transcript[start..]);
+    }
+    let omitted = message_count.saturating_sub(1 + kept_messages);
+    if omitted == 0 {
+        return transcript.to_string();
+    }
+    format!(
+        "{first_message}\n[… {omitted} earlier messages omitted …]\n\n{}",
+        &transcript[tail_start..]
+    )
+}
+
+/// The first message of a fork. Agents cannot import another thread's
+/// history, so the parent's transcript is passed as text.
+pub(crate) fn fork_context_message(parent_title: Option<&str>, transcript: &str) -> String {
+    let title = parent_title.unwrap_or("an earlier thread");
+    let transcript = truncated_transcript(transcript);
+    format!(
+        "{FORK_MARKER}\n{FORK_CONTEXT_PREFIX} \"{title}\". Its conversation so far is below, for context. \
+         You are working in a separate git worktree that started as a copy of that \
+         thread's working tree, including uncommitted changes; what you change here \
+         reaches the original only when I merge it. Do not act on the conversation \
+         yet: reply with one short line saying you are ready.\n\n\
+         <conversation>\n{transcript}\n</conversation>\n",
+    )
+}
+
+pub(crate) fn fork_thread_title(kind: &ForkKind, parent_title: Option<&str>) -> String {
+    let label = match kind {
+        ForkKind::Fork => "Fork",
+        ForkKind::Review => "Review",
+        ForkKind::Land => "Land",
+    };
+    match parent_title {
+        Some(title) => format!("{label}: {title}"),
+        None => label.to_string(),
+    }
+}
+
+/// The message a fork's thread starts with, by kind.
+pub(crate) fn first_message(
+    kind: &ForkKind,
+    parent_title: Option<&str>,
+    transcript: &str,
+    base_sha: &str,
+) -> String {
+    let context = fork_context_message(parent_title, transcript);
+    match kind {
+        ForkKind::Fork | ForkKind::Land => context,
+        ForkKind::Review => context
+            .replace("; what you change here reaches the original only when I merge it.", ".")
+            .replace(
+                "Do not act on the conversation yet: reply with one short line saying you are ready.",
+                &review_instructions(base_sha),
+            ),
+    }
+}
+
+fn review_instructions(base_sha: &str) -> String {
+    let short_sha: String = base_sha.chars().take(12).collect();
+    format!(
+        "You are the reviewer of that thread's work. The work is everything between the \
+         repository's default branch (find it with `git symbolic-ref --short \
+         refs/remotes/origin/HEAD`, or use `main` or `master`) and this worktree's HEAD \
+         commit {short_sha}, which is a snapshot that includes the uncommitted changes. Do \
+         not change any files. First reply with a short risk summary and the top 3 points \
+         I should check. Then write a change guide: an ordered walkthrough of the change for \
+         a reader who has not seen it, one step per logical change, each naming the files \
+         and lines involved and saying what changed and why it matters, with anything risky, \
+         unclear or untested called out. I will then comment and give a verdict."
+    )
+}
+
+const VERDICT_PREFIX: &str = "Review verdict:";
+const THREAD_MESSAGE_PREFIX: &str = "Message from thread";
+const LAND_PREFIX: &str = "Land the changes of thread";
+
+const MAX_FORWARDED_BYTES: usize = 8_000;
+
+fn clipped(text: &str) -> &str {
+    let mut end = text.len().min(MAX_FORWARDED_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// `text` cut to `MAX_FORWARDED_BYTES`, and whether it was cut.
+fn clipped_with_flag(text: &str) -> (&str, bool) {
+    let clipped_text = clipped(text);
+    (clipped_text, clipped_text.len() < text.len())
+}
+
+fn quote_safe_title(title: Option<&str>, fallback: &str) -> String {
+    title
+        .unwrap_or(fallback)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| *c != '"')
+        .take(60)
+        .collect()
+}
+
+/// The message a review's verdict reaches the reviewed thread with: the
+/// verdict, what the user wrote (which decides), and the reviewer's notes.
+pub(crate) fn verdict_message(
+    verdict: ReviewVerdict,
+    review_title: Option<&str>,
+    instructions: &str,
+    reviewer_notes: &str,
+) -> String {
+    let (label, next_step) = match verdict {
+        ReviewVerdict::Approved if instructions.trim().is_empty() => {
+            ("approved", "No changes are needed. Reply briefly and stop.")
+        }
+        ReviewVerdict::Approved => (
+            "approved",
+            "Do what the user's instructions above ask, if anything, then reply briefly.",
+        ),
+        ReviewVerdict::ChangesRequested => (
+            "changes requested",
+            "Make these changes in this working tree, then summarise what you changed.",
+        ),
+    };
+    let title = quote_safe_title(review_title, "the review thread");
+    let mut message = format!(
+        "{VERDICT_MARKER}\n{VERDICT_PREFIX} {label}. From the review thread \"{title}\".\n"
+    );
+    for (heading, text) in [
+        ("Instructions from the user (authoritative):", instructions),
+        ("Reviewer notes:", reviewer_notes),
+    ] {
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let (body, was_cut) = clipped_with_flag(text);
+        message.push_str(&format!("\n{heading}\n{body}\n"));
+        if was_cut {
+            message.push_str("(truncated)\n");
+        }
+    }
+    message.push_str(&format!("\nNext step: {next_step}\n"));
+    message
+}
+
+/// The message another thread's reply is passed on with.
+pub(crate) fn thread_message(sender_title: Option<&str>, text: &str) -> String {
+    // A title can be a thread's whole first message: keep its first line,
+    // shortened, and without quotes that would end the quoted title early.
+    let title = quote_safe_title(sender_title, "another thread");
+    format!(
+        "{THREAD_MESSAGE_MARKER}\n{THREAD_MESSAGE_PREFIX} \"{title}\":\n\n{}\n\n\
+         Act on it if it is relevant to your task.\n",
+        clipped(text.trim())
+    )
+}
+
+/// The first message of a thread that lands another thread's changes.
+/// `steps` is the project's own landing procedure, when it has one.
+pub(crate) fn land_message(parent_title: Option<&str>, steps: Option<&str>) -> String {
+    let title = parent_title.unwrap_or("this working tree");
+    let steps = steps
+        .map(str::trim)
+        .filter(|steps| !steps.is_empty())
+        .unwrap_or(
+            "1. Make sure the work is committed in sensible commits on the current branch.\n\
+         2. Bring the branch up to date with the default branch (rebase unless the \
+         project merges).\n\
+         3. Run the project's checks and tests; stop if they fail.\n\
+         4. Push the branch, and open or update its pull request.",
+        );
+    format!(
+        "{LAND_MARKER}\n{LAND_PREFIX} \"{title}\". You are in the same working tree as that thread. \
+         Follow these steps in order. Stop at the first step that fails and do not force \
+         anything (no force-push, no skipped checks).\n\n{steps}\n\n\
+         Finish with a short report: what landed, what did not, and what I need to do.\n"
+    )
+}
+
+/// The project's own landing procedure, from `.zed/land.md` in the working
+/// tree, if it has one.
+pub(crate) async fn landing_steps(
+    project: &Entity<Project>,
+    directory: &str,
+    cx: &mut AsyncApp,
+) -> Option<String> {
+    let script = format!("cat {}/.zed/land.md 2>/dev/null || true", quote(directory));
+    run_script(project, script, cx)
+        .await
+        .log_err()
+        .filter(|steps| !steps.trim().is_empty())
+}
+
+/// The one-line form of a message delivered from another thread, a verdict
+/// or a landing request, for the collapsed row in the transcript.
+pub(crate) fn delivered_message_summary(text: &str) -> Option<String> {
+    if let Some(body) = marked_body(text, VERDICT_MARKER) {
+        let rest = body.strip_prefix(VERDICT_PREFIX).unwrap_or(body);
+        let verdict = rest.trim_start().split('.').next().unwrap_or_default();
+        return Some(format!("Review verdict: {verdict}"));
+    }
+    let quoted_title = |rest: &str| {
+        rest.trim_start()
+            .strip_prefix('"')
+            .and_then(|rest| rest.split_once('"'))
+            .map(|(title, _)| title.to_string())
+    };
+    if let Some(body) = marked_body(text, THREAD_MESSAGE_MARKER) {
+        let rest = body.strip_prefix(THREAD_MESSAGE_PREFIX).unwrap_or(body);
+        return Some(match quoted_title(rest) {
+            Some(title) => format!("Message from thread \"{title}\""),
+            None => "Message from another thread".to_string(),
+        });
+    }
+    if let Some(body) = marked_body(text, LAND_MARKER) {
+        let rest = body.strip_prefix(LAND_PREFIX).unwrap_or(body);
+        return Some(match quoted_title(rest) {
+            Some(title) => format!("Landing the changes of \"{title}\""),
+            None => "Landing changes".to_string(),
+        });
+    }
+    None
+}
+
+/// What a merge did, in a sentence for a notification.
+pub(crate) fn merge_summary(fork_name: &str, outcome: &MergeOutcome) -> String {
+    match outcome {
+        MergeOutcome::NothingToMerge => {
+            format!("{fork_name} has no changes that are not already merged")
+        }
+        MergeOutcome::Merged {
+            changed_files,
+            conflicted_files,
+        } => {
+            let files = match changed_files.len() {
+                1 => "1 file".to_string(),
+                count => format!("{count} files"),
+            };
+            if conflicted_files.is_empty() {
+                format!("Merged {files} from {fork_name}")
+            } else {
+                format!(
+                    "Merged {files} from {fork_name}. Resolve the conflict markers in: {}",
+                    conflicted_files.join(", ")
+                )
+            }
+        }
+    }
+}
+
+/// The panel action a message such as `/fork` stands for.
+pub(crate) fn slash_command_action(text: &str) -> Option<Box<dyn gpui::Action>> {
+    match text {
+        "/fork" => Some(Box::new(zed_actions::agent::ForkThread)),
+        "/merge" => Some(Box::new(zed_actions::agent::MergeIntoParent)),
+        "/review" => Some(Box::new(zed_actions::agent::ReviewThread)),
+        "/land" => Some(Box::new(zed_actions::agent::LandChanges)),
+        "/send-to-parent" => Some(Box::new(zed_actions::agent::SendToParentThread)),
+        _ => None,
+    }
+}
+
+fn quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+/// Runs a POSIX shell script in the project's environment (local or remote)
+/// and returns its standard output, trimmed. The user's shell may not be
+/// POSIX (fish, nushell), so the script always runs under `sh`.
+async fn run_script(
+    project: &Entity<Project>,
+    script: String,
+    cx: &mut AsyncApp,
+) -> Result<String> {
+    let command = project.update(cx, |project, cx| {
+        project.exec_in_shell(format!("sh -c {}", quote(&script)), cx)
+    });
+    let output = command.await?.output().await?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("{}\n{}", stderr.trim(), stdout).context("git failed"));
+    }
+    Ok(stdout)
+}
+
+/// Captures the whole working tree of `directory` (staged, unstaged and
+/// untracked files) as a commit, without changing `HEAD` or the index.
+pub(crate) async fn snapshot(
+    project: &Entity<Project>,
+    directory: &str,
+    cx: &mut AsyncApp,
+) -> Result<String> {
+    let script = format!(
+        "cd {directory} && \
+         index=\"$(git rev-parse --absolute-git-dir)/zed-fork-index.$$\" && \
+         cp \"$(git rev-parse --absolute-git-dir)/index\" \"$index\" 2>/dev/null; \
+         tree=$(GIT_INDEX_FILE=\"$index\" git add --all && GIT_INDEX_FILE=\"$index\" git write-tree); \
+         status=$?; rm -f \"$index\"; [ $status -eq 0 ] || exit $status; \
+         if git rev-parse --verify -q HEAD >/dev/null; then set -- -p HEAD; else set --; fi; \
+         git -c user.name=Zed -c user.email=zed@localhost \
+         commit-tree \"$tree\" \"$@\" -m 'Zed fork snapshot'",
+        directory = quote(directory),
+    );
+    let sha = run_script(project, script, cx)
+        .await
+        .context("could not snapshot the working tree")?;
+    anyhow::ensure!(
+        sha.len() >= 40 && sha.chars().all(|c| c.is_ascii_hexdigit()),
+        "unexpected snapshot id {sha:?}"
+    );
+    Ok(sha)
+}
+
+pub(crate) fn new_fork_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+pub(crate) fn fork_ref(id: &str, name: &str) -> String {
+    format!("refs/zed/forks/{id}/{name}")
+}
+
+/// Points `ref_name` at `sha` in the repository of `directory`, so that
+/// `git gc` keeps a snapshot commit nothing else refers to. Refs are shared
+/// by all of a repository's worktrees.
+pub(crate) async fn pin_commit(
+    project: &Entity<Project>,
+    directory: &str,
+    ref_name: &str,
+    sha: &str,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let script = format!(
+        "cd {} && git update-ref {} {}",
+        quote(directory),
+        quote(ref_name),
+        quote(sha)
+    );
+    run_script(project, script, cx)
+        .await
+        .context("could not keep the fork's snapshot commit")?;
+    Ok(())
+}
+
+/// Deletes the refs that pin a fork's snapshot commits.
+pub(crate) async fn unpin_fork_commits(
+    project: &Entity<Project>,
+    parent_path: &str,
+    id: &str,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    if id.is_empty() {
+        return Ok(());
+    }
+    let script = format!(
+        "cd {} && git update-ref -d {} && git update-ref -d {}",
+        quote(parent_path),
+        quote(&fork_ref(id, "base")),
+        quote(&fork_ref(id, "merged"))
+    );
+    run_script(project, script, cx).await?;
+    Ok(())
+}
+
+/// The directories of the repository's linked worktrees, after pruning
+/// entries whose directory is gone.
+pub(crate) async fn live_worktree_paths(
+    project: &Entity<Project>,
+    directory: &str,
+    cx: &mut AsyncApp,
+) -> Result<Vec<String>> {
+    let script = format!(
+        "cd {} && git worktree prune && git worktree list --porcelain",
+        quote(directory)
+    );
+    let listing = run_script(project, script, cx).await?;
+    Ok(listing
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(|path| path.to_string())
+        .collect())
+}
+
+/// The linked worktree of the repository that is detached at `sha` and has no
+/// record: where a fork lives when its workspace could not say.
+pub(crate) async fn unrecorded_worktree_at(
+    project: &Entity<Project>,
+    parent_path: &str,
+    sha: &str,
+    cx: &mut AsyncApp,
+) -> Result<Option<String>> {
+    let script = format!("cd {} && git worktree list --porcelain", quote(parent_path));
+    let listing = run_script(project, script, cx).await?;
+    let recorded: HashSet<String> = cx.update(|cx| {
+        load_records(cx)
+            .into_iter()
+            .map(|record| record.fork_path)
+            .collect()
+    });
+    let parent_path = normalize_path(parent_path);
+    Ok(listing
+        .split("\n\n")
+        .filter(|entry| {
+            entry
+                .lines()
+                .any(|line| line.strip_prefix("HEAD ") == Some(sha))
+        })
+        .filter_map(|entry| {
+            entry
+                .lines()
+                .find_map(|line| line.strip_prefix("worktree "))
+        })
+        .map(normalize_path)
+        .find(|path| *path != parent_path && !recorded.contains(path)))
+}
+
+/// Drops records whose fork directory is no longer a worktree of the
+/// repository, and returns the live forks of `parent_path`.
+pub(crate) async fn live_forks(
+    project: &Entity<Project>,
+    parent_path: &str,
+    cx: &mut AsyncApp,
+) -> Result<Vec<ForkRecord>> {
+    let parent_path = normalize_path(parent_path);
+    let worktrees: HashSet<String> = live_worktree_paths(project, &parent_path, cx)
+        .await?
+        .iter()
+        .map(|path| normalize_path(path))
+        .collect();
+    let records = cx.update(|cx| load_records(cx));
+    let (live, stale): (Vec<_>, Vec<_>) = records.into_iter().partition(|record| {
+        record.parent_path != parent_path || worktrees.contains(&record.fork_path)
+    });
+    if !stale.is_empty() {
+        let live = live.clone();
+        cx.update(|cx| save_records(live, cx));
+    }
+    Ok(live
+        .into_iter()
+        .filter(|record| record.parent_path == parent_path)
+        .collect())
+}
+
+/// The forks being created per working tree: they have no record yet, so
+/// two quick forks would otherwise both pass the cap.
+#[derive(Default)]
+struct ForksBeingCreated(HashMap<String, usize>);
+
+impl Global for ForksBeingCreated {}
+
+/// Refuses a new fork once [`MAX_LIVE_FORKS`] of the working tree exist,
+/// counting those still being created. Otherwise it reserves a place for the
+/// new fork, which the caller must give back with [`release_fork_place`]
+/// once the fork is recorded or its creation failed.
+pub(crate) async fn ensure_room_for_fork(
+    project: &Entity<Project>,
+    parent_path: &str,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let parent_path = normalize_path(parent_path);
+    let live = live_forks(project, &parent_path, cx).await?;
+    cx.update(|cx| {
+        let being_created = cx
+            .default_global::<ForksBeingCreated>()
+            .0
+            .entry(parent_path)
+            .or_default();
+        let total = live.len() + *being_created;
+        anyhow::ensure!(
+            total < MAX_LIVE_FORKS,
+            "This working tree already has {total} forks. Merge and archive some of them before forking again."
+        );
+        *being_created += 1;
+        Ok(())
+    })
+}
+
+pub(crate) fn release_fork_place(parent_path: &str, cx: &mut App) {
+    let parent_path = normalize_path(parent_path);
+    let being_created = cx.default_global::<ForksBeingCreated>();
+    if let Some(count) = being_created.0.get_mut(&parent_path) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            being_created.0.remove(&parent_path);
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MergeOutcome {
+    /// The fork has no changes that the parent has not already received.
+    NothingToMerge,
+    Merged {
+        /// Files the merge changed in the parent.
+        changed_files: Vec<String>,
+        /// Files left with conflict markers for the user to resolve.
+        conflicted_files: Vec<String>,
+    },
+}
+
+/// Merges what the fork changed since it was made (or since its last merge)
+/// into the parent's working tree, and returns the updated record.
+///
+/// This is a three-way merge of the two working trees, so edits made in the
+/// parent meanwhile are kept; where both changed the same lines, the file
+/// gets conflict markers. The parent's `HEAD` and index stay as they are.
+pub(crate) async fn merge_into_parent(
+    project: &Entity<Project>,
+    record: ForkRecord,
+    cx: &mut AsyncApp,
+) -> Result<(ForkRecord, MergeOutcome)> {
+    let parent_path = record.parent_path.clone();
+    let acquired = cx.update(|cx| {
+        cx.default_global::<MergesRunning>()
+            .0
+            .insert(parent_path.clone())
+    });
+    anyhow::ensure!(
+        acquired,
+        "A merge into this working tree is already running"
+    );
+    let result = merge_into_parent_exclusively(project, record, cx).await;
+    cx.update(|cx| {
+        cx.default_global::<MergesRunning>().0.remove(&parent_path);
+    });
+    result
+}
+
+/// The working trees that a merge is running into. Two merges applying
+/// patches to one working tree at once would trample each other.
+#[derive(Default)]
+struct MergesRunning(HashSet<String>);
+
+impl Global for MergesRunning {}
+
+async fn merge_into_parent_exclusively(
+    project: &Entity<Project>,
+    mut record: ForkRecord,
+    cx: &mut AsyncApp,
+) -> Result<(ForkRecord, MergeOutcome)> {
+    let fork_sha = snapshot(project, &record.fork_path, cx).await?;
+    let merge_base = record.merged_sha.clone().unwrap_or(record.base_sha.clone());
+    let parent = quote(&record.parent_path);
+
+    let unchanged = run_script(
+        project,
+        format!(
+            "cd {parent} && [ \"$(git rev-parse {fork_sha}^{{tree}})\" = \"$(git rev-parse {merge_base}^{{tree}})\" ] && echo same || echo different"
+        ),
+        cx,
+    )
+    .await?;
+    if unchanged == "same" {
+        return Ok((record, MergeOutcome::NothingToMerge));
+    }
+
+    let parent_sha = snapshot(project, &record.parent_path, cx).await?;
+    // `merge-tree` exits with 1 when there are conflicts; the tree it prints
+    // first then holds the conflict markers. With `--name-only` the tree is
+    // followed by the conflicted paths, up to the first blank line.
+    let script = format!(
+        "cd {parent} && \
+         merged=$(git -c core.quotePath=false merge-tree --write-tree --name-only --merge-base={merge_base} {parent_sha} {fork_sha}); \
+         status=$?; [ $status -le 1 ] || exit $status; \
+         tree=$(printf '%s\\n' \"$merged\" | head -n 1) && \
+         patch=$(mktemp) && \
+         git diff --binary {parent_sha} \"$tree\" > \"$patch\" && \
+         git -c core.quotePath=false diff --name-only {parent_sha} \"$tree\" && \
+         echo '--conflicts--' && \
+         printf '%s\\n' \"$merged\" | awk 'NR > 1 {{ if ($0 == \"\") exit; print }}' && \
+         if [ -s \"$patch\" ]; then git apply --whitespace=nowarn \"$patch\"; fi; \
+         applied=$?; rm -f \"$patch\"; exit $applied"
+    );
+    let output = run_script(project, script, cx)
+        .await
+        .context("could not merge the fork into its parent")?;
+    let (changed, conflicted) = output
+        .split_once("--conflicts--")
+        .unwrap_or((output.as_str(), ""));
+    let lines = |text: &str| -> Vec<String> {
+        let mut lines: Vec<String> = text
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+        lines.sort();
+        lines.dedup();
+        lines
+    };
+
+    // The merge took a while: the record may have changed meanwhile (a
+    // review verdict, say), and only the merge point is this function's.
+    let id = cx.update(|cx| {
+        record_for_fork(&record.fork_path, cx)
+            .map(|current| current.id)
+            .unwrap_or_else(|| record.id.clone())
+    });
+    let id = if id.is_empty() { new_fork_id() } else { id };
+    // The merge is applied by now, so a failure to pin must not fail it.
+    pin_commit(
+        project,
+        &record.parent_path,
+        &fork_ref(&id, "merged"),
+        &fork_sha,
+        cx,
+    )
+    .await
+    .log_err();
+    record = cx.update(|cx| {
+        let mut current = record_for_fork(&record.fork_path, cx).unwrap_or(record);
+        current.id = id;
+        current.merged_sha = Some(fork_sha);
+        upsert_record(current.clone(), cx);
+        current
+    });
+    Ok((
+        record,
+        MergeOutcome::Merged {
+            changed_files: lines(changed),
+            conflicted_files: lines(conflicted),
+        },
+    ))
+}
+
+/// Whether the fork holds changes its parent has not received.
+pub(crate) async fn has_unmerged_changes(
+    project: &Entity<Project>,
+    record: &ForkRecord,
+    cx: &mut AsyncApp,
+) -> Result<bool> {
+    let fork_sha = snapshot(project, &record.fork_path, cx).await?;
+    let merge_base = record.merged_sha.clone().unwrap_or(record.base_sha.clone());
+    let result = run_script(
+        project,
+        format!(
+            "cd {} && [ \"$(git rev-parse {fork_sha}^{{tree}})\" = \"$(git rev-parse {merge_base}^{{tree}})\" ] && echo same || echo different",
+            quote(&record.fork_path)
+        ),
+        cx,
+    )
+    .await?;
+    Ok(result != "same")
+}
+
+/// Removes a fork's worktree and its record. A fork with changes that were
+/// never merged is kept, and an error says so.
+pub(crate) async fn remove_fork(
+    project: &Entity<Project>,
+    record: &ForkRecord,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    anyhow::ensure!(
+        !has_unmerged_changes(project, record, cx).await?,
+        "The fork at {} has changes that were not merged into its parent, so it was kept.",
+        record.fork_path
+    );
+    run_script(
+        project,
+        format!(
+            "cd {} && git worktree remove --force {} && git worktree prune",
+            quote(&record.parent_path),
+            quote(&record.fork_path)
+        ),
+        cx,
+    )
+    .await
+    .context("could not remove the fork's worktree")?;
+    unpin_fork_commits(project, &record.parent_path, &record.id, cx)
+        .await
+        .log_err();
+    let fork_path = record.fork_path.clone();
+    cx.update(|cx| {
+        let mut records = load_records(cx);
+        records.retain(|existing| existing.fork_path != fork_path);
+        save_records(records, cx);
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use settings::SettingsStore;
+    use std::path::Path;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            cx.set_global(db::AppDatabase::test_new());
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+        cx.executor().allow_parking();
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn git(directory: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(directory)
+            .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+            .args(args)
+            .output()
+            .expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        parent: std::path::PathBuf,
+        project: Entity<Project>,
+    }
+
+    impl Fixture {
+        async fn new(cx: &mut TestAppContext) -> Self {
+            Self::build(false, cx).await
+        }
+
+        /// A fixture whose paths all go through a symlink to the directory
+        /// that really holds the repository.
+        #[cfg(unix)]
+        async fn new_via_symlink(cx: &mut TestAppContext) -> Self {
+            Self::build(true, cx).await
+        }
+
+        async fn build(symlinked: bool, cx: &mut TestAppContext) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let parent = if symlinked {
+                let real = root.join("real");
+                std::fs::create_dir_all(&real).unwrap();
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&real, root.join("link")).unwrap();
+                root.join("link").join("repo")
+            } else {
+                root.join("repo")
+            };
+            std::fs::create_dir_all(&parent).unwrap();
+            std::fs::write(parent.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+            std::fs::write(parent.join("b.txt"), "alpha\n").unwrap();
+            git(&parent, &["init", "-b", "main"]);
+            git(&parent, &["add", "."]);
+            git(&parent, &["commit", "-m", "initial"]);
+            let project =
+                Project::test(fs::RealFs::new(None, cx.executor()), [parent.as_path()], cx).await;
+            Self {
+                _directory: directory,
+                parent,
+                project,
+            }
+        }
+
+        fn parent_path(&self) -> String {
+            self.parent.to_string_lossy().to_string()
+        }
+
+        /// Forks the parent's working tree the way the agent panel does:
+        /// a detached worktree at a snapshot of it.
+        async fn fork(&self, name: &str, cx: &mut TestAppContext) -> ForkRecord {
+            let parent_path = self.parent_path();
+            let mut async_cx = cx.to_async();
+            ensure_room_for_fork(&self.project, &parent_path, &mut async_cx)
+                .await
+                .unwrap();
+            let base_sha = snapshot(&self.project, &parent_path, &mut async_cx)
+                .await
+                .unwrap();
+            let id = new_fork_id();
+            pin_commit(
+                &self.project,
+                &parent_path,
+                &fork_ref(&id, "base"),
+                &base_sha,
+                &mut async_cx,
+            )
+            .await
+            .unwrap();
+            let fork = self.parent.parent().unwrap().join(name);
+            git(
+                &self.parent,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    fork.to_str().unwrap(),
+                    &base_sha,
+                ],
+            );
+            let record = ForkRecord {
+                id,
+                fork_path: fork.to_string_lossy().to_string(),
+                parent_path,
+                base_sha,
+                merged_sha: None,
+                kind: ForkKind::Fork,
+                parent_title: None,
+                verdict: None,
+                parent_thread_id: None,
+            };
+            cx.update(|cx| {
+                upsert_record(record.clone(), cx);
+                release_fork_place(&record.parent_path, cx);
+            });
+            cx.run_until_parked();
+            record
+        }
+    }
+
+    #[gpui::test]
+    async fn test_merge_keeps_changes_made_to_the_record_meanwhile(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fixture = Fixture::new(cx).await;
+        let stale_record = fixture.fork("fork-verdict", cx).await;
+        std::fs::write(Path::new(&stale_record.fork_path).join("new.txt"), "x\n").unwrap();
+
+        let mut with_verdict = stale_record.clone();
+        with_verdict.verdict = Some(ReviewVerdict::Approved);
+        cx.update(|cx| upsert_record(with_verdict, cx));
+
+        let mut async_cx = cx.to_async();
+        let (returned, _) =
+            merge_into_parent(&fixture.project, stale_record.clone(), &mut async_cx)
+                .await
+                .unwrap();
+        assert_eq!(returned.verdict, Some(ReviewVerdict::Approved));
+        let stored = cx
+            .update(|cx| record_for_fork(&stale_record.fork_path, cx))
+            .unwrap();
+        assert_eq!(stored.verdict, Some(ReviewVerdict::Approved));
+        assert!(stored.merged_sha.is_some());
+    }
+
+    #[gpui::test]
+    async fn test_only_one_merge_into_a_working_tree_runs_at_a_time(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fixture = Fixture::new(cx).await;
+        let record = fixture.fork("fork-busy", cx).await;
+        let parent_path = fixture.parent_path();
+        cx.update(|cx| {
+            cx.default_global::<MergesRunning>()
+                .0
+                .insert(parent_path.clone());
+        });
+
+        let mut async_cx = cx.to_async();
+        let error = merge_into_parent(&fixture.project, record.clone(), &mut async_cx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already running"), "{error:#}");
+
+        cx.update(|cx| {
+            cx.default_global::<MergesRunning>().0.remove(&parent_path);
+        });
+        merge_into_parent(&fixture.project, record, &mut async_cx)
+            .await
+            .unwrap();
+        let still_running = cx.update(|cx| cx.default_global::<MergesRunning>().0.len());
+        assert_eq!(still_running, 0);
+    }
+
+    #[gpui::test]
+    async fn test_fork_carries_uncommitted_work_and_merges_back(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fixture = Fixture::new(cx).await;
+        let parent = fixture.parent.clone();
+        // Uncommitted and untracked work in the parent travels to the fork.
+        std::fs::write(parent.join("b.txt"), "alpha edited\n").unwrap();
+        std::fs::write(parent.join("untracked.txt"), "draft\n").unwrap();
+        let head = git(&parent, &["rev-parse", "HEAD"]);
+
+        let record = fixture.fork("fork-one", cx).await;
+        let fork = Path::new(&record.fork_path).to_path_buf();
+        assert_eq!(
+            std::fs::read_to_string(fork.join("b.txt")).unwrap(),
+            "alpha edited\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fork.join("untracked.txt")).unwrap(),
+            "draft\n"
+        );
+
+        // The fork and the parent then change different things.
+        std::fs::write(fork.join("a.txt"), "one\ntwo\nthree\nfour from fork\n").unwrap();
+        std::fs::write(fork.join("new.txt"), "made in fork\n").unwrap();
+        std::fs::remove_file(fork.join("untracked.txt")).unwrap();
+        std::fs::write(parent.join("a.txt"), "zero from parent\none\ntwo\nthree\n").unwrap();
+
+        let mut async_cx = cx.to_async();
+        let (record, outcome) = merge_into_parent(&fixture.project, record, &mut async_cx)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            MergeOutcome::Merged {
+                changed_files: vec![
+                    "a.txt".to_string(),
+                    "new.txt".to_string(),
+                    "untracked.txt".to_string()
+                ],
+                conflicted_files: Vec::new(),
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(parent.join("a.txt")).unwrap(),
+            "zero from parent\none\ntwo\nthree\nfour from fork\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(parent.join("new.txt")).unwrap(),
+            "made in fork\n"
+        );
+        assert!(!parent.join("untracked.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(parent.join("b.txt")).unwrap(),
+            "alpha edited\n"
+        );
+        // The parent's history and index are untouched.
+        assert_eq!(git(&parent, &["rev-parse", "HEAD"]), head);
+        assert_eq!(git(&parent, &["diff", "--cached", "--name-only"]), "");
+
+        // Merging again carries nothing; a later change is merged alone.
+        let (record, outcome) = merge_into_parent(&fixture.project, record, &mut async_cx)
+            .await
+            .unwrap();
+        assert_eq!(outcome, MergeOutcome::NothingToMerge);
+        std::fs::write(fork.join("new.txt"), "made in fork\nand extended\n").unwrap();
+        let (_, outcome) = merge_into_parent(&fixture.project, record, &mut async_cx)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            MergeOutcome::Merged {
+                changed_files: vec!["new.txt".to_string()],
+                conflicted_files: Vec::new(),
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(parent.join("new.txt")).unwrap(),
+            "made in fork\nand extended\n"
+        );
+    }
+
+    #[test]
+    fn test_fork_messages() {
+        let message = fork_context_message(Some("Fix the parser"), "## User\nhello\n");
+        assert!(message.starts_with("[Zed: fork]\nThis thread is a fork of"));
+        assert!(message.contains("\"Fix the parser\""));
+        assert!(message.contains("<conversation>\n## User\nhello\n\n</conversation>"));
+
+        // A transcript without message headings keeps its end.
+        let long = format!("{}THE END", "x".repeat(MAX_TRANSCRIPT_BYTES * 2));
+        let message = fork_context_message(None, &long);
+        assert!(message.contains("(earlier part omitted)"));
+        assert!(message.contains("THE END"));
+        assert!(message.len() < MAX_TRANSCRIPT_BYTES + 2_000);
+
+        // A long conversation keeps its first message and its recent ones, cut
+        // on message boundaries.
+        let mut conversation = String::from("## User\n\nTHE ARCHITECT PROMPT\n\n");
+        for index in 0..400 {
+            conversation.push_str(&format!(
+                "## Assistant\n\nreply {index} {}\n\n",
+                "y".repeat(400)
+            ));
+        }
+        conversation.push_str("## User\n\nLAST QUESTION\n\n");
+        let message = fork_context_message(None, &conversation);
+        assert!(message.contains("THE ARCHITECT PROMPT"));
+        assert!(message.contains("LAST QUESTION"));
+        assert!(message.contains("reply 399 "));
+        assert!(!message.contains("reply 0 "));
+        assert!(
+            message.contains("earlier messages omitted …]"),
+            "{}",
+            &message[..400]
+        );
+        assert!(message.len() < MAX_TRANSCRIPT_BYTES + 2_000);
+        let kept = message.matches("## Assistant").count();
+        assert!(message.contains(&format!("[… {} earlier messages omitted …]", 400 - kept)));
+
+        assert_eq!(
+            fork_thread_title(&ForkKind::Fork, Some("Fix the parser")),
+            "Fork: Fix the parser"
+        );
+        assert!(slash_command_action("/fork").is_some());
+        assert!(slash_command_action("/merge").is_some());
+        assert!(slash_command_action("/fork please").is_none());
+
+        assert_eq!(
+            merge_summary(
+                "worktrees/fork",
+                &MergeOutcome::Merged {
+                    changed_files: vec!["a".into(), "b".into()],
+                    conflicted_files: vec!["b".into()],
+                }
+            ),
+            "Merged 2 files from worktrees/fork. Resolve the conflict markers in: b"
+        );
+    }
+
+    #[test]
+    fn test_review_land_and_thread_messages() {
+        let review = first_message(
+            &ForkKind::Review,
+            Some("Fix the parser"),
+            "hello",
+            "0123456789abcdef",
+        );
+        assert!(review.starts_with("[Zed: fork]\nThis thread is a fork of"));
+        assert!(review.contains("write a change guide"));
+        assert!(!review.contains("reply with one short line"));
+        assert!(review.contains("HEAD commit 0123456789ab"));
+        assert!(review.contains("risk summary and the top 3 points"));
+        assert!(!review.contains("reaches the original"));
+        let fork = first_message(
+            &ForkKind::Fork,
+            Some("Fix the parser"),
+            "hello",
+            "0123456789abcdef",
+        );
+        assert!(fork.contains("reaches the original only when I merge it"));
+
+        let verdict = verdict_message(
+            ReviewVerdict::ChangesRequested,
+            Some("Review: Fix the parser"),
+            "Rename the helper.\n",
+            "1. The parser drops the last token.",
+        );
+        assert_eq!(
+            verdict,
+            "[Zed: review verdict]\nReview verdict: changes requested. From the review thread \
+             \"Review: Fix the parser\".\n\nInstructions from the user (authoritative):\n\
+             Rename the helper.\n\nReviewer notes:\n1. The parser drops the last token.\n\n\
+             Next step: Make these changes in this working tree, then summarise what you \
+             changed.\n"
+        );
+        assert_eq!(
+            delivered_message_summary(&verdict).as_deref(),
+            Some("Review verdict: changes requested")
+        );
+        let approved = verdict_message(ReviewVerdict::Approved, None, "", "");
+        assert!(approved.contains("Next step: No changes are needed. Reply briefly and stop."));
+        assert!(!approved.contains("Instructions from the user"));
+        let long_note = "n".repeat(MAX_FORWARDED_BYTES + 10);
+        let truncated = verdict_message(ReviewVerdict::Approved, None, &long_note, "");
+        assert!(truncated.contains("\n(truncated)\n"));
+        assert_eq!(
+            delivered_message_summary(&approved).as_deref(),
+            Some("Review verdict: approved")
+        );
+
+        let forwarded = thread_message(Some("Review: Fix the parser"), "All good.");
+        assert_eq!(
+            forwarded,
+            "[Zed: message from another thread]\nMessage from thread \"Review: Fix the parser\":\n\nAll good.\n\nAct on it if it is relevant to your task.\n"
+        );
+        assert_eq!(
+            delivered_message_summary(&forwarded).as_deref(),
+            Some("Message from thread \"Review: Fix the parser\"")
+        );
+
+        let land = land_message(Some("Fix the parser"), None);
+        assert!(land.contains("Push the branch"));
+        assert!(land.contains("no force-push"));
+        assert_eq!(
+            delivered_message_summary(&land).as_deref(),
+            Some("Landing the changes of \"Fix the parser\"")
+        );
+        let custom = land_message(None, Some("1. make ship\n"));
+        assert!(custom.contains("1. make ship") && !custom.contains("Push the branch"));
+
+        let long_title = format!("Land the changes of thread \"Hello\". {}", "x".repeat(200));
+        let from_long = thread_message(Some(&long_title), "done");
+        assert_eq!(
+            delivered_message_summary(&from_long).as_deref(),
+            Some(
+                "Message from thread \"Land the changes of thread Hello. xxxxxxxxxxxxxxxxxxxxxxxxxx\""
+            )
+        );
+        assert!(delivered_message_summary("An ordinary message").is_none());
+        // Typing the wording of a generated message does not collapse the turn.
+        for typed in [
+            "Message from thread notes: remember the milk",
+            "Review verdict: I think it is fine",
+            "Land the changes of thread two on Friday",
+            "[Zed: land] but on the same line",
+        ] {
+            assert!(delivered_message_summary(typed).is_none(), "{typed}");
+        }
+        for command in ["/review", "/land", "/send-to-parent"] {
+            assert!(slash_command_action(command).is_some(), "{command}");
+        }
+    }
+
+    #[test]
+    fn test_forks_are_listed_under_their_parent_thread() {
+        use crate::thread_metadata_store::ThreadId;
+        use std::path::PathBuf;
+
+        struct Row {
+            title: &'static str,
+            thread_id: ThreadId,
+            path: &'static str,
+            fork_parent: Option<ForkLink>,
+        }
+        let row = |title, path, fork_parent| Row {
+            title,
+            thread_id: ThreadId::new(),
+            path,
+            fork_parent,
+        };
+        let link = |fork_path: &str, parent_path: &str, parent_thread_id| ForkLink {
+            fork_path: PathBuf::from(fork_path),
+            parent_path: PathBuf::from(parent_path),
+            parent_thread_id,
+        };
+        let older_parent = row("older parent", "/repo", None);
+        let fork_one = row(
+            "fork one",
+            "/worktrees/one",
+            Some(link(
+                "/worktrees/one",
+                "/repo",
+                Some(older_parent.thread_id),
+            )),
+        );
+        // A fork of a fork, listed before the fork it follows moves.
+        let nested_fork = row(
+            "fork of fork one",
+            "/worktrees/nested",
+            Some(link(
+                "/worktrees/nested",
+                "/worktrees/one",
+                Some(fork_one.thread_id),
+            )),
+        );
+        // As a thread list sorts them: most recent first.
+        let rows = vec![
+            nested_fork,
+            row(
+                "fork two",
+                "/worktrees/two",
+                Some(link("/worktrees/two", "/repo", None)),
+            ),
+            row("unrelated", "/other", None),
+            row("recent parent", "/repo", None),
+            fork_one,
+            older_parent,
+            row(
+                "orphan fork",
+                "/worktrees/orphan",
+                Some(link("/worktrees/orphan", "/gone", None)),
+            ),
+        ];
+        let titles: Vec<&str> = nest_forks_under_parents(rows, |row| {
+            Some(ForkListRow {
+                thread_id: row.thread_id,
+                folder_paths: vec![PathBuf::from(row.path)],
+                fork_parent: row.fork_parent.clone(),
+            })
+        })
+        .iter()
+        .map(|row| row.title)
+        .collect();
+        assert_eq!(
+            titles,
+            vec![
+                "unrelated",
+                // Without a recorded thread, the fork follows the first
+                // listed thread of its parent working tree.
+                "recent parent",
+                "fork two",
+                // With one, it follows that thread.
+                "older parent",
+                "fork one",
+                "fork of fork one",
+                // A fork whose parent is not listed stays in place.
+                "orphan fork",
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_land_parent_survives_a_restart(cx: &mut TestAppContext) {
+        init_test(cx);
+        let land_thread = ThreadId::new();
+        let parent = ThreadId::new();
+        assert_eq!(cx.update(|cx| land_parent(land_thread, cx)), None);
+        cx.update(|cx| set_land_parent(land_thread, parent, cx));
+        assert_eq!(cx.update(|cx| land_parent(land_thread, cx)), Some(parent));
+
+        // After a restart nothing is in memory: the link comes from the
+        // database.
+        cx.run_until_parked();
+        cx.update(|cx| {
+            cx.remove_global::<LandParents>();
+        });
+        assert_eq!(cx.update(|cx| land_parent(land_thread, cx)), Some(parent));
+        assert_eq!(cx.update(|cx| land_parent(parent, cx)), None);
+    }
+
+    #[gpui::test]
+    async fn test_conflicting_merge_leaves_markers(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fixture = Fixture::new(cx).await;
+        let parent = fixture.parent.clone();
+        // A name that git would quote when printing it.
+        let name = "my fïle.txt";
+        std::fs::write(parent.join(name), "base\n").unwrap();
+        let record = fixture.fork("fork-conflict", cx).await;
+        let fork = Path::new(&record.fork_path).to_path_buf();
+        std::fs::write(fork.join(name), "from fork\n").unwrap();
+        std::fs::write(parent.join(name), "from parent\n").unwrap();
+
+        let mut async_cx = cx.to_async();
+        let (_, outcome) = merge_into_parent(&fixture.project, record, &mut async_cx)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            MergeOutcome::Merged {
+                changed_files: vec![name.to_string()],
+                conflicted_files: vec![name.to_string()],
+            }
+        );
+        let merged = std::fs::read_to_string(parent.join(name)).unwrap();
+        assert!(merged.contains("<<<<<<<"), "{merged}");
+        assert!(merged.contains("from fork") && merged.contains("from parent"));
+    }
+
+    #[gpui::test]
+    async fn test_modify_delete_conflict_is_listed(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fixture = Fixture::new(cx).await;
+        let parent = fixture.parent.clone();
+        let record = fixture.fork("fork-delete", cx).await;
+        let fork = Path::new(&record.fork_path).to_path_buf();
+        std::fs::remove_file(fork.join("b.txt")).unwrap();
+        std::fs::write(parent.join("b.txt"), "alpha edited in parent\n").unwrap();
+
+        let mut async_cx = cx.to_async();
+        let (_, outcome) = merge_into_parent(&fixture.project, record, &mut async_cx)
+            .await
+            .unwrap();
+        let MergeOutcome::Merged {
+            conflicted_files, ..
+        } = outcome
+        else {
+            panic!("expected a merge, got {outcome:?}");
+        };
+        assert_eq!(conflicted_files, vec!["b.txt".to_string()]);
+        // The parent's edit is what stays.
+        assert_eq!(
+            std::fs::read_to_string(parent.join("b.txt")).unwrap(),
+            "alpha edited in parent\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_forks_are_found_through_symlinked_paths(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fixture = Fixture::new_via_symlink(cx).await;
+        let parent_path = fixture.parent_path();
+        let record = fixture.fork("fork-linked", cx).await;
+        let real_parent = fixture.parent.canonicalize().unwrap();
+        assert_ne!(real_parent.to_string_lossy(), parent_path);
+
+        let mut async_cx = cx.to_async();
+        let live = live_forks(&fixture.project, &parent_path, &mut async_cx)
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(
+            live[0].fork_path,
+            Path::new(&record.fork_path)
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+        );
+
+        // Every spelling of the paths finds the record, and it was not
+        // dropped as stale.
+        for parent in [
+            parent_path.clone(),
+            format!("{parent_path}/"),
+            real_parent.to_string_lossy().to_string(),
+        ] {
+            assert_eq!(cx.update(|cx| records_for_parent(&parent, cx)).len(), 1);
+        }
+        for fork in [
+            record.fork_path.clone(),
+            format!("{}/", record.fork_path),
+            live[0].fork_path.clone(),
+        ] {
+            assert!(cx.update(|cx| record_for_fork(&fork, cx)).is_some());
+        }
+        let links = cx.update(|cx| fork_links(cx));
+        assert!(links[0].is_among(&[Path::new(&record.fork_path).to_path_buf()]));
+
+        assert_eq!(
+            normalize_path("/definitely/not/here/"),
+            "/definitely/not/here"
+        );
+        assert_eq!(normalize_path("/"), "/");
+    }
+
+    #[gpui::test]
+    async fn test_snapshot_of_a_repository_without_commits(cx: &mut TestAppContext) {
+        init_test(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().canonicalize().unwrap().join("repo");
+        std::fs::create_dir_all(&repository).unwrap();
+        git(&repository, &["init", "-b", "main"]);
+        std::fs::write(repository.join("a.txt"), "draft\n").unwrap();
+        let project = Project::test(
+            fs::RealFs::new(None, cx.executor()),
+            [repository.as_path()],
+            cx,
+        )
+        .await;
+
+        let mut async_cx = cx.to_async();
+        let sha = snapshot(&project, &repository.to_string_lossy(), &mut async_cx)
+            .await
+            .unwrap();
+        assert_eq!(
+            git(&repository, &["rev-list", "--parents", "-n1", &sha]),
+            sha
+        );
+        assert_eq!(
+            git(&repository, &["show", &format!("{sha}:a.txt")]),
+            "draft"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_snapshot_commits_are_pinned_until_the_fork_is_removed(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fixture = Fixture::new(cx).await;
+        let record = fixture.fork("fork-pinned", cx).await;
+        let fork = Path::new(&record.fork_path).to_path_buf();
+        std::fs::write(fork.join("new.txt"), "made in fork\n").unwrap();
+
+        let mut async_cx = cx.to_async();
+        let (record, _) = merge_into_parent(&fixture.project, record, &mut async_cx)
+            .await
+            .unwrap();
+        let refs = git(
+            &fixture.parent,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/zed/forks",
+            ],
+        );
+        assert_eq!(
+            refs,
+            format!(
+                "{base_ref} {base}\n{merged_ref} {merged}",
+                base_ref = fork_ref(&record.id, "base"),
+                base = record.base_sha,
+                merged_ref = fork_ref(&record.id, "merged"),
+                merged = record.merged_sha.clone().unwrap(),
+            )
+        );
+
+        remove_fork(&fixture.project, &record, &mut async_cx)
+            .await
+            .unwrap();
+        assert_eq!(
+            git(&fixture.parent, &["for-each-ref", "refs/zed/forks"]),
+            ""
+        );
+    }
+
+    #[gpui::test]
+    async fn test_fork_cleanup_is_safe_and_capped(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fixture = Fixture::new(cx).await;
+        let parent_path = fixture.parent_path();
+        let record = fixture.fork("fork-keep", cx).await;
+        let fork = Path::new(&record.fork_path).to_path_buf();
+        let mut async_cx = cx.to_async();
+
+        // A fork with work that was never merged is not removed.
+        std::fs::write(fork.join("b.txt"), "unmerged work\n").unwrap();
+        let error = remove_fork(&fixture.project, &record, &mut async_cx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not merged"), "{error:#}");
+        assert!(fork.exists());
+
+        // Once merged, it is removed along with its record and git's entry.
+        let (record, _) = merge_into_parent(&fixture.project, record, &mut async_cx)
+            .await
+            .unwrap();
+        remove_fork(&fixture.project, &record, &mut async_cx)
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert!(!fork.exists());
+        assert!(
+            cx.update(|cx| records_for_parent(&parent_path, cx))
+                .is_empty()
+        );
+        assert!(!git(&fixture.parent, &["worktree", "list"]).contains("fork-keep"));
+        assert_eq!(
+            git(&fixture.parent, &["for-each-ref", "refs/zed/forks"]),
+            ""
+        );
+
+        // A fork deleted behind Zed's back is forgotten and pruned from git.
+        let gone = fixture.fork("fork-gone", cx).await;
+        std::fs::remove_dir_all(&gone.fork_path).unwrap();
+        let live = live_forks(&fixture.project, &parent_path, &mut async_cx)
+            .await
+            .unwrap();
+        assert!(live.is_empty());
+        assert!(!git(&fixture.parent, &["worktree", "list"]).contains("fork-gone"));
+
+        // Forking stops at the cap.
+        for index in 0..MAX_LIVE_FORKS {
+            fixture.fork(&format!("fork-{index}"), cx).await;
+        }
+        let error = ensure_room_for_fork(&fixture.project, &parent_path, &mut async_cx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already has"), "{error:#}");
+    }
+
+    #[gpui::test]
+    async fn test_worktree_without_a_record_is_found_by_its_snapshot(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fixture = Fixture::new(cx).await;
+        let parent_path = fixture.parent_path();
+        let mut async_cx = cx.to_async();
+        let base_sha = snapshot(&fixture.project, &parent_path, &mut async_cx)
+            .await
+            .unwrap();
+        let fork = fixture.parent.parent().unwrap().join("fork-orphan");
+        git(
+            &fixture.parent,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                fork.to_str().unwrap(),
+                &base_sha,
+            ],
+        );
+
+        let found =
+            unrecorded_worktree_at(&fixture.project, &parent_path, &base_sha, &mut async_cx)
+                .await
+                .unwrap();
+        assert_eq!(found, Some(fork.to_string_lossy().to_string()));
+
+        let record = ForkRecord {
+            id: new_fork_id(),
+            fork_path: fork.to_string_lossy().to_string(),
+            parent_path: parent_path.clone(),
+            base_sha: base_sha.clone(),
+            merged_sha: None,
+            kind: ForkKind::Fork,
+            parent_title: None,
+            verdict: None,
+            parent_thread_id: None,
+        };
+        cx.update(|cx| upsert_record(record, cx));
+        let found =
+            unrecorded_worktree_at(&fixture.project, &parent_path, &base_sha, &mut async_cx)
+                .await
+                .unwrap();
+        assert_eq!(found, None);
+    }
+
+    #[gpui::test]
+    async fn test_forks_being_created_count_towards_the_cap(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fixture = Fixture::new(cx).await;
+        let parent_path = fixture.parent_path();
+        let mut async_cx = cx.to_async();
+
+        // None of these has a record yet, as when forks are started quickly.
+        for _ in 0..MAX_LIVE_FORKS {
+            ensure_room_for_fork(&fixture.project, &parent_path, &mut async_cx)
+                .await
+                .unwrap();
+        }
+        let error = ensure_room_for_fork(&fixture.project, &parent_path, &mut async_cx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already has"), "{error:#}");
+
+        cx.update(|cx| release_fork_place(&parent_path, cx));
+        ensure_room_for_fork(&fixture.project, &parent_path, &mut async_cx)
+            .await
+            .unwrap();
+        // Failed attempts reserved nothing: releasing everything empties it.
+        for _ in 0..MAX_LIVE_FORKS {
+            cx.update(|cx| release_fork_place(&parent_path, cx));
+        }
+        assert!(cx.update(|cx| cx.default_global::<ForksBeingCreated>().0.is_empty()));
+    }
+}

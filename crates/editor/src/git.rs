@@ -177,6 +177,120 @@ pub(super) struct StoredReviewComment {
     pub(super) range: Range<Anchor>,
     /// Whether this comment is currently being edited inline.
     pub(super) is_editing: bool,
+    /// The agent's answer to this comment, once sent.
+    pub(super) agent_reply: AgentReply,
+    /// The code this comment was written on has changed since (found when
+    /// restoring it after a restart).
+    pub(super) outdated: bool,
+}
+
+/// The text of the marker shown where comments are hidden.
+pub(super) fn hidden_review_comment_marker_label(count: usize, answered: usize) -> SharedString {
+    let comments = match count {
+        1 => "1 comment".to_string(),
+        count => format!("{count} comments"),
+    };
+    let state = if answered == count {
+        "answered"
+    } else if answered == 0 {
+        "not answered yet"
+    } else {
+        "partly answered"
+    };
+    format!("{comments}, {state}").into()
+}
+
+/// Marks the rows of commented code while the review boxes are hidden.
+enum HiddenReviewComments {}
+
+/// A review comment as saved between sessions.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SavedReviewComment {
+    /// Path of the file, relative to its worktree.
+    pub file_path: String,
+    /// Rows of the commented lines in the file, both inclusive.
+    pub start_row: u32,
+    pub end_row: u32,
+    /// The commented lines, for finding them again after the file changed.
+    pub code: String,
+    pub comment: String,
+    /// The agent's answer, if it gave one.
+    pub answer: Option<String>,
+    #[serde(default)]
+    pub outdated: bool,
+}
+
+fn lines_text(buffer: &language::BufferSnapshot, start_row: u32, end_row: u32) -> String {
+    let end_row = end_row.min(buffer.max_point().row);
+    let start = Point::new(start_row.min(end_row), 0);
+    let end = Point::new(end_row, buffer.line_len(end_row));
+    buffer.text_for_range(start..end).collect()
+}
+
+/// Where a saved comment belongs in the file now: its rows, and whether the
+/// commented code is gone (the comment is outdated).
+fn locate_saved_comment(
+    saved: &SavedReviewComment,
+    buffer: &language::BufferSnapshot,
+) -> (u32, u32, bool) {
+    let max_row = buffer.max_point().row;
+    let line_count = saved.end_row.saturating_sub(saved.start_row);
+    if saved.end_row <= max_row && lines_text(buffer, saved.start_row, saved.end_row) == saved.code
+    {
+        return (saved.start_row, saved.end_row, false);
+    }
+    // The lines moved: take the occurrence nearest to where they were.
+    let moved = (0..=max_row.saturating_sub(line_count))
+        .filter(|row| lines_text(buffer, *row, row + line_count) == saved.code)
+        .min_by_key(|row| row.abs_diff(saved.start_row));
+    if let Some(row) = moved {
+        return (row, row + line_count, false);
+    }
+    let start_row = saved.start_row.min(max_row);
+    (start_row, (start_row + line_count).min(max_row), true)
+}
+
+/// Answers longer than this scroll inside their comment.
+const MAX_AGENT_REPLY_LINES: u32 = 14;
+
+/// Lines an agent reply takes under its comment (an estimate: the review box
+/// height is set in editor lines before the text is laid out).
+fn agent_reply_height(reply: &AgentReply) -> u32 {
+    const CHARS_PER_LINE: usize = 90;
+    match reply {
+        AgentReply::NotSent => 0,
+        AgentReply::Waiting | AgentReply::Failed(_) => 1,
+        AgentReply::Answered(text) => {
+            let lines: usize = text
+                .lines()
+                .map(|line| line.chars().count().div_ceil(CHARS_PER_LINE).max(1))
+                .sum();
+            // One more line for the reply's header and padding.
+            (lines as u32).clamp(1, MAX_AGENT_REPLY_LINES) + 1
+        }
+    }
+}
+
+/// The reason shown, muted and without a "Not answered" prefix, when a review
+/// comment could not be sent because the agent was in the middle of a turn.
+pub const AGENT_BUSY_MESSAGE: &str = "Agent is busy; press Send again when it's done.";
+
+/// Where a review comment is in its exchange with the agent thread.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum AgentReply {
+    #[default]
+    NotSent,
+    Waiting,
+    Answered(String),
+    /// Not answered (the send failed or the agent skipped it); sent again
+    /// with the next review.
+    Failed(String),
+}
+
+impl AgentReply {
+    fn needs_sending(&self) -> bool {
+        matches!(self, Self::NotSent | Self::Failed(_))
+    }
 }
 
 /// Represents an active diff review overlay that appears when clicking the "Add Review" button.
@@ -214,6 +328,37 @@ impl DiffReviewDragState {
     }
 }
 
+/// A review comment taken out of an editor for sending to an agent thread.
+pub struct ReviewCommentForAgent {
+    /// The stored comment's ID, for matching the agent's answer to it.
+    pub id: usize,
+    /// The file path (relative to worktree) of the hunk the comment was left on.
+    pub file_path: Arc<util::rel_path::RelPath>,
+    pub code: ReviewCommentCode,
+    pub comment: String,
+    /// Earlier comments on the same lines with the agent's answers, oldest
+    /// first: this comment is a reply in that exchange.
+    pub earlier_exchange: Vec<(String, String)>,
+}
+
+/// The code a review comment was left on.
+pub enum ReviewCommentCode {
+    /// Lines that exist in the current file.
+    Buffer {
+        buffer: Entity<Buffer>,
+        range: Range<text::Anchor>,
+    },
+    /// Lines that include removed code, which only the diff shows. Removed
+    /// lines are prefixed with `-`, the others with a space.
+    Diff {
+        text: String,
+        /// 1-based row of the first line: in the old file when the range
+        /// starts on a removed line, else in the current file.
+        row: u32,
+        starts_on_removed_line: bool,
+    },
+}
+
 impl StoredReviewComment {
     fn new(id: usize, comment: String, anchor_range: Range<Anchor>) -> Self {
         Self {
@@ -221,6 +366,8 @@ impl StoredReviewComment {
             comment,
             range: anchor_range,
             is_editing: false,
+            agent_reply: AgentReply::NotSent,
+            outdated: false,
         }
     }
 }
@@ -484,7 +631,7 @@ impl Editor {
     }
 
     pub fn git_restore(&mut self, _: &Restore, window: &mut Window, cx: &mut Context<Self>) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         let selections = self
@@ -560,6 +707,425 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_diff_review_overlay(display_range, true, window, cx);
+    }
+
+    /// Diff views take review comments, and so does a plain editor on a
+    /// project file. Other editors (a review box's own input, pickers) do
+    /// not.
+    fn can_host_review_comments(&self, cx: &App) -> bool {
+        self.show_diff_review_button
+            || (self.mode.is_full()
+                && self.project.is_some()
+                && self
+                    .buffer
+                    .read(cx)
+                    .as_singleton()
+                    .is_some_and(|buffer| buffer.read(cx).file().is_some()))
+    }
+
+    /// Whether typing on code starts a review comment instead of editing.
+    pub fn comment_mode(&self) -> bool {
+        self.comment_mode
+    }
+
+    /// In comment mode the editor does not edit its buffers: typed text opens
+    /// a review comment on the selected lines instead.
+    pub fn set_comment_mode(&mut self, comment_mode: bool, cx: &mut Context<Self>) {
+        if self.comment_mode != comment_mode {
+            self.comment_mode = comment_mode;
+            cx.emit(EditorEvent::CommentModeChanged);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn toggle_comment_mode(
+        &mut self,
+        _: &ToggleCommentMode,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A review box's own input is an editor too: let its diff handle this.
+        if !self.can_host_review_comments(cx) {
+            cx.propagate();
+            return;
+        }
+        self.show_diff_review_button = true;
+        self.set_comment_mode(!self.comment_mode, cx);
+    }
+
+    pub(super) fn comment_on_selection(
+        &mut self,
+        _: &CommentOnSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_host_review_comments(cx) {
+            cx.propagate();
+            return;
+        }
+        self.show_diff_review_button = true;
+        self.start_review_comment(None, window, cx);
+    }
+
+    pub(super) fn toggle_review_comments_hidden(
+        &mut self,
+        _: &ToggleReviewCommentsHidden,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.show_diff_review_button {
+            cx.propagate();
+            return;
+        }
+        if self.review_comments_hidden && self.reopen_hidden_comment_at_cursor(window, cx) {
+            return;
+        }
+        self.set_review_comments_hidden(!self.review_comments_hidden, window, cx);
+    }
+
+    /// While comments are hidden: opens the box of the comment whose marked
+    /// lines hold the cursor, leaving the others hidden. Returns whether it
+    /// opened one.
+    fn reopen_hidden_comment_at_cursor(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let snapshot = self.snapshot(window, cx);
+        let cursor_row = self
+            .selections
+            .newest::<Point>(&snapshot.display_snapshot)
+            .head()
+            .row;
+        let buffer_snapshot = snapshot.buffer_snapshot();
+        let range = self
+            .stored_review_comments
+            .iter()
+            .flat_map(|(_, comments)| comments.iter().map(|comment| comment.range.clone()))
+            .find(|range| {
+                (range.start.to_point(buffer_snapshot).row
+                    ..=range.end.to_point(buffer_snapshot).row)
+                    .contains(&cursor_row)
+            });
+        let Some(range) = range else {
+            return false;
+        };
+        // The marker covers every comment of that place, not just this one.
+        let range = self
+            .hidden_review_comment_markers
+            .iter()
+            .map(|(_, marker_range, _)| marker_range.clone())
+            .find(|marker_range| {
+                (marker_range.start.to_point(buffer_snapshot).row
+                    ..=marker_range.end.to_point(buffer_snapshot).row)
+                    .contains(&cursor_row)
+            })
+            .unwrap_or(range);
+        self.open_hidden_review_comments(&range, window, cx)
+    }
+
+    pub fn review_comments_hidden(&self) -> bool {
+        self.review_comments_hidden
+    }
+
+    /// How many places show a clickable marker while the boxes are hidden,
+    /// with the range of each.
+    pub fn hidden_review_comment_marker_ranges(&self) -> Vec<Range<Anchor>> {
+        self.hidden_review_comment_markers
+            .iter()
+            .map(|(_, range, _)| range.clone())
+            .collect()
+    }
+
+    /// The text of each marker shown while the boxes are hidden.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hidden_review_comment_marker_labels(&self) -> Vec<SharedString> {
+        self.hidden_review_comment_markers
+            .iter()
+            .map(|(_, _, label)| label.clone())
+            .collect()
+    }
+
+    /// How many commented ranges carry a marker while the boxes are hidden.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hidden_review_comment_marker_count(&self, cx: &App) -> usize {
+        self.highlighted_rows::<HiddenReviewComments>(cx).count()
+    }
+
+    /// Hides the review boxes, leaving a highlight on each commented range
+    /// as a marker, or opens a box for every range with comments again. A
+    /// box holding text that was not sent yet stays open when hiding.
+    pub fn set_review_comments_hidden(
+        &mut self,
+        hidden: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.review_comments_hidden = hidden;
+        self.clear_row_highlights::<HiddenReviewComments>();
+        let marker_blocks: HashSet<CustomBlockId> = self
+            .hidden_review_comment_markers
+            .drain(..)
+            .map(|(block_id, _, _)| block_id)
+            .collect();
+        if !marker_blocks.is_empty() {
+            self.remove_blocks(marker_blocks, None, cx);
+        }
+        let ranges: Vec<Range<Anchor>> = self
+            .stored_review_comments
+            .iter()
+            .flat_map(|(_, comments)| comments.iter().map(|comment| comment.range.clone()))
+            .collect();
+        if hidden {
+            self.dismiss_diff_review_overlays_without_unsent_text(cx);
+            self.refresh_hidden_review_comment_markers(cx);
+        } else {
+            for range in ranges {
+                let snapshot = self.snapshot(window, cx);
+                let rows = range
+                    .start
+                    .to_display_point(&snapshot.display_snapshot)
+                    .row()
+                    ..range.end.to_display_point(&snapshot.display_snapshot).row();
+                self.open_diff_review_overlay(rows, false, window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// While comments are hidden: puts the markers and highlights back to
+    /// match the current comments. Places whose box is open have none.
+    fn refresh_hidden_review_comment_markers(&mut self, cx: &mut Context<Self>) {
+        if !self.review_comments_hidden {
+            return;
+        }
+        self.clear_row_highlights::<HiddenReviewComments>();
+        let marker_blocks: HashSet<CustomBlockId> = self
+            .hidden_review_comment_markers
+            .drain(..)
+            .map(|(block_id, _, _)| block_id)
+            .collect();
+        if !marker_blocks.is_empty() {
+            self.remove_blocks(marker_blocks, None, cx);
+        }
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let ranges: Vec<Range<Anchor>> = self
+            .stored_review_comments
+            .iter()
+            .filter(|(hunk_key, _)| !self.has_open_review_box(hunk_key, &snapshot))
+            .flat_map(|(_, comments)| comments.iter().map(|comment| comment.range.clone()))
+            .collect();
+        for range in ranges {
+            self.highlight_rows::<HiddenReviewComments>(
+                range,
+                |cx| {
+                    cx.theme()
+                        .colors()
+                        .editor_document_highlight_read_background
+                },
+                RowHighlightOptions::default(),
+                cx,
+            );
+        }
+        self.insert_hidden_review_comment_markers(cx);
+        cx.notify();
+    }
+
+    fn has_open_review_box(&self, hunk_key: &DiffHunkKey, snapshot: &MultiBufferSnapshot) -> bool {
+        self.diff_review_overlays
+            .iter()
+            .any(|overlay| Self::hunk_keys_match(&overlay.hunk_key, hunk_key, snapshot))
+    }
+
+    /// Puts a one-line marker under each place that has comments: how many,
+    /// and whether the agent answered. Clicking one opens its comments.
+    fn insert_hidden_review_comment_markers(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let editor = cx.entity().downgrade();
+        let mut blocks = Vec::new();
+        let mut ranges = Vec::new();
+        let mut labels = Vec::new();
+        for (index, (hunk_key, comments)) in self.stored_review_comments.iter().enumerate() {
+            if self.has_open_review_box(hunk_key, &snapshot) {
+                continue;
+            }
+            let Some(start) = comments
+                .iter()
+                .map(|comment| comment.range.start)
+                .min_by(|left, right| left.cmp(right, &snapshot))
+            else {
+                continue;
+            };
+            let Some(end) = comments
+                .iter()
+                .map(|comment| comment.range.end)
+                .max_by(|left, right| left.cmp(right, &snapshot))
+            else {
+                continue;
+            };
+            let count = comments.len();
+            let answered = comments
+                .iter()
+                .filter(|comment| matches!(comment.agent_reply, AgentReply::Answered(_)))
+                .count();
+            let label = hidden_review_comment_marker_label(count, answered);
+            let range = start..end;
+            labels.push(label.clone());
+            blocks.push(BlockProperties {
+                style: BlockStyle::Sticky,
+                placement: BlockPlacement::Below(end),
+                height: Some(1),
+                render: Arc::new({
+                    let editor = editor.clone();
+                    let range = range.clone();
+                    move |_cx| {
+                        let editor = editor.clone();
+                        let range = range.clone();
+                        h_flex()
+                            .id(("hidden-review-comments", index))
+                            .px_2()
+                            .gap_1()
+                            .cursor_pointer()
+                            .child(
+                                Icon::new(IconName::Chat)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(label.clone())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .on_click(move |_, window, cx| {
+                                editor
+                                    .update(cx, |editor, cx| {
+                                        editor.open_hidden_review_comments(&range, window, cx);
+                                    })
+                                    .ok();
+                            })
+                            .into_any_element()
+                    }
+                }),
+                priority: 0,
+            });
+            ranges.push(range);
+        }
+        let block_ids = self.insert_blocks(blocks, None, cx);
+        self.hidden_review_comment_markers = block_ids
+            .into_iter()
+            .zip(ranges)
+            .zip(labels)
+            .map(|((block_id, range), label)| (block_id, range, label))
+            .collect();
+    }
+
+    /// While comments are hidden: opens the box of the comments in `range`
+    /// and removes that place's marker and highlights, leaving the other
+    /// places hidden. Returns whether a box was opened.
+    pub fn open_hidden_review_comments(
+        &mut self,
+        range: &Range<Anchor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let snapshot = self.snapshot(window, cx);
+        let open_boxes = self.diff_review_overlays.len();
+        let rows = range
+            .start
+            .to_display_point(&snapshot.display_snapshot)
+            .row()..range.end.to_display_point(&snapshot.display_snapshot).row();
+        self.open_diff_review_overlay(rows, false, window, cx);
+        if self.diff_review_overlays.len() == open_boxes {
+            // Its box is already open.
+            return false;
+        }
+        let buffer_snapshot = snapshot.buffer_snapshot();
+        let covered = range.start.to_point(buffer_snapshot)..=range.end.to_point(buffer_snapshot);
+        let mut marker_blocks = HashSet::default();
+        self.hidden_review_comment_markers
+            .retain(|(block_id, marker_range, _)| {
+                let inside = covered.contains(&marker_range.start.to_point(buffer_snapshot));
+                if inside {
+                    marker_blocks.insert(*block_id);
+                }
+                !inside
+            });
+        if !marker_blocks.is_empty() {
+            self.remove_blocks(marker_blocks, None, cx);
+        }
+        let highlighted: Vec<Range<Anchor>> = self
+            .stored_review_comments
+            .iter()
+            .flat_map(|(_, comments)| comments.iter().map(|comment| comment.range.clone()))
+            .filter(|comment_range| {
+                covered.contains(&comment_range.start.to_point(buffer_snapshot))
+            })
+            .collect();
+        self.remove_highlighted_rows::<HiddenReviewComments>(highlighted, cx);
+        cx.notify();
+        true
+    }
+
+    /// Opens a review comment on the lines of the newest selection, with
+    /// `text` (what the user typed in comment mode) already in it.
+    pub fn start_review_comment(
+        &mut self,
+        text: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.show_diff_review_button {
+            return;
+        }
+        if self.review_comments_hidden {
+            self.set_review_comments_hidden(false, window, cx);
+        }
+        let snapshot = self.snapshot(window, cx);
+        let selection = self.selections.newest::<Point>(&snapshot.display_snapshot);
+        let mut end = selection.end;
+        // A selection that ends at the start of a line does not include that line.
+        if end.column == 0 && end.row > selection.start.row {
+            end = Point::new(end.row - 1, 0);
+        }
+        let start_row = selection
+            .start
+            .to_display_point(&snapshot.display_snapshot)
+            .row();
+        let end_row = end.to_display_point(&snapshot.display_snapshot).row();
+        let Some(prompt_editor) =
+            self.open_diff_review_overlay(start_row..end_row, true, window, cx)
+        else {
+            return;
+        };
+        if let Some(text) = text {
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.move_to_end(&crate::actions::MoveToEnd, window, cx);
+                prompt_editor.insert(text, window, cx);
+            });
+        }
+    }
+
+    /// Opens (or focuses) the review box for the given rows and returns its
+    /// input editor.
+    pub(super) fn open_diff_review_overlay(
+        &mut self,
+        display_range: Range<DisplayRow>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<Editor>> {
+        self.open_diff_review_overlay_with_range(display_range, focus, window, cx)
+            .map(|(prompt_editor, _)| prompt_editor)
+    }
+
+    /// The key and anchors of a review comment on the given rows.
+    fn review_hunk_key_and_range(
+        &self,
+        display_range: Range<DisplayRow>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (DiffHunkKey, Range<Anchor>) {
         let Range { start, end } = display_range.sorted();
 
         let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
@@ -582,29 +1148,58 @@ impl Editor {
         let anchor_range =
             buffer_snapshot.anchor_after(start_point)..buffer_snapshot.anchor_before(line_end);
 
-        // Compute the hunk key for this display row
+        let hunk_start_anchor = buffer_snapshot.anchor_before(start_point);
+        // `file_at` finds no file on the very first row of a multibuffer, so
+        // the file comes from the buffer that holds the start anchor.
         let file_path = buffer_snapshot
-            .file_at(start_point)
+            .anchor_to_buffer_anchor(hunk_start_anchor)
+            .and_then(|(_, buffer)| buffer.file())
+            .or_else(|| buffer_snapshot.file_at(start_point))
             .map(|file: &Arc<dyn language::File>| file.path().clone())
             .unwrap_or_else(|| Arc::from(util::rel_path::RelPath::empty()));
-        let hunk_start_anchor = buffer_snapshot.anchor_before(start_point);
-        let new_hunk_key = DiffHunkKey {
+        let hunk_key = DiffHunkKey {
             file_path,
             hunk_start_anchor,
         };
+        (hunk_key, anchor_range)
+    }
+
+    /// Like `open_diff_review_overlay`, also returning the anchors of the
+    /// requested rows. An existing box for the same start row is reused, so
+    /// this range can differ from the one the box was first opened for.
+    fn open_diff_review_overlay_with_range(
+        &mut self,
+        display_range: Range<DisplayRow>,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(Entity<Editor>, Range<Anchor>)> {
+        let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        let (new_hunk_key, anchor_range) =
+            self.review_hunk_key_and_range(display_range, window, cx);
 
         // Check if we already have an overlay for this hunk
-        if let Some(existing_overlay) = self.diff_review_overlays.iter().find(|overlay| {
+        if let Some(existing_overlay) = self.diff_review_overlays.iter_mut().find(|overlay| {
             Self::hunk_keys_match(&overlay.hunk_key, &new_hunk_key, &buffer_snapshot)
         }) {
             // Just focus the existing overlay's prompt editor
-            let focus_handle = existing_overlay.prompt_editor.focus_handle(cx);
-            window.focus(&focus_handle, cx);
-            return;
+            let prompt_editor = existing_overlay.prompt_editor.clone();
+            if focus {
+                // A comment submitted now belongs to the rows it was started for.
+                existing_overlay.anchor_range = anchor_range.clone();
+                let focus_handle = prompt_editor.focus_handle(cx);
+                window.focus(&focus_handle, cx);
+                cx.emit(EditorEvent::ReviewCommentBoxOpened);
+            }
+            return Some((prompt_editor, anchor_range));
         }
 
-        // Dismiss overlays that have no comments for their hunks
-        self.dismiss_overlays_without_comments(cx);
+        // Dismiss overlays that have no comments for their hunks. Restoring
+        // saved comments opens each box before adding its comments, so those
+        // boxes must survive until then.
+        if focus {
+            self.dismiss_overlays_without_comments(cx);
+        }
 
         // Get the current user's avatar URI from the project's user_store
         let user_avatar_uri = self.project.as_ref().and_then(|project| {
@@ -615,10 +1210,8 @@ impl Editor {
                 .map(|user| user.avatar_uri.clone())
         });
 
-        // Create anchor at the end of the last row so the block appears immediately below it
-        // Use multibuffer coordinates for anchor creation
-        let line_len = buffer_snapshot.line_len(end_multi_buffer_row);
-        let anchor = buffer_snapshot.anchor_after(Point::new(end_multi_buffer_row.0, line_len));
+        // The block goes right below the last row of the range.
+        let anchor = buffer_snapshot.anchor_after(anchor_range.end.to_point(&buffer_snapshot));
 
         // Use the hunk key we already computed
         let hunk_key = new_hunk_key;
@@ -626,14 +1219,23 @@ impl Editor {
         // Create the prompt editor for the review input
         let prompt_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Add a review comment...", window, cx);
+            let send_key = if cfg!(target_os = "macos") {
+                "Cmd+Enter"
+            } else {
+                "Ctrl+Enter"
+            };
+            editor.set_placeholder_text(
+                &format!("Comment… Enter adds, {send_key} sends all to the agent"),
+                window,
+                cx,
+            );
             editor
         });
 
         // Register the Newline action on the prompt editor to submit the review
         let parent_editor = cx.entity().downgrade();
         let subscription = prompt_editor.update(cx, |prompt_editor, _cx| {
-            prompt_editor.register_action({
+            let store = prompt_editor.register_action({
                 let parent_editor = parent_editor.clone();
                 move |_: &crate::actions::Newline, window, cx| {
                     if let Some(editor) = parent_editor.upgrade() {
@@ -642,7 +1244,19 @@ impl Editor {
                         });
                     }
                 }
-            })
+            });
+            let send_now = prompt_editor.register_action({
+                let parent_editor = parent_editor.clone();
+                move |_: &SendDiffReviewCommentNow, window, cx| {
+                    if let Some(editor) = parent_editor.upgrade() {
+                        editor.update(cx, |editor, cx| {
+                            editor.submit_diff_review_comment(window, cx);
+                        });
+                        window.dispatch_action(Box::new(SendReviewToAgent), cx);
+                    }
+                }
+            });
+            Subscription::join(store, send_now)
         });
 
         // Calculate initial height based on existing comments for this hunk
@@ -670,11 +1284,11 @@ impl Editor {
         let block_ids = self.insert_blocks([block], None, cx);
         let Some(block_id) = block_ids.into_iter().next() else {
             log::error!("Failed to insert diff review overlay block");
-            return;
+            return None;
         };
 
         self.diff_review_overlays.push(DiffReviewOverlay {
-            anchor_range,
+            anchor_range: anchor_range.clone(),
             block_id,
             prompt_editor: prompt_editor.clone(),
             hunk_key,
@@ -685,11 +1299,135 @@ impl Editor {
             _subscription: subscription,
         });
 
-        // Focus the prompt editor
-        let focus_handle = prompt_editor.focus_handle(cx);
-        window.focus(&focus_handle, cx);
+        if focus {
+            let focus_handle = prompt_editor.focus_handle(cx);
+            window.focus(&focus_handle, cx);
+            cx.emit(EditorEvent::ReviewCommentBoxOpened);
+        }
 
         cx.notify();
+        Some((prompt_editor, anchor_range))
+    }
+
+    /// The review comments in a form that survives a restart: located by file
+    /// and lines rather than by anchors. Comments on removed lines, which
+    /// exist only in the diff, are left out.
+    pub fn saved_review_comments(&self, cx: &App) -> Vec<SavedReviewComment> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let mut saved = Vec::new();
+        for (hunk_key, comments) in &self.stored_review_comments {
+            for comment in comments {
+                let Some((buffer, range)) =
+                    snapshot.anchor_range_to_buffer_anchor_range(comment.range.clone())
+                else {
+                    continue;
+                };
+                let start_row = range.start.to_point(buffer).row;
+                let end_row = range.end.to_point(buffer).row;
+                saved.push(SavedReviewComment {
+                    file_path: hunk_key.file_path.as_unix_str().to_string(),
+                    start_row,
+                    end_row,
+                    code: lines_text(buffer, start_row, end_row),
+                    comment: comment.comment.clone(),
+                    answer: match &comment.agent_reply {
+                        AgentReply::Answered(answer) => Some(answer.clone()),
+                        AgentReply::NotSent | AgentReply::Waiting | AgentReply::Failed(_) => None,
+                    },
+                    outdated: comment.outdated,
+                });
+            }
+        }
+        saved
+    }
+
+    /// Puts saved comments back on their lines, in open review boxes. A
+    /// comment whose lines moved follows them; one whose lines changed stays
+    /// at its old position, marked outdated. Returns the comments whose file
+    /// is not in this editor.
+    pub fn restore_review_comments(
+        &mut self,
+        saved: Vec<SavedReviewComment>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<SavedReviewComment> {
+        let mut unplaced = Vec::new();
+        for mut saved_comment in saved {
+            let multibuffer = self.buffer.read(cx);
+            let buffer = multibuffer.all_buffers_iter().find(|buffer| {
+                buffer.read(cx).file().is_some_and(|file| {
+                    file.path().as_unix_str() == saved_comment.file_path.as_str()
+                })
+            });
+            let Some(buffer) = buffer else {
+                unplaced.push(saved_comment);
+                continue;
+            };
+            let buffer_snapshot = buffer.read(cx).snapshot();
+            let (start_row, end_row, outdated) =
+                locate_saved_comment(&saved_comment, &buffer_snapshot);
+            // `buffer_point_to_anchor` moves a point outside the excerpts to
+            // the nearest excerpt edge, which would put the comment on the
+            // wrong line.
+            let is_shown = multibuffer
+                .snapshot(cx)
+                .excerpts_for_buffer(buffer_snapshot.remote_id())
+                .any(|excerpt| {
+                    excerpt.context.start.to_point(&buffer_snapshot).row <= start_row
+                        && end_row <= excerpt.context.end.to_point(&buffer_snapshot).row
+                });
+            if !is_shown {
+                unplaced.push(saved_comment);
+                continue;
+            }
+            let anchors = multibuffer
+                .buffer_point_to_anchor(&buffer, Point::new(start_row, 0), cx)
+                .zip(multibuffer.buffer_point_to_anchor(&buffer, Point::new(end_row, 0), cx));
+            let Some((start, end)) = anchors else {
+                unplaced.push(saved_comment);
+                continue;
+            };
+            let snapshot = self.snapshot(window, cx);
+            let rows = start.to_display_point(&snapshot.display_snapshot).row()
+                ..end.to_display_point(&snapshot.display_snapshot).row();
+            let (hunk_key, anchor_range) = if self.review_comments_hidden {
+                self.review_hunk_key_and_range(rows, window, cx)
+            } else {
+                let Some((prompt_editor, anchor_range)) =
+                    self.open_diff_review_overlay_with_range(rows, false, window, cx)
+                else {
+                    unplaced.push(saved_comment);
+                    continue;
+                };
+                let Some(hunk_key) = self
+                    .diff_review_overlays
+                    .iter()
+                    .find(|overlay| overlay.prompt_editor == prompt_editor)
+                    .map(|overlay| overlay.hunk_key.clone())
+                else {
+                    unplaced.push(saved_comment);
+                    continue;
+                };
+                (hunk_key, anchor_range)
+            };
+            let id =
+                self.add_review_comment(hunk_key.clone(), saved_comment.comment, anchor_range, cx);
+            for (_, comments) in &mut self.stored_review_comments {
+                if let Some(comment) = comments.iter_mut().find(|comment| comment.id == id) {
+                    comment.outdated = outdated || saved_comment.outdated;
+                    if let Some(answer) = saved_comment.answer.take() {
+                        comment.agent_reply = AgentReply::Answered(answer);
+                    }
+                }
+            }
+            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        }
+        self.refresh_hidden_review_comment_markers(cx);
+        cx.emit(EditorEvent::ReviewCommentsChanged {
+            total_count: self.unsent_review_comment_count(),
+        });
+        cx.notify();
+        unplaced
     }
 
     /// Stores the diff review comment locally.
@@ -746,11 +1484,21 @@ impl Editor {
     }
 
     /// Returns the total count of stored review comments across all hunks.
-    pub(super) fn total_review_comment_count(&self) -> usize {
+    pub fn total_review_comment_count(&self) -> usize {
         self.stored_review_comments
             .iter()
             .map(|(_, v)| v.len())
             .sum()
+    }
+
+    /// Comments that the next "Send Review to Agent" would send: new ones,
+    /// edited ones and ones the agent did not answer.
+    pub fn unsent_review_comment_count(&self) -> usize {
+        self.stored_review_comments
+            .iter()
+            .flat_map(|(_, comments)| comments)
+            .filter(|comment| comment.agent_reply.needs_sending())
+            .count()
     }
 
     /// Adds a new review comment to a specific hunk.
@@ -781,7 +1529,7 @@ impl Editor {
         }
 
         cx.emit(EditorEvent::ReviewCommentsChanged {
-            total_count: self.total_review_comment_count(),
+            total_count: self.unsent_review_comment_count(),
         });
         cx.notify();
         id
@@ -860,7 +1608,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         let mut buffer_ids = HashSet::default();
@@ -889,7 +1637,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         let selections = self
@@ -1107,6 +1855,24 @@ impl Editor {
         cx.notify();
     }
 
+    /// Dismisses the diff review overlays whose input is empty.
+    fn dismiss_diff_review_overlays_without_unsent_text(&mut self, cx: &mut Context<Self>) {
+        let mut block_ids = HashSet::default();
+        let mut kept = Vec::new();
+        for overlay in self.diff_review_overlays.drain(..) {
+            if overlay.prompt_editor.read(cx).text(cx).trim().is_empty() {
+                block_ids.insert(overlay.block_id);
+            } else {
+                kept.push(overlay);
+            }
+        }
+        self.diff_review_overlays = kept;
+        if !block_ids.is_empty() {
+            self.remove_blocks(block_ids, None, cx);
+            cx.notify();
+        }
+    }
+
     /// Dismisses all diff review overlays.
     pub(super) fn dismiss_all_diff_review_overlays(&mut self, cx: &mut Context<Self>) {
         if self.diff_review_overlays.is_empty() {
@@ -1168,8 +1934,9 @@ impl Editor {
         for (_, comments) in self.stored_review_comments.iter_mut() {
             if let Some(index) = comments.iter().position(|c| c.id == id) {
                 comments.remove(index);
+                self.refresh_hidden_review_comment_markers(cx);
                 cx.emit(EditorEvent::ReviewCommentsChanged {
-                    total_count: self.total_review_comment_count(),
+                    total_count: self.unsent_review_comment_count(),
                 });
                 cx.notify();
                 return true;
@@ -1189,8 +1956,9 @@ impl Editor {
             if let Some(comment) = comments.iter_mut().find(|c| c.id == id) {
                 comment.comment = new_comment;
                 comment.is_editing = false;
+                comment.agent_reply = AgentReply::NotSent;
                 cx.emit(EditorEvent::ReviewCommentsChanged {
-                    total_count: self.total_review_comment_count(),
+                    total_count: self.unsent_review_comment_count(),
                 });
                 cx.notify();
                 return true;
@@ -1222,7 +1990,7 @@ impl Editor {
     /// from accumulating.
     pub(super) fn cleanup_orphaned_review_comments(&mut self, cx: &mut Context<Self>) {
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let original_count = self.total_review_comment_count();
+        let original_count = self.unsent_review_comment_count();
 
         // Remove comments with invalid hunk anchors
         self.stored_review_comments
@@ -1239,8 +2007,9 @@ impl Editor {
         self.stored_review_comments
             .retain(|(_, comments)| !comments.is_empty());
 
-        let new_count = self.total_review_comment_count();
+        let new_count = self.unsent_review_comment_count();
         if new_count != original_count {
+            self.refresh_hidden_review_comment_markers(cx);
             cx.emit(EditorEvent::ReviewCommentsChanged {
                 total_count: new_count,
             });
@@ -1758,7 +2527,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         let mut restorable_hunks = Vec::new();
@@ -1834,7 +2603,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
 
@@ -1866,7 +2635,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only(cx) {
+        if self.blocks_user_edits(cx) {
             return;
         }
         let snapshot = self.snapshot(window, cx);
@@ -2075,8 +2844,14 @@ impl Editor {
         if comment_count == 0 {
             base_height
         } else if comments_expanded {
-            // Header (1 line) + 2 lines per comment
-            base_height + 1 + (comment_count as u32 * 2)
+            // Header (1 line) + 2 lines per comment, plus room for the agent's
+            // answer under each one.
+            let reply_lines: u32 = self
+                .comments_for_hunk(hunk_key, snapshot)
+                .iter()
+                .map(|comment| agent_reply_height(&comment.agent_reply))
+                .sum();
+            base_height + 1 + (comment_count as u32 * 2) + reply_lines
         } else {
             // Just header when collapsed
             base_height + 1
@@ -2577,6 +3352,7 @@ impl Editor {
 
         v_flex()
             .w_full()
+            .key_context("ReviewComment")
             .bg(colors.editor_background)
             .border_b_1()
             .border_color(colors.border)
@@ -2597,7 +3373,19 @@ impl Editor {
                     el
                 }
             })
-            // Top row: editable input with user's avatar
+            // Expandable comments section (only shown when there are comments)
+            .when(comment_count > 0, |el| {
+                el.child(Self::render_comments_section(
+                    comments,
+                    comments_expanded,
+                    inline_editors,
+                    user_avatar_uri.clone(),
+                    avatar_size,
+                    action_icon_size,
+                    colors,
+                ))
+            })
+            // Input row, below the comments and their answers
             .child(
                 h_flex()
                     .w_full()
@@ -2653,7 +3441,17 @@ impl Editor {
                                 IconButton::new("diff-review-add", IconName::Return)
                                     .icon_color(ui::Color::Muted)
                                     .icon_size(action_icon_size)
-                                    .tooltip(Tooltip::text("Add comment"))
+                                    .tooltip({
+                                        let focus_handle = prompt_editor.focus_handle(cx);
+                                        move |_window, cx| {
+                                            Tooltip::for_action_in(
+                                                "Add comment",
+                                                &crate::actions::Newline,
+                                                &focus_handle,
+                                                cx,
+                                            )
+                                        }
+                                    })
                                     .on_click(|_, window, cx| {
                                         window.dispatch_action(
                                             Box::new(crate::actions::SubmitDiffReviewComment),
@@ -2663,18 +3461,6 @@ impl Editor {
                             ),
                     ),
             )
-            // Expandable comments section (only shown when there are comments)
-            .when(comment_count > 0, |el| {
-                el.child(Self::render_comments_section(
-                    comments,
-                    comments_expanded,
-                    inline_editors,
-                    user_avatar_uri,
-                    avatar_size,
-                    action_icon_size,
-                    colors,
-                ))
-            })
             .into_any_element()
     }
 
@@ -2756,7 +3542,8 @@ impl Editor {
         let comment_id = comment.id;
         let is_editing = inline_editor.is_some();
 
-        h_flex()
+        let agent_reply = comment.agent_reply.clone();
+        let comment_row = h_flex()
             .w_full()
             .items_center()
             .gap_2()
@@ -2795,11 +3582,20 @@ impl Editor {
                     .into_any_element()
             } else {
                 // Display mode: show the comment text
-                div()
+                h_flex()
                     .flex_1()
+                    .min_w_0()
+                    .gap_1p5()
                     .text_sm()
                     .text_color(colors.text)
-                    .child(comment.comment)
+                    .when(comment.outdated, |row| {
+                        row.child(
+                            Label::new("Outdated")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Warning),
+                        )
+                    })
+                    .child(div().min_w_0().child(comment.comment))
                     .into_any_element()
             })
             .child(if is_editing {
@@ -2844,6 +3640,77 @@ impl Editor {
             } else {
                 // Display mode: no action buttons for now (edit/delete not yet implemented)
                 gpui::Empty.into_any_element()
+            });
+
+        v_flex()
+            .w_full()
+            .child(comment_row)
+            .when(agent_reply != AgentReply::NotSent, |this| {
+                this.child(Self::render_agent_reply(
+                    comment_id,
+                    agent_reply,
+                    action_icon_size,
+                    colors,
+                ))
+            })
+    }
+
+    /// The agent's answer under a review comment.
+    fn render_agent_reply(
+        comment_id: usize,
+        reply: AgentReply,
+        action_icon_size: IconSize,
+        colors: &theme::ThemeColors,
+    ) -> impl IntoElement {
+        let (text, color, answered) = match reply {
+            AgentReply::NotSent => (String::new(), Color::Muted, false),
+            AgentReply::Waiting => ("Waiting for the agent…".to_string(), Color::Muted, false),
+            AgentReply::Answered(text) => (text, Color::Default, true),
+            AgentReply::Failed(reason) if reason == AGENT_BUSY_MESSAGE => {
+                (reason, Color::Muted, false)
+            }
+            AgentReply::Failed(reason) => (
+                format!("Not answered: {reason} It will be sent again with the next review."),
+                Color::Error,
+                false,
+            ),
+        };
+        h_flex()
+            .items_start()
+            .gap_2()
+            .ml_6()
+            .px_2()
+            .py_1()
+            .border_l_2()
+            .border_color(colors.border_variant)
+            .child(
+                Icon::new(IconName::ZedAgent)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                div()
+                    .id(("agent-reply", comment_id))
+                    .flex_1()
+                    .min_w_0()
+                    .max_h(rems(MAX_AGENT_REPLY_LINES as f32 * 1.25))
+                    .overflow_y_scroll()
+                    .text_sm()
+                    .child(Label::new(text).size(LabelSize::Small).color(color)),
+            )
+            .when(answered, |this| {
+                this.child(
+                    IconButton::new(("resolve-review-comment", comment_id), IconName::Check)
+                        .icon_color(Color::Muted)
+                        .icon_size(action_icon_size)
+                        .tooltip(Tooltip::text("Resolve and remove"))
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(
+                                Box::new(crate::actions::DeleteReviewComment { id: comment_id }),
+                                cx,
+                            );
+                        }),
+                )
             })
     }
 
@@ -2912,9 +3779,150 @@ impl Editor {
             .unwrap_or(end_point.row);
         Some((start_row, end_row))
     }
+}
+
+impl Editor {
+    /// The comments to send to the agent (new, edited or unanswered ones),
+    /// resolved to the code they were left on and in diff order. They stay in
+    /// the diff, waiting for the agent's answers (`set_review_comment_replies`).
+    pub fn send_review_comments_to_agent(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<ReviewCommentForAgent> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let mut comments: Vec<(Point, ReviewCommentForAgent)> = Vec::new();
+        for (hunk_key, hunk_comments) in &self.stored_review_comments {
+            for (index, comment) in hunk_comments.iter().enumerate() {
+                if !comment.agent_reply.needs_sending() {
+                    continue;
+                }
+                let earlier_exchange = hunk_comments[..index]
+                    .iter()
+                    .filter_map(|earlier| match &earlier.agent_reply {
+                        AgentReply::Answered(answer) => {
+                            Some((earlier.comment.clone(), answer.clone()))
+                        }
+                        AgentReply::NotSent | AgentReply::Waiting | AgentReply::Failed(_) => None,
+                    })
+                    .collect();
+                let start = comment.range.start.to_point(&snapshot);
+                let end = comment.range.end.to_point(&snapshot);
+                let code = self.review_comment_code(&snapshot, &comment.range, start..end, cx);
+                comments.push((
+                    start,
+                    ReviewCommentForAgent {
+                        id: comment.id,
+                        file_path: hunk_key.file_path.clone(),
+                        code,
+                        comment: comment.comment.clone(),
+                        earlier_exchange,
+                    },
+                ));
+            }
+        }
+        comments.sort_by_key(|(start, _)| *start);
+        let comments: Vec<ReviewCommentForAgent> =
+            comments.into_iter().map(|(_, comment)| comment).collect();
+        let replies = comments
+            .iter()
+            .map(|comment| (comment.id, AgentReply::Waiting))
+            .collect();
+        self.set_review_comment_replies(replies, window, cx);
+        comments
+    }
+
+    /// Records the agent's answers by comment ID and resizes the review boxes
+    /// that show them.
+    pub fn set_review_comment_replies(
+        &mut self,
+        replies: Vec<(usize, AgentReply)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut replies: HashMap<usize, AgentReply> = replies.into_iter().collect();
+        let mut changed_hunks = Vec::new();
+        for (hunk_key, comments) in &mut self.stored_review_comments {
+            let mut changed = false;
+            for comment in comments.iter_mut() {
+                if let Some(reply) = replies.remove(&comment.id) {
+                    comment.agent_reply = reply;
+                    changed = true;
+                }
+            }
+            if changed {
+                changed_hunks.push(hunk_key.clone());
+            }
+        }
+        for hunk_key in &changed_hunks {
+            self.refresh_diff_review_overlay_height(hunk_key, window, cx);
+        }
+        self.refresh_hidden_review_comment_markers(cx);
+        cx.emit(EditorEvent::ReviewCommentsChanged {
+            total_count: self.unsent_review_comment_count(),
+        });
+        cx.notify();
+    }
+
+    fn review_comment_code(
+        &self,
+        snapshot: &MultiBufferSnapshot,
+        range: &Range<Anchor>,
+        points: Range<Point>,
+        cx: &App,
+    ) -> ReviewCommentCode {
+        let rows = points.start.row..=points.end.row;
+        // A removed line in a diff resolves to a position in the current
+        // file, so check every row: any removed one means the buffer range
+        // would silently drop it.
+        let removed_rows: Vec<bool> = rows
+            .clone()
+            .map(|row| {
+                // anchor_after: at a line start, anchor_before would lean
+                // into a removed hunk that ends just before this line.
+                snapshot
+                    .anchor_after(Point::new(row, 0))
+                    .diff_base_anchor()
+                    .is_some()
+            })
+            .collect();
+
+        if !removed_rows.contains(&true)
+            && let Some((buffer_snapshot, buffer_range)) =
+                snapshot.anchor_range_to_buffer_anchor_range(range.clone())
+            && let Some(buffer) = self.buffer.read(cx).buffer(buffer_snapshot.remote_id())
+        {
+            return ReviewCommentCode::Buffer {
+                buffer,
+                range: buffer_range,
+            };
+        }
+
+        let line_starts = rows.map(|row| Point::new(row, 0));
+        let mut text = String::new();
+        for (line_start, removed) in line_starts.zip(&removed_rows) {
+            let line_end = Point::new(
+                line_start.row,
+                snapshot.line_len(MultiBufferRow(line_start.row)),
+            );
+            text.push_str(if *removed { "-" } else { " " });
+            text.extend(snapshot.text_for_range(line_start..line_end));
+            text.push('\n');
+        }
+        let row = snapshot
+            .point_to_buffer_point(Point::new(points.start.row, 0))
+            .map(|(_, point)| point.row + 1)
+            .unwrap_or(points.start.row + 1);
+        ReviewCommentCode::Diff {
+            text,
+            row,
+            starts_on_removed_line: removed_rows.first().copied().unwrap_or(false),
+        }
+    }
 
     /// Takes all stored comments from all hunks, clearing the storage.
     /// Returns a Vec of (hunk_key, comments) pairs.
+    #[cfg(test)]
     pub(super) fn take_all_review_comments(
         &mut self,
         cx: &mut Context<Self>,
@@ -2924,6 +3932,7 @@ impl Editor {
         let comments = std::mem::take(&mut self.stored_review_comments);
         // Reset the ID counter since all comments have been taken
         self.next_review_comment_id = 0;
+        self.refresh_hidden_review_comment_markers(cx);
         cx.emit(EditorEvent::ReviewCommentsChanged { total_count: 0 });
         cx.notify();
         comments

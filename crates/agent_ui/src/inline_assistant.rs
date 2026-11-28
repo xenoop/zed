@@ -9,14 +9,17 @@ use uuid::Uuid;
 use crate::context::load_context;
 use crate::mention_set::MentionSet;
 use crate::{
-    AgentPanel,
-    buffer_codegen::{BufferCodegen, CodegenAlternative, CodegenEvent},
+    Agent, AgentPanel,
+    buffer_codegen::{
+        BufferCodegen, CodegenAlternative, CodegenEvent, InlineAssistAsksAgentThread,
+    },
+    conversation_view::{INLINE_QUESTION_MARKER, INLINE_QUESTION_PREFIX, INLINE_QUESTION_SUFFIX},
     inline_prompt_editor::{CodegenStatus, InlineAssistId, PromptEditor, PromptEditorEvent},
     terminal_inline_assistant::TerminalInlineAssistant,
 };
 use agent::ThreadStore;
 use agent_settings::AgentSettings;
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet, VecDeque, hash_map};
 use editor::EditorSnapshot;
 use editor::MultiBufferOffset;
@@ -193,7 +196,9 @@ impl InlineAssistant {
                 {
                     for assist_id in editor_assists.assist_ids.clone() {
                         let assist = &self.assists[&assist_id];
-                        if let CodegenStatus::Done = assist.codegen.read(cx).status(cx) {
+                        if let CodegenStatus::Done = assist.codegen.read(cx).status(cx)
+                            && !asks_agent_thread(assist, cx)
+                        {
                             self.finish_assist(assist_id, false, window, cx)
                         }
                     }
@@ -227,8 +232,13 @@ impl InlineAssistant {
             return;
         };
         let agent_panel = agent_panel.read(cx);
+        // An external agent (Claude, Codex, ...) can be asked without a Zed
+        // model; a thread is started for it if none is showing.
+        let has_agent_thread = agent_panel.active_conversation_view().is_some()
+            || matches!(agent_panel.selected_agent(cx), Agent::Custom { .. });
 
         let thread_store = agent_panel.thread_store().clone();
+        let is_editor_target = matches!(inline_assist_target, InlineAssistTarget::Editor(_));
 
         let handle_assist =
             |window: &mut Window, cx: &mut Context<Workspace>| match inline_assist_target {
@@ -260,7 +270,19 @@ impl InlineAssistant {
                 }
             };
 
-        if let Some(error) = configuration_error(cx) {
+        // Asking the agent thread needs no inline model, so a missing model
+        // provider only matters for the inline model mode. Without a provider
+        // but with an agent thread open, open the box asking the agent.
+        let asks_agent_thread = cx
+            .try_global::<InlineAssistAsksAgentThread>()
+            .is_some_and(|asks| asks.0);
+        if is_editor_target
+            && configuration_error(cx).is_some()
+            && (asks_agent_thread || has_agent_thread)
+        {
+            cx.set_global(InlineAssistAsksAgentThread(true));
+            handle_assist(window, cx);
+        } else if let Some(error) = configuration_error(cx) {
             if let ConfigurationError::ProviderNotAuthenticated(provider) = error {
                 cx.spawn(async move |_, cx| {
                     cx.update(|cx| provider.authenticate(cx)).await?;
@@ -748,7 +770,9 @@ impl InlineAssistant {
             for assist_id in &editor_assists.assist_ids {
                 let assist = &self.assists[assist_id];
                 let assist_range = assist.range.to_offset(&buffer);
-                if assist_range.contains(&selection.start) && assist_range.contains(&selection.end)
+                if assist_range.contains(&selection.start)
+                    && assist_range.contains(&selection.end)
+                    && !asks_agent_thread(assist, cx)
                 {
                     if matches!(assist.codegen.read(cx).status(cx), CodegenStatus::Pending) {
                         self.dismiss_assist(*assist_id, window, cx);
@@ -882,7 +906,8 @@ impl InlineAssistant {
                     if matches!(
                         assist.codegen.read(cx).status(cx),
                         CodegenStatus::Error(_) | CodegenStatus::Done
-                    ) {
+                    ) && !asks_agent_thread(assist, cx)
+                    {
                         let assist_range = assist.range.to_offset(&snapshot);
                         if edited_ranges
                             .iter()
@@ -1245,7 +1270,23 @@ impl InlineAssistant {
             self.prompt_history.pop_front();
         }
 
+        if assist.codegen.read(cx).ask_agent_thread {
+            let question = agent_question(&assist.codegen, &assist.range, &user_prompt, cx);
+            let answer = ask_agent_thread(&assist.workspace, question, window, cx);
+            assist
+                .codegen
+                .update(cx, |codegen, cx| codegen.start_with_answer(answer, cx));
+            return;
+        }
+
         let Some(model) = LanguageModelRegistry::read_global(cx).inline_assistant_model() else {
+            let reason = Task::ready(Err(anyhow!(
+                "No inline model is configured. Ask the agent thread instead (chat icon), \
+                 or configure an LLM provider in the agent settings."
+            )));
+            assist
+                .codegen
+                .update(cx, |codegen, cx| codegen.start_with_answer(reason, cx));
             return;
         };
 
@@ -1628,6 +1669,79 @@ impl InlineAssistGroupId {
         self.0 += 1;
         id
     }
+}
+
+/// The message sent to the agent thread: the selected code with its location,
+/// then the user's question.
+fn agent_question(
+    codegen: &Entity<BufferCodegen>,
+    range: &Range<Anchor>,
+    user_prompt: &str,
+    cx: &App,
+) -> String {
+    let snapshot = codegen.read(cx).buffer(cx).read(cx).snapshot(cx);
+    let start = range.start.to_point(&snapshot);
+    let end = range.end.to_point(&snapshot);
+    let path = snapshot
+        .point_to_buffer_point(start)
+        .and_then(|(buffer, _)| {
+            buffer
+                .file()
+                .map(|file| file.path().as_unix_str().to_string())
+        })
+        .unwrap_or_else(|| "untitled".to_string());
+    let row = |point: Point| {
+        snapshot
+            .point_to_buffer_point(point)
+            .map_or(point.row + 1, |(_, point)| point.row + 1)
+    };
+    let code: String = snapshot.text_for_range(start..end).collect();
+    let location = if code.is_empty() {
+        format!("`{path}` near line {}", row(start))
+    } else {
+        format!(
+            "`{path}` lines {}-{}:\n```\n{code}\n```",
+            row(start),
+            row(end)
+        )
+    };
+    format!(
+        "{INLINE_QUESTION_MARKER}\n{INLINE_QUESTION_PREFIX}{location}\n\n{user_prompt}\n\n{INLINE_QUESTION_SUFFIX}"
+    )
+}
+
+/// Whether `assist` asks the agent thread a question. Its answer changes
+/// nothing in the buffer, so saving, typing or pressing Enter in the editor
+/// must not close it; only its close buttons (or closing the editor) do.
+fn asks_agent_thread(assist: &InlineAssist, cx: &App) -> bool {
+    assist.codegen.read(cx).ask_agent_thread
+}
+
+/// Sends `question` to the agent thread in the agent panel, starting one with
+/// the selected agent when none is showing, and resolves with its answer.
+fn ask_agent_thread(
+    workspace: &WeakEntity<Workspace>,
+    question: String,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<Result<String>> {
+    let Some(agent_panel) = workspace
+        .upgrade()
+        .and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx))
+    else {
+        return Task::ready(Err(anyhow!("The agent panel isn't available.")));
+    };
+    let thread = agent_panel.update(cx, |agent_panel, cx| {
+        agent_panel.ensure_agent_thread(window, cx)
+    });
+    window.spawn(cx, async move |cx| {
+        let conversation_view = thread.await?;
+        conversation_view
+            .update_in(cx, |view, window, cx| {
+                view.ask_active_thread(question, window, cx)
+            })??
+            .await
+    })
 }
 
 pub struct InlineAssist {

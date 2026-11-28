@@ -205,6 +205,7 @@ members = [
     "crates/snippets_ui",
     "crates/sqlez",
     "crates/sqlez_macros",
+    "crates/strata_view",
     "crates/streaming_diff",
     "crates/sum_tree",
     "crates/svg_preview",
@@ -480,6 +481,7 @@ snippet_provider = { path = "crates/snippet_provider" }
 snippets_ui = { path = "crates/snippets_ui" }
 sqlez = { path = "crates/sqlez" }
 sqlez_macros = { path = "crates/sqlez_macros" }
+strata_view = { path = "crates/strata_view" }
 streaming_diff = { path = "crates/streaming_diff" }
 sum_tree = { path = "crates/sum_tree" }
 svg_preview = { path = "crates/svg_preview" }
@@ -918,6 +920,8 @@ sqlformat = "0.2"
 sqlx = { version = "0.8", default-features = false }
 stacksafe = "1.0"
 streaming-iterator = "0.1"
+strata-core = { git = "https://github.com/xenoop/strata", rev = "859d01d75727602e693552944ef9ef8fcb731e29", default-features = false }
+strata-spec = { git = "https://github.com/xenoop/strata", rev = "859d01d75727602e693552944ef9ef8fcb731e29" }
 strsim = "0.11"
 strum = { version = "0.28", features = ["derive"] }
 swash = "0.2.6"

@@ -219,6 +219,11 @@
     "context": "AgentPanel",
     "use_key_equivalents": true,
     "bindings": {
+      "alt-shift-f": "agent::ForkThread",
+      "alt-shift-m": "agent::MergeIntoParent",
+      "alt-shift-p": "agent::PullFromFork",
+      "alt-shift-r": "agent::ReviewThread",
+      "alt-shift-l": "agent::LandChanges",
       "ctrl-n": "agent::NewThread",
       "shift-alt-c": "agent::OpenSettings",
       "shift-alt-i": "agent::ToggleOptionsMenu",
@@ -247,6 +252,7 @@
     "context": "AcpThread",
     "use_key_equivalents": true,
     "bindings": {
+      "ctrl-alt-m": "agent::CommentOnTranscriptSelection",
       "ctrl-n": "agent::NewThread",
       "ctrl--": "pane::GoBack",
       "shift-alt-l": "agent::ManageSkills",
@@ -635,6 +641,8 @@
     "use_key_equivalents": true,
     "bindings": {
       "alt-/": "which_key::ShowPendingBindings",
+      // The active project's Changes view (thread changes), as in Delta.
+      "alt-shift-d": "agent::OpenThreadChanges",
       // Move focus between the major regions of the window (editor, open
       // panels, status bar). Accessibility navigation; mirrors VS Code's
       // "Focus Next/Previous Part". `ctrl-f6` mirrors `f6` so region navigation
@@ -1441,6 +1449,31 @@
     },
   },
   {
+    "context": "StrataView",
+    "bindings": {
+      "left": "strata::PreviousStep",
+      "right": "strata::NextStep",
+      "space": "strata::TogglePlayback",
+      "shift-left": "strata::ScrubBackward",
+      "shift-right": "strata::ScrubForward",
+      "[": "strata::SlowDown",
+      "]": "strata::SpeedUp",
+      "b": "strata::ShowBefore",
+      "a": "strata::ShowAfter",
+      "escape": "strata::CloseDetails",
+      "ctrl-=": "strata::ZoomIn",
+      "ctrl-+": "strata::ZoomIn",
+      "ctrl--": "strata::ZoomOut",
+      "ctrl-0": "strata::FitToView",
+      "ctrl-shift-0": "strata::FrameChanges",
+      "=": "strata::ZoomIn",
+      "-": "strata::ZoomOut",
+      "0": "strata::FitToView",
+      "f": "strata::FrameChanges",
+      "l": "strata::ToggleFitEachStep",
+    },
+  },
+  {
     "context": "MarkdownPreview",
     "use_key_equivalents": true,
     "bindings": {
@@ -1745,6 +1778,31 @@
       "ctrl-shift-home": ["tabular_data::ExtendSelection", { "direction": "up", "unit": "edge" }],
       "ctrl-shift-end": ["tabular_data::ExtendSelection", { "direction": "down", "unit": "edge" }],
       "escape": "tabular_data::ClearSelection",
+    },
+  },
+  {
+    "context": "ChangesView > Editor",
+    "bindings": {
+      "ctrl-alt-y": "git::ToggleFileSeen",
+      "ctrl-shift-y": "git::MarkAllFilesSeen",
+      "alt-]": "git::GoToNextChangedFile",
+      "alt-[": "git::GoToPreviousChangedFile",
+      "ctrl-alt-m": "editor::CommentOnSelection",
+      "ctrl-alt-c": "editor::ToggleCommentMode",
+      "ctrl-shift-m": "editor::ToggleReviewCommentsHidden",
+    },
+  },
+  {
+    "context": "ReviewComment > Editor",
+    "bindings": {
+      "ctrl-enter": "editor::SendDiffReviewCommentNow",
+    },
+  },
+  {
+    "context": "Editor && mode == full",
+    "bindings": {
+      "ctrl-alt-m": "editor::CommentOnSelection",
+      "ctrl-alt-c": "editor::ToggleCommentMode",
     },
   },
 ]

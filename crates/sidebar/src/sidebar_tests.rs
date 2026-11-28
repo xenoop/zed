@@ -1545,6 +1545,7 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
             highlight_positions: Vec::new(),
             worktrees: Vec::new(),
             diff_stats: DiffStats::default(),
+            fork_parent: None,
         }))
     };
 
@@ -1637,6 +1638,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                fork_parent: None,
             })),
             // Active thread with Running status
             ListEntry::Thread(Arc::new(ThreadEntry {
@@ -1664,6 +1666,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                fork_parent: None,
             })),
             // Active thread with Error status
             ListEntry::Thread(Arc::new(ThreadEntry {
@@ -1691,6 +1694,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                fork_parent: None,
             })),
             // Thread with WaitingForConfirmation status, not active
             // remote_connection: None,
@@ -1719,6 +1723,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                fork_parent: None,
             })),
             // Background thread that completed (should show notification)
             // remote_connection: None,
@@ -1747,6 +1752,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                 highlight_positions: Vec::new(),
                 worktrees: Vec::new(),
                 diff_stats: DiffStats::default(),
+                fork_parent: None,
             })),
             // Collapsed project header
             ListEntry::ProjectHeader {
@@ -6252,6 +6258,55 @@ async fn test_thread_title_update_propagates_to_sidebar(cx: &mut TestAppContext)
             "v [my-project]",
             "  Friendly Greeting with AI *",
         ]
+    );
+}
+
+#[gpui::test]
+async fn test_threads_sharing_a_session_id_keep_their_own_titles(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    open_thread_with_connection(&panel, StubAgentConnection::new(), cx);
+    send_message(&panel, cx);
+    let parent_session_id = active_session_id(&panel, cx);
+    let parent_thread = panel.read_with(cx, |panel, cx| panel.active_agent_thread(cx).unwrap());
+    parent_thread.update(cx, |thread, cx| {
+        thread.set_title("Add parser module".into(), cx).detach();
+    });
+    cx.run_until_parked();
+
+    let session_number: usize = parent_session_id.0.parse().unwrap();
+    cx.update(|_, cx| {
+        cx.set_global(acp_thread::StubSessionCounter(
+            std::sync::atomic::AtomicUsize::new(session_number),
+        ));
+    });
+    open_thread_with_connection(&panel, StubAgentConnection::new(), cx);
+    send_message(&panel, cx);
+    assert_eq!(active_session_id(&panel, cx), parent_session_id);
+    let review_thread = panel.read_with(cx, |panel, cx| panel.active_agent_thread(cx).unwrap());
+    review_thread.update(cx, |thread, cx| {
+        thread
+            .set_title("Review: Add parser module".into(), cx)
+            .detach();
+    });
+    cx.run_until_parked();
+
+    let entries = visible_entries_as_strings(&sidebar, cx);
+    assert_eq!(entries.len(), 3, "{entries:?}");
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.starts_with("  Add parser module")),
+        "{entries:?}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.starts_with("  Review: Add parser module")),
+        "{entries:?}"
     );
 }
 

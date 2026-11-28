@@ -61,7 +61,7 @@ impl Vim {
         // (none of the other helix_ methods call it)
 
         self.update_editor(cx, |vim, editor, cx| {
-            if editor.read_only(cx) {
+            if editor.blocks_user_edits(cx) {
                 return;
             }
 

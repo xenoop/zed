@@ -658,6 +658,9 @@ impl EditorElement {
         register_action(editor, window, Editor::toggle_all_diff_hunks);
         register_action(editor, window, Editor::toggle_review_comments_expanded);
         register_action(editor, window, Editor::submit_diff_review_comment_action);
+        register_action(editor, window, Editor::comment_on_selection);
+        register_action(editor, window, Editor::toggle_comment_mode);
+        register_action(editor, window, Editor::toggle_review_comments_hidden);
         register_action(editor, window, Editor::edit_review_comment);
         register_action(editor, window, Editor::delete_review_comment);
         register_action(editor, window, Editor::confirm_edit_review_comment_action);
@@ -709,7 +712,7 @@ impl EditorElement {
         register_action(editor, window, Editor::toggle_read_only);
         register_action(editor, window, Editor::reload_file);
 
-        if !editor.read(cx).read_only(cx) {
+        if !editor.read(cx).blocks_user_edits(cx) {
             register_action(editor, window, Editor::newline);
             register_action(editor, window, Editor::newline_above);
             register_action(editor, window, Editor::newline_below);
@@ -7125,7 +7128,10 @@ pub fn render_breadcrumb_text(
 ) -> gpui::AnyElement {
     const MAX_SEGMENTS: usize = 12;
 
-    let element = h_flex().flex_grow_1().text_ui(cx);
+    let element = h_flex()
+        .flex_grow_1()
+        .text_ui(cx)
+        .when(multibuffer_header, |this| this.min_w_0().overflow_hidden());
 
     let prefix_end_ix = cmp::min(segments.len(), MAX_SEGMENTS / 2);
     let suffix_start_ix = cmp::max(
@@ -8579,7 +8585,7 @@ impl Element for EditorElement {
             window.with_text_style(Some(text_style), |window| {
                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
                     let (mut snapshot, is_read_only) = self.editor.update(cx, |editor, cx| {
-                        (editor.snapshot(window, cx), editor.read_only(cx))
+                        (editor.snapshot(window, cx), editor.blocks_user_edits(cx))
                     });
                     let style = &self.style;
 

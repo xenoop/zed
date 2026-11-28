@@ -762,6 +762,17 @@ pub struct ThreadView {
     pub expanded_tool_call_raw_inputs: HashSet<acp_v2::ToolCallId>,
     collapsed_sandbox_authorization_details: HashSet<acp_v2::ToolCallId>,
     collapsed_sandbox_network_details: HashSet<acp_v2::ToolCallId>,
+    /// Questions asked from the editor (by the index of their user message)
+    /// that the user expanded in the chat; the rest stay collapsed.
+    pub(crate) expanded_editor_questions: HashSet<usize>,
+    /// Where this thread's last reply was sent on to another thread: the
+    /// index of the transcript entry the note follows, and who received it.
+    /// Kept only while the view lives; the agent's transcript has no place
+    /// for entries the agent did not see.
+    sent_notes: Vec<(usize, SharedString)>,
+    /// Comments on passages of the agent's messages, shown under the
+    /// message they are about. Kept only while the view lives.
+    pub(crate) passage_comments: Vec<PassageComment>,
     /// Sandbox escalation prompts whose "surprising Unicode" warning the user
     /// has explicitly acknowledged. Until a prompt's tool call is in this set,
     /// its allow buttons stay disabled. See [`Self::sandbox_confusable_findings`].
@@ -1059,7 +1070,15 @@ impl ThreadView {
         }));
 
         let has_slash_completions = session_capabilities.read().has_slash_completions();
-        let placeholder = placeholder_text(agent_display_name.as_ref(), has_slash_completions);
+        let placeholder = match project.upgrade() {
+            Some(project) => super::message_placeholder(
+                agent_display_name.as_ref(),
+                has_slash_completions,
+                project.read(cx),
+                cx,
+            ),
+            None => placeholder_text(agent_display_name.as_ref(), has_slash_completions),
+        };
 
         let mut should_auto_submit = false;
         let mut show_external_source_prompt_warning = false;
@@ -1305,6 +1324,9 @@ impl ThreadView {
             editor_expanded: false,
             should_be_following: false,
             editing_message: None,
+            expanded_editor_questions: HashSet::default(),
+            sent_notes: Vec::new(),
+            passage_comments: Vec::new(),
             message_queue: MessageQueue::default(),
             turn_fields: TurnFields::default(),
             discarded_partial_edits: HashSet::default(),
@@ -2229,6 +2251,21 @@ impl ThreadView {
 
         let text = message_editor.read(cx).text(cx);
         let text = text.trim();
+        // An agent's own command of the same name (such as `/review`) wins.
+        let agent_has_command = |name: &str| {
+            self.session_capabilities
+                .read()
+                .available_commands()
+                .iter()
+                .any(|available_command| available_command.name() == name)
+        };
+        if let Some(action) = crate::thread_fork::slash_command_action(text)
+            && !agent_has_command(text.trim_start_matches('/'))
+        {
+            message_editor.update(cx, |editor, cx| editor.clear(window, cx));
+            window.dispatch_action(action, cx);
+            return;
+        }
         if text == "/login" || text == "/logout" {
             let connection = thread.read(cx).connection().clone();
             let can_login = connection
@@ -2392,6 +2429,30 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Callers of this one learn of a failure from the thread's error.
+        drop(self.send_content_reporting_failure(contents_task, is_native_command, window, cx));
+    }
+
+    /// Like [`Self::send_content`]. The returned receiver gets the error when
+    /// the send fails, and is dropped without a value when it does not.
+    pub(crate) fn send_content_reporting_failure(
+        &mut self,
+        contents_task: Task<
+            anyhow::Result<Option<(Vec<acp_v2::ContentBlock>, Vec<Entity<Buffer>>)>>,
+        >,
+        is_native_command: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> futures::channel::oneshot::Receiver<SharedString> {
+        let (failure_tx, failure_rx) = futures::channel::oneshot::channel();
+        let failure_tx = Rc::new(std::cell::Cell::new(Some(failure_tx)));
+        let report_failure = {
+            move |error: &anyhow::Error| {
+                if let Some(failure_tx) = failure_tx.take() {
+                    failure_tx.send(format!("{error:#}").into()).ok();
+                }
+            }
+        };
         let session_id = self.thread.read(cx).session_id().clone();
         let parent_session_id = self.thread.read(cx).parent_session_id().cloned();
         let agent_telemetry_id = self.thread.read(cx).connection().telemetry_id();
@@ -2411,10 +2472,24 @@ impl ThreadView {
 
         let side = crate::agent_sidebar_side(cx);
 
+        let snapshot_project = self.project.clone();
+        let report_failure_in_task = report_failure.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
             let Some((contents, tracked_buffers)) = contents_task.await? else {
                 return Ok(());
             };
+            let answered_elsewhere = contents.iter().find_map(|block| match block {
+                acp_v2::ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            });
+            let answered_elsewhere = answered_elsewhere
+                .and_then(editor_question_summary)
+                .is_some_and(|question| question.answered_elsewhere);
+            if !answered_elsewhere {
+                // Before the agent can edit anything, so the Changes view can show
+                // what this turn changed.
+                record_last_turn_snapshot(&snapshot_project, cx).await;
+            }
 
             let uses_reported_activity =
                 thread.read_with(cx, |thread, _| thread.uses_reported_activity())?;
@@ -2447,20 +2522,7 @@ impl ThreadView {
                 })
             });
             if is_first_message && thread.read_with(cx, |thread, _cx| thread.title().is_none())? {
-                let text: String = contents
-                    .iter()
-                    .filter_map(|block| match block {
-                        acp_v2::ContentBlock::Text(text_content) => Some(text_content.text.clone()),
-                        acp_v2::ContentBlock::ResourceLink(resource_link) => {
-                            Some(format!("@{}", resource_link.name))
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let text = text.lines().next().unwrap_or("").trim();
-                if !text.is_empty() {
-                    let title: SharedString = util::truncate_and_trailoff(text, 200).into();
+                if let Some(title) = provisional_title_for_first_message(&contents) {
                     thread.update(cx, |thread, cx| {
                         thread.set_provisional_title(title, cx);
                     })?;
@@ -2535,7 +2597,10 @@ impl ThreadView {
                     }
                     Ok(Some(SubmissionResponse::Accepted(_))) => {}
                     Ok(None) => {}
-                    Err(error) => this.handle_thread_error(error, cx),
+                    Err(error) => {
+                        report_failure_in_task(&error);
+                        this.handle_thread_error(error, cx)
+                    }
                 }
             })?;
             anyhow::Ok(())
@@ -2543,6 +2608,7 @@ impl ThreadView {
 
         cx.spawn(async move |this, cx| {
             if let Err(err) = task.await {
+                report_failure(&err);
                 this.update(cx, |this, cx| {
                     this.handle_thread_error(err, cx);
                 })
@@ -2550,6 +2616,7 @@ impl ThreadView {
             }
         })
         .detach();
+        failure_rx
     }
 
     pub fn interrupt_and_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2879,6 +2946,27 @@ impl ThreadView {
     }
 
     // message queueing
+
+    /// Takes a message from another thread: sent now if the agent is idle,
+    /// queued behind the current turn otherwise.
+    pub(crate) fn deliver_message(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let content: Vec<acp_v2::ContentBlock> = vec![text.into()];
+        if self.thread.read(cx).status() == ThreadStatus::Generating {
+            self.add_to_queue(content, Vec::new(), window, cx);
+        } else {
+            self.send_content(
+                Task::ready(Ok(Some((content, Vec::new())))),
+                false,
+                window,
+                cx,
+            );
+        }
+    }
 
     fn queue_message(
         &mut self,
@@ -7404,6 +7492,245 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
     }
 }
 
+/// What `event` means for a question asked of the thread whose answer starts
+/// at entry `first_new_entry`: the answer when the turn ends, an error when it
+/// does not produce one, and `None` for events that do not end the turn.
+pub(super) fn question_outcome(
+    thread: &AcpThread,
+    event: &AcpThreadEvent,
+    first_new_entry: usize,
+    cx: &App,
+) -> Option<Result<String, &'static str>> {
+    match event {
+        AcpThreadEvent::Stopped {
+            stop_reason: Some(acp_v2::StopReason::Cancelled),
+            ..
+        } => Some(Err("The question was cancelled.")),
+        AcpThreadEvent::Stopped { .. } => {
+            Some(Ok(super::final_answer(thread, first_new_entry, cx)))
+        }
+        AcpThreadEvent::Error => Some(Err("The agent stopped with an error.")),
+        AcpThreadEvent::Refusal => Some(Err("The agent refused to answer.")),
+        AcpThreadEvent::ConnectionLost => Some(Err("The agent's connection was lost.")),
+        _ => None,
+    }
+}
+
+/// How long sending a message waits for the Last Turn snapshot before going
+/// ahead without it.
+const LAST_TURN_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Captures the working tree of the project's active repository as a detached
+/// commit (staged, unstaged and untracked files) and records it as the start
+/// of the latest turn. Failures only cost the "Last Turn" comparison.
+async fn record_last_turn_snapshot(
+    project: &WeakEntity<Project>,
+    cx: &mut gpui::AsyncWindowContext,
+) {
+    let snapshot = project.update(cx, |project, cx| {
+        let repository = project.active_repository(cx)?;
+        let repo_id = repository.read(cx).id;
+        let checkpoint =
+            repository.update(cx, |repository, _| repository.create_archive_checkpoint());
+        Some((repo_id, checkpoint))
+    });
+    let Ok(Some((repo_id, checkpoint))) = snapshot else {
+        return;
+    };
+    let timeout = cx.background_executor().timer(LAST_TURN_SNAPSHOT_TIMEOUT);
+    let checkpoint = match futures::future::select(checkpoint, timeout).await {
+        futures::future::Either::Left((checkpoint, _)) => checkpoint,
+        futures::future::Either::Right(_) => {
+            log::warn!(
+                "snapshotting the working tree for this turn took more than {}s; sending without it",
+                LAST_TURN_SNAPSHOT_TIMEOUT.as_secs()
+            );
+            // The previous snapshot would make Last Turn show an older turn.
+            project
+                .update(cx, |project, cx| {
+                    project.git_store().update(cx, |git_store, _| {
+                        git_store.clear_last_turn_snapshot(repo_id)
+                    })
+                })
+                .log_err();
+            return;
+        }
+    };
+    match checkpoint {
+        Ok(Ok((_staged, full))) => {
+            project
+                .update(cx, |project, cx| {
+                    project.git_store().update(cx, |git_store, _| {
+                        git_store.set_last_turn_snapshot(repo_id, full.into())
+                    })
+                })
+                .log_err();
+        }
+        Ok(Err(error)) => {
+            log::warn!("could not snapshot the working tree for this turn: {error:#}")
+        }
+        Err(_) => log::warn!("snapshotting the working tree for this turn was cancelled"),
+    }
+}
+
+/// The first line of the message a comment on a transcript passage is sent
+/// with: the thread view shows such a turn collapsed, since the answer is shown
+/// under the passage.
+pub(crate) const PASSAGE_COMMENT_MARKER: &str = "[Zed: passage comment]";
+const PASSAGE_COMMENT_PREFIX: &str =
+    "Comment on a passage of one of your earlier replies, quoted below.";
+
+/// A comment on a passage of one of the agent's messages.
+pub(crate) struct PassageComment {
+    /// The transcript entry (an agent message) the passage is in.
+    pub(crate) entry_ix: usize,
+    pub(crate) passage: SharedString,
+    /// Where the comment is typed. Enter sends it.
+    pub(crate) input: Entity<Editor>,
+    /// The comment as sent.
+    pub(crate) comment: SharedString,
+    pub(crate) state: PassageCommentState,
+    _send_on_enter: Subscription,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PassageCommentState {
+    Writing,
+    Waiting,
+    Answered(SharedString),
+    /// Not answered; the comment stays in the input to send again.
+    Failed(SharedString),
+}
+
+/// The message a passage comment is sent to the agent with.
+pub(crate) fn passage_comment_question(passage: &str, comment: &str) -> String {
+    let mut question =
+        format!("{PASSAGE_COMMENT_MARKER}\n{PASSAGE_COMMENT_PREFIX} Answer in text.\n\n");
+    for line in passage.trim().lines() {
+        question.push_str(if line.is_empty() { ">" } else { "> " });
+        question.push_str(line);
+        question.push('\n');
+    }
+    question.push('\n');
+    question.push_str(comment.trim());
+    question.push('\n');
+    question
+}
+
+/// How a message Zed generated is shown in the transcript.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct EditorQuestion {
+    pub summary: SharedString,
+    /// The answer is shown outside the transcript (in the diff, the editor or
+    /// under a passage), so the whole turn collapses. Otherwise only the
+    /// message itself does, and the agent's reply stays visible.
+    pub answered_elsewhere: bool,
+}
+
+/// A one-line summary of a message Zed generated (a question asked from the
+/// editor, review comments, a fork, a verdict...), or `None` for any other
+/// message.
+fn editor_question_summary(text: &str) -> Option<EditorQuestion> {
+    use super::{INLINE_QUESTION_MARKER, INLINE_QUESTION_PREFIX, REVIEW_QUESTION_MARKER};
+    use crate::thread_fork::{FORK_CONTEXT_PREFIX, FORK_MARKER, marked_body};
+    if marked_body(text, PASSAGE_COMMENT_MARKER).is_some() {
+        return Some(EditorQuestion {
+            summary: "Comment on a passage, answered under it".into(),
+            answered_elsewhere: true,
+        });
+    }
+    if let Some(summary) = crate::thread_fork::delivered_message_summary(text) {
+        return Some(EditorQuestion {
+            summary: summary.into(),
+            answered_elsewhere: false,
+        });
+    }
+    if let Some(body) = marked_body(text, FORK_MARKER) {
+        let title = body
+            .strip_prefix(FORK_CONTEXT_PREFIX)
+            .and_then(|rest| rest.trim_start().strip_prefix('"'))
+            .and_then(|rest| rest.split_once("\". "))
+            .map(|(title, _)| title);
+        let summary: SharedString = match title {
+            Some(title) => {
+                format!("Forked from \"{title}\", with its conversation as context").into()
+            }
+            None => "Forked, with the earlier conversation as context".into(),
+        };
+        return Some(EditorQuestion {
+            summary,
+            answered_elsewhere: false,
+        });
+    }
+    if let Some(body) = marked_body(text, REVIEW_QUESTION_MARKER) {
+        let count = body
+            .lines()
+            .filter(|line| {
+                line.split_once(':')
+                    .and_then(|(label, _)| label.strip_prefix('R'))
+                    .is_some_and(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
+            })
+            .count();
+        let summary: SharedString = match count {
+            1 => "Review comment, answered in the diff".into(),
+            count => format!("{count} review comments, answered in the diff").into(),
+        };
+        return Some(EditorQuestion {
+            summary,
+            answered_elsewhere: true,
+        });
+    }
+    let location = marked_body(text, INLINE_QUESTION_MARKER)?
+        .strip_prefix(INLINE_QUESTION_PREFIX)?
+        .lines()
+        .next()?
+        .trim_end_matches(':');
+    Some(EditorQuestion {
+        summary: format!("Question about {location}, answered in the editor").into(),
+        answered_elsewhere: true,
+    })
+}
+
+/// The title a thread gets from its first message, which is a one-line
+/// summary for a message Zed generated, never its marker line.
+fn provisional_title_for_first_message(contents: &[acp_v2::ContentBlock]) -> Option<SharedString> {
+    let first_text = contents.iter().find_map(|block| match block {
+        acp_v2::ContentBlock::Text(text) => Some(text.text.as_str()),
+        _ => None,
+    });
+    if let Some(question) = first_text.and_then(editor_question_summary) {
+        return Some(question.summary);
+    }
+    let text: String = contents
+        .iter()
+        .filter_map(|block| match block {
+            acp_v2::ContentBlock::Text(text_content) => Some(text_content.text.clone()),
+            acp_v2::ContentBlock::ResourceLink(resource_link) => {
+                Some(format!("@{}", resource_link.name))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text = text.lines().next().unwrap_or("").trim();
+    (!text.is_empty()).then(|| util::truncate_and_trailoff(text, 200).into())
+}
+
+fn editor_question_for_message(entry: &AgentThreadEntry) -> Option<EditorQuestion> {
+    let AgentThreadEntry::UserMessage(message) = entry else {
+        return None;
+    };
+    let text = message
+        .content
+        .source_blocks()
+        .iter()
+        .find_map(|block| match block {
+            acp_v2::ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })?;
+    editor_question_summary(text)
+}
+
 impl ThreadView {
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
@@ -7437,7 +7764,296 @@ impl ThreadView {
         .flex_grow_1()
     }
 
+    /// Notes below the transcript's current last entry that its reply was
+    /// sent on to `target`.
+    pub(crate) fn record_sent_note(
+        &mut self,
+        target: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let last_entry = self.thread.read(cx).entries().len().saturating_sub(1);
+        self.sent_notes.push((last_entry, target.into()));
+        cx.notify();
+    }
+
+    /// Forgets what was attached to transcript entries from `first_removed_entry`
+    /// on, once those entries are gone: their indexes would otherwise point at
+    /// whatever entries take their place.
+    pub(crate) fn forget_entries_from(
+        &mut self,
+        first_removed_entry: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.sent_notes
+            .retain(|(entry_ix, _)| *entry_ix < first_removed_entry);
+        self.passage_comments
+            .retain(|comment| comment.entry_ix < first_removed_entry);
+        self.expanded_editor_questions
+            .retain(|entry_ix| *entry_ix < first_removed_entry);
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sent_notes(&self) -> &[(usize, SharedString)] {
+        &self.sent_notes
+    }
+
     fn render_entry(
+        &self,
+        entry_ix: usize,
+        total_entries: usize,
+        entry: &AgentThreadEntry,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let rendered = self.render_entry_or_question(entry_ix, total_entries, entry, window, cx);
+        let has_notes = self
+            .sent_notes
+            .iter()
+            .any(|(note_ix, _)| *note_ix == entry_ix);
+        let has_passage_comments = self
+            .passage_comments
+            .iter()
+            .any(|comment| comment.entry_ix == entry_ix);
+        if !has_notes && !has_passage_comments {
+            return rendered;
+        }
+        v_flex()
+            .child(rendered)
+            .children(
+                self.passage_comments
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, comment)| comment.entry_ix == entry_ix)
+                    .map(|(index, comment)| self.render_passage_comment(index, comment, cx)),
+            )
+            .children(
+                self.sent_notes
+                    .iter()
+                    .filter(|(note_ix, _)| *note_ix == entry_ix)
+                    .map(|(_, target)| {
+                        h_flex()
+                            .w_full()
+                            .px_2()
+                            .py_1()
+                            .gap_1p5()
+                            .child(
+                                Icon::new(IconName::ArrowUpRight)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(target.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// The card of a comment on a passage: the passage, then the input, or
+    /// the comment with the agent's answer.
+    fn render_passage_comment(
+        &self,
+        index: usize,
+        comment: &PassageComment,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let passage: SharedString = comment
+            .passage
+            .lines()
+            .take(4)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into();
+        let card = v_flex()
+            .id(("passage-comment", index))
+            .mx_2()
+            .my_1()
+            .p_2()
+            .gap_1p5()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.editor_background)
+            .child(
+                div()
+                    .pl_2()
+                    .border_l_2()
+                    .border_color(colors.border_variant)
+                    .child(
+                        Label::new(passage)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            );
+        let sent_comment = || {
+            Label::new(comment.comment.clone())
+                .size(LabelSize::Small)
+                .color(Color::Default)
+        };
+        match &comment.state {
+            PassageCommentState::Writing => card.child(comment.input.clone()),
+            PassageCommentState::Waiting => card.child(sent_comment()).child(
+                Label::new("Waiting for the agent…")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            ),
+            PassageCommentState::Answered(answer) => card
+                .child(sent_comment())
+                .child(Label::new(answer.clone()).size(LabelSize::Small)),
+            PassageCommentState::Failed(error) => card
+                .child(Label::new(error.clone()).size(LabelSize::Small).color(
+                    if error.as_ref() == editor::AGENT_BUSY_MESSAGE {
+                        Color::Muted
+                    } else {
+                        Color::Error
+                    },
+                ))
+                .child(comment.input.clone()),
+        }
+        .into_any_element()
+    }
+
+    fn render_entry_or_question(
+        &self,
+        entry_ix: usize,
+        total_entries: usize,
+        entry: &AgentThreadEntry,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let Some((question_ix, question)) = self.editor_question_for_entry(entry_ix, cx) else {
+            return self.render_entry_contents(entry_ix, total_entries, entry, window, cx);
+        };
+        let expanded = self.expanded_editor_questions.contains(&question_ix);
+        if entry_ix != question_ix {
+            return if question.answered_elsewhere
+                && self.collapsed_turn_hides_entry(entry_ix, question_ix, entry, cx)
+            {
+                Empty.into_any_element()
+            } else {
+                self.render_entry_contents(entry_ix, total_entries, entry, window, cx)
+            };
+        }
+        let header = self.render_editor_question_header(question_ix, question, expanded, cx);
+        if !expanded {
+            return header;
+        }
+        v_flex()
+            .child(header)
+            .child(self.render_entry_contents(entry_ix, total_entries, entry, window, cx))
+            .into_any_element()
+    }
+
+    /// Whether `entry` is hidden because the editor question at `question_ix`
+    /// that started its turn is collapsed. Only turns whose answer is shown
+    /// elsewhere hide their entries; for the others just the message collapses.
+    /// Entries the user must act on, and
+    /// every entry of a turn that is still running, stay visible so a
+    /// permission prompt can never be hidden.
+    pub(crate) fn collapsed_turn_hides_entry(
+        &self,
+        entry_ix: usize,
+        question_ix: usize,
+        entry: &AgentThreadEntry,
+        cx: &App,
+    ) -> bool {
+        if self.expanded_editor_questions.contains(&question_ix) {
+            return false;
+        }
+        let answered_elsewhere = self
+            .thread
+            .read(cx)
+            .entries()
+            .get(question_ix)
+            .and_then(editor_question_for_message)
+            .is_some_and(|question| question.answered_elsewhere);
+        if !answered_elsewhere {
+            return false;
+        }
+        if matches!(
+            entry,
+            AgentThreadEntry::ToolCall(call)
+                if call.status() == ToolCallStatus::WaitingForConfirmation
+        ) {
+            return false;
+        }
+        let thread = self.thread.read(cx);
+        let turn_is_last = !thread.entries().iter().skip(entry_ix + 1).any(
+            |later| matches!(later, AgentThreadEntry::UserMessage(message) if !message.indented),
+        );
+        let turn_is_running = turn_is_last && thread.status() == ThreadStatus::Generating;
+        !turn_is_running
+    }
+
+    /// The user message that starts the turn `entry_ix` belongs to, with a
+    /// short summary, when that message is a question asked from the editor.
+    fn editor_question_for_entry(
+        &self,
+        entry_ix: usize,
+        cx: &Context<Self>,
+    ) -> Option<(usize, EditorQuestion)> {
+        let entries = self.thread.read(cx).entries();
+        let question_ix = (0..=entry_ix).rev().find(|ix| {
+            matches!(
+                entries.get(*ix),
+                Some(AgentThreadEntry::UserMessage(message)) if !message.indented
+            )
+        })?;
+        editor_question_for_message(entries.get(question_ix)?)
+            .map(|question| (question_ix, question))
+    }
+
+    fn render_editor_question_header(
+        &self,
+        question_ix: usize,
+        question: EditorQuestion,
+        expanded: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .id(("editor-question", question_ix))
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_1p5()
+            .cursor_pointer()
+            .child(
+                Icon::new(IconName::ReplyArrowRight)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new(question.summary)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate(),
+            )
+            .child(div().flex_1())
+            .child(
+                Label::new(if expanded { "Hide" } else { "Show" })
+                    .size(LabelSize::Small)
+                    .color(Color::Accent),
+            )
+            .tooltip(Tooltip::text(if question.answered_elsewhere {
+                "Asked from the editor; the answer is shown there."
+            } else {
+                "Sent by Zed; click to show the full message."
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.expanded_editor_questions.remove(&question_ix) {
+                    this.expanded_editor_questions.insert(question_ix);
+                }
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    fn render_entry_contents(
         &self,
         entry_ix: usize,
         total_entries: usize,
@@ -9005,12 +9621,29 @@ impl ThreadView {
                             })
                             .separator()
                         })
-                        .when_some(selected_text, |menu, selected_text| {
+                        .when_some(selected_text.clone(), |menu, selected_text| {
                             menu.entry("Copy", Some(Box::new(markdown::Copy)), move |_, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(
                                     selected_text.to_string(),
                                 ));
                             })
+                        })
+                        .when_some(selected_text, |menu, selected_text| {
+                            let entity = entity.clone();
+                            menu.entry(
+                                "Comment on Selection",
+                                Some(Box::new(zed_actions::agent::CommentOnTranscriptSelection)),
+                                move |window, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.comment_on_passage(
+                                            entry_ix,
+                                            &selected_text,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                },
+                            )
                         })
                         .when_some(selected_markdown, |menu, selected_markdown| {
                             menu.entry(
@@ -9030,6 +9663,162 @@ impl ThreadView {
                 })
             })
             .into_any_element()
+    }
+
+    /// The text selected in one of the agent's messages, as markdown source,
+    /// with the index of that message's transcript entry.
+    fn selected_transcript_passage(&self, cx: &App) -> Option<(usize, String)> {
+        self.thread
+            .read(cx)
+            .entries()
+            .iter()
+            .enumerate()
+            .find_map(|(entry_ix, entry)| {
+                let AgentThreadEntry::AssistantMessage(message) = entry else {
+                    return None;
+                };
+                message.chunks.iter().find_map(|chunk| {
+                    let (AssistantMessageChunk::Message { block, .. }
+                    | AssistantMessageChunk::Thought { block, .. }) = chunk;
+                    block.markdowns().find_map(|markdown| {
+                        let passage = markdown.read(cx).selected_source()?;
+                        (!passage.trim().is_empty()).then(|| (entry_ix, passage.to_string()))
+                    })
+                })
+            })
+    }
+
+    /// Starts a comment on a passage of the transcript: a card opens under
+    /// the message at `entry_ix`, with the passage quoted and an input for
+    /// the comment. Enter sends it to the agent, and the answer is shown in
+    /// the card.
+    pub(crate) fn comment_on_passage(
+        &mut self,
+        entry_ix: usize,
+        passage: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Comment on this passage…", window, cx);
+            editor
+        });
+        let this = cx.weak_entity();
+        let input_id = input.entity_id();
+        let send_on_enter = input.update(cx, |editor, _| {
+            editor.register_action(move |_: &editor::actions::Newline, window, cx| {
+                this.update(cx, |this, cx| {
+                    let index = this
+                        .passage_comments
+                        .iter()
+                        .position(|comment| comment.input.entity_id() == input_id);
+                    if let Some(index) = index {
+                        this.send_passage_comment(index, window, cx);
+                    }
+                })
+                .ok();
+            })
+        });
+        input.focus_handle(cx).focus(window, cx);
+        self.passage_comments.push(PassageComment {
+            entry_ix,
+            passage: passage.trim().to_string().into(),
+            input,
+            comment: SharedString::default(),
+            state: PassageCommentState::Writing,
+            _send_on_enter: send_on_enter,
+        });
+        cx.notify();
+    }
+
+    /// Sends the comment typed in a passage card to the agent; the answer,
+    /// or the reason there is none, ends up in the card.
+    pub(crate) fn send_passage_comment(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(passage_comment) = self.passage_comments.get(index) else {
+            return;
+        };
+        if passage_comment.state == PassageCommentState::Waiting {
+            return;
+        }
+        let comment = passage_comment.input.read(cx).text(cx).trim().to_string();
+        if comment.is_empty() {
+            return;
+        }
+        let question = passage_comment_question(&passage_comment.passage, &comment);
+        let input = passage_comment.input.clone();
+
+        let set_state =
+            move |this: &mut Self, state: PassageCommentState, cx: &mut Context<Self>| {
+                if let Some(passage_comment) = this
+                    .passage_comments
+                    .iter_mut()
+                    .find(|passage_comment| passage_comment.input == input)
+                {
+                    passage_comment.state = state;
+                }
+                cx.notify();
+            };
+
+        // A turn in progress, or a send still being prepared, would end first
+        // and be taken for the answer.
+        if self.thread.read(cx).status() == ThreadStatus::Generating || self.is_loading_contents {
+            set_state(
+                self,
+                PassageCommentState::Failed(editor::AGENT_BUSY_MESSAGE.into()),
+                cx,
+            );
+            return;
+        }
+
+        let thread = self.thread.clone();
+        let first_new_entry = thread.read(cx).entries().len();
+        let (answer_tx, answer_rx) = futures::channel::oneshot::channel();
+        let mut answer_tx = Some(answer_tx);
+        let subscription = cx.subscribe(&thread, move |_, thread, event, cx| {
+            let Some(result) = question_outcome(thread.read(cx), event, first_new_entry, cx) else {
+                return;
+            };
+            let result = result.map_err(SharedString::from);
+            if let Some(answer_tx) = answer_tx.take() {
+                answer_tx.send(result).ok();
+            }
+        });
+
+        if let Some(passage_comment) = self.passage_comments.get_mut(index) {
+            passage_comment.comment = comment.into();
+            passage_comment.state = PassageCommentState::Waiting;
+        }
+        let send_failure = self.send_content_reporting_failure(
+            Task::ready(Ok(Some((vec![question.into()], Vec::new())))),
+            false,
+            window,
+            cx,
+        );
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let _subscription = subscription;
+            let answer = match futures::future::select(answer_rx, send_failure).await {
+                futures::future::Either::Left((answer, _)) => answer,
+                futures::future::Either::Right((Ok(error), _)) => Ok(Err(error)),
+                futures::future::Either::Right((Err(_), answer_rx)) => answer_rx.await,
+            };
+            let state = match answer {
+                Ok(Ok(answer)) => PassageCommentState::Answered(answer.into()),
+                Ok(Err(error)) => PassageCommentState::Failed(error),
+                Err(_) => {
+                    PassageCommentState::Failed("The thread was closed before it answered.".into())
+                }
+            };
+            this.update(cx, |this, cx| set_state(this, state, cx)).ok();
+        })
+        .detach();
     }
 
     fn agent_message_copy_index(
@@ -14017,6 +14806,16 @@ impl Render for ThreadView {
         v_flex()
             .key_context("AcpThread")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(
+                |this, _: &zed_actions::agent::CommentOnTranscriptSelection, window, cx| {
+                    match this.selected_transcript_passage(cx) {
+                        Some((entry_ix, passage)) => {
+                            this.comment_on_passage(entry_ix, &passage, window, cx)
+                        }
+                        None => cx.propagate(),
+                    }
+                },
+            ))
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
                 if this.parent_session_id.is_none() {
                     this.cancel_generation(cx);
@@ -14749,6 +15548,101 @@ mod tests {
     use util::path;
     use util::paths::PathStyle;
     use workspace::MultiWorkspace;
+
+    fn summary_of(text: &str) -> Option<(String, bool)> {
+        editor_question_summary(text)
+            .map(|question| (question.summary.to_string(), question.answered_elsewhere))
+    }
+
+    #[test]
+    fn test_editor_question_summary() {
+        use super::super::{
+            INLINE_QUESTION_MARKER, INLINE_QUESTION_PREFIX, INLINE_QUESTION_SUFFIX,
+            REVIEW_QUESTION_MARKER, REVIEW_QUESTION_PREFIX,
+        };
+
+        let inline = format!(
+            "{INLINE_QUESTION_MARKER}\n{INLINE_QUESTION_PREFIX}`src/lib.rs` lines 18-20:\n```\nfn a() {{}}\n```\n\nWhy?\n\n{INLINE_QUESTION_SUFFIX}"
+        );
+        assert_eq!(
+            summary_of(&inline),
+            Some((
+                "Question about `src/lib.rs` lines 18-20, answered in the editor".to_string(),
+                true
+            ))
+        );
+
+        let review = format!(
+            "{REVIEW_QUESTION_MARKER}\n{REVIEW_QUESTION_PREFIX} Answer each comment, like `R1:`.\n\
+             \nR1: `a.rs` lines 1-2\n```\nx\n```\nwhy?\n\
+             \nR2: `b.rs` lines 3-3\n```\ny\n```\nand this?\n"
+        );
+        assert_eq!(
+            summary_of(&review),
+            Some(("2 review comments, answered in the diff".to_string(), true))
+        );
+
+        // An ordinary message, even one worded the same way, stays visible.
+        for typed in [
+            "Question about the build failure",
+            "Review comments on the diff. R1: looks fine",
+            "This thread is a fork of \"x\". Ready?",
+            "Comment on a passage of one of your earlier replies, quoted below. Why?",
+            "[Zed: question] Question about nothing",
+            &format!("{INLINE_QUESTION_PREFIX}`a.rs`:\n\nWhy?\n\n{INLINE_QUESTION_SUFFIX}"),
+        ] {
+            assert_eq!(summary_of(typed), None, "{typed}");
+        }
+        assert_eq!(summary_of("hello"), None);
+        // A comment on a transcript passage is answered in its card.
+        assert_eq!(
+            summary_of(&passage_comment_question("a passage", "Why?")),
+            Some(("Comment on a passage, answered under it".to_string(), true))
+        );
+        for (message, expected) in [
+            (
+                crate::thread_fork::fork_context_message(Some("Plan"), "## User\n\nhi\n"),
+                "Forked from \"Plan\", with its conversation as context",
+            ),
+            (
+                crate::thread_fork::verdict_message(
+                    crate::thread_fork::ReviewVerdict::Approved,
+                    Some("Review"),
+                    "ok",
+                    "",
+                ),
+                "Review verdict: approved",
+            ),
+        ] {
+            let (summary, answered_elsewhere) =
+                summary_of(&message).unwrap_or_else(|| panic!("no summary for {message}"));
+            assert!(!answered_elsewhere, "{message}");
+            assert_eq!(summary, expected);
+        }
+    }
+
+    #[test]
+    fn test_provisional_title_never_is_a_marker_line() {
+        let title_of = |text: &str| {
+            provisional_title_for_first_message(&[text.to_string().into()])
+                .map(|title| title.to_string())
+        };
+        assert_eq!(
+            title_of("Fix the parser\nplease"),
+            Some("Fix the parser".into())
+        );
+        let fork = crate::thread_fork::fork_context_message(Some("Plan"), "## User\n\nhi\n");
+        let verdict = crate::thread_fork::verdict_message(
+            crate::thread_fork::ReviewVerdict::Approved,
+            Some("Review"),
+            "ok",
+            "",
+        );
+        for message in [fork, verdict] {
+            let title = title_of(&message).expect("a title");
+            assert!(!title.starts_with("[Zed:"), "{title}");
+        }
+    }
 
     #[test]
     fn test_reported_activity_completion_status() {

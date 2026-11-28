@@ -21,7 +21,8 @@ use client::zed_urls;
 use collections::{HashMap, HashSet, IndexMap};
 use editor::scroll::Autoscroll;
 use editor::{
-    Editor, EditorEvent, EditorMode, MultiBuffer, PathKey, SelectionEffects, SizingBehavior,
+    AgentReply, Editor, EditorEvent, EditorMode, MultiBuffer, PathKey, ReviewCommentCode,
+    ReviewCommentForAgent, SelectionEffects, SizingBehavior,
 };
 use file_icons::FileIcons;
 use fs::Fs;
@@ -57,7 +58,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::{rc::Rc, time::Duration};
 use terminal_view::terminal_panel::TerminalPanel;
-use text::Anchor;
+use text::{Anchor, ToPoint as _};
 use theme_settings::{AgentBufferFontSize, AgentUiFontSize};
 use ui::{
     Callout, CircularProgress, CommonAnimationExt, ContextMenu, ContextMenuEntry, CopyButton,
@@ -1400,6 +1401,7 @@ impl ConversationView {
                 thread_location = thread_location
             );
 
+            let new_session_title = resume_session_id.is_none().then(|| title.clone()).flatten();
             let mut resumed_without_history = false;
             let Some(recovering) = this
                 .read_with(cx, |this, _| this.recovery.is_some())
@@ -1473,6 +1475,11 @@ impl ConversationView {
                             });
                         }
                         this.clear_resolved_request_elicitations_for_connection(&connection, cx);
+                        if let Some(new_session_title) = new_session_title {
+                            thread
+                                .update(cx, |thread, cx| thread.set_title(new_session_title, cx))
+                                .detach_and_log_err(cx);
+                        }
                         let root_session_id = thread.read(cx).session_id().clone();
 
                         let conversation = cx.new(|cx| {
@@ -1918,6 +1925,11 @@ impl ConversationView {
         matches!(self.server_state, ServerState::Loading { .. })
     }
 
+    /// Whether connecting the thread to its agent failed.
+    pub(crate) fn load_failed(&self) -> bool {
+        matches!(self.server_state, ServerState::LoadError { .. })
+    }
+
     fn send_queued_after_confirmed_idle(
         &mut self,
         window: &mut Window,
@@ -2035,6 +2047,7 @@ impl ConversationView {
                     entry_view_state.update(cx, |view_state, _cx| view_state.remove(range.clone()));
                     list_state.splice(range.clone(), 0);
                     active.update(cx, |active, cx| {
+                        active.forget_entries_from(range.start, cx);
                         active.sync_editor_mode(cx);
                     });
                 }
@@ -2311,8 +2324,12 @@ impl ConversationView {
                         .agent_display_name(&self.agent.agent_id())
                         .unwrap_or_else(|| self.agent.agent_id().0.to_string().into());
 
-                    let new_placeholder =
-                        placeholder_text(agent_display_name.as_ref(), has_slash_completions);
+                    let new_placeholder = message_placeholder(
+                        agent_display_name.as_ref(),
+                        has_slash_completions,
+                        self.project.read(cx),
+                        cx,
+                    );
 
                     thread_view.update(cx, |thread_view, cx| {
                         let mut session_capabilities = thread_view.session_capabilities.write();
@@ -3786,6 +3803,71 @@ impl ConversationView {
         }
     }
 
+    /// Inserts diff review comments into the active thread's message editor as
+    /// a mention of each commented range followed by its comment, without
+    /// sending. Returns false when there is no active thread to insert into.
+    /// Sends `prompt` to the active agent thread (whichever ACP agent it runs:
+    /// Codex, Claude Code, ...) through the usual send path, so it shows in the
+    /// thread like a typed message. The task resolves with the agent's final
+    /// answer text once its turn ends. The message box draft is not touched.
+    pub(crate) fn ask_active_thread(
+        &mut self,
+        prompt: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Task<Result<String>>> {
+        let thread_view = self
+            .active_thread()
+            .cloned()
+            .context("The agent thread isn't ready yet. Ask again once it is.")?;
+        let thread = thread_view.read(cx).thread.clone();
+        // A turn in progress, or a send still being prepared, would end first
+        // and be taken for the answer. A new thread may not have confirmed it is
+        // idle yet; that is not a turn.
+        if thread.read(cx).status() == ThreadStatus::Generating
+            || thread_view.read(cx).is_loading_contents
+        {
+            return Err(anyhow!(editor::AGENT_BUSY_MESSAGE));
+        }
+        let first_new_entry = thread.read(cx).entries().len();
+
+        let (answer_tx, answer_rx) = futures::channel::oneshot::channel();
+        let mut answer_tx = Some(answer_tx);
+        let subscription = cx.subscribe(&thread, move |_, thread, event, cx| {
+            let Some(result) =
+                thread_view::question_outcome(thread.read(cx), event, first_new_entry, cx)
+            else {
+                return;
+            };
+            let result = result.map_err(|error| anyhow!(error));
+            if let Some(answer_tx) = answer_tx.take() {
+                // The receiver is gone when the inline assist was stopped.
+                answer_tx.send(result).ok();
+            }
+        });
+
+        let send_failure = thread_view.update(cx, |thread_view, cx| {
+            thread_view.send_content_reporting_failure(
+                Task::ready(Ok(Some((vec![prompt.into()], Vec::new())))),
+                false,
+                window,
+                cx,
+            )
+        });
+
+        Ok(cx.spawn(async move |_, _| {
+            let _subscription = subscription;
+            let closed = || anyhow!("The agent thread was closed before it answered.");
+            match futures::future::select(answer_rx, send_failure).await {
+                futures::future::Either::Left((answer, _)) => answer.map_err(|_| closed())?,
+                futures::future::Either::Right((Ok(error), _)) => Err(anyhow!(error)),
+                futures::future::Either::Right((Err(_), answer_rx)) => {
+                    answer_rx.await.map_err(|_| closed())?
+                }
+            }
+        }))
+    }
+
     fn current_model_name(&self, cx: &App) -> SharedString {
         // For native agent (Zed Agent), use the specific model name (e.g., "Claude 3.5 Sonnet")
         // For ACP agents, use the agent name (e.g., "Claude Agent", "Gemini CLI")
@@ -3898,6 +3980,32 @@ fn native_available_skills(
             warning: skill.warning,
         })
         .collect()
+}
+
+const REVIEW_PLACEHOLDER: &str =
+    "Ask the reviewer, or write your review summary here and use Submit Review in the Forks menu";
+
+/// The message editor's placeholder: the review prompt in the working tree of
+/// a review fork, otherwise the agent's.
+fn message_placeholder(
+    agent_name: &str,
+    has_commands: bool,
+    project: &Project,
+    cx: &App,
+) -> String {
+    let is_review = project
+        .visible_worktrees(cx)
+        .next()
+        .is_some_and(|worktree| {
+            let path = worktree.read(cx).abs_path().to_string_lossy().to_string();
+            crate::thread_fork::record_for_fork(&path, cx)
+                .is_some_and(|record| record.kind == crate::thread_fork::ForkKind::Review)
+        });
+    if is_review {
+        REVIEW_PLACEHOLDER.to_string()
+    } else {
+        placeholder_text(agent_name, has_commands)
+    }
 }
 
 fn placeholder_text(agent_name: &str, has_commands: bool) -> String {
@@ -4300,6 +4408,209 @@ fn plan_label_markdown_style(
             ..default_md_style.base_text_style
         },
         ..default_md_style
+    }
+}
+
+/// Questions asked from the editor (inline assist, review comments) begin with
+/// one of these marker lines, so the agent chat can collapse their turns: the
+/// answers are shown in the editor already.
+pub(crate) const INLINE_QUESTION_MARKER: &str = "[Zed: question]";
+pub(crate) const REVIEW_QUESTION_MARKER: &str = "[Zed: review comments]";
+pub(crate) const INLINE_QUESTION_PREFIX: &str = "Question about ";
+pub(crate) const INLINE_QUESTION_SUFFIX: &str =
+    "(Answer in text. Only change files if the question asks for a change.)";
+pub(crate) const REVIEW_QUESTION_PREFIX: &str = "Review comments on the diff.";
+
+/// The message that sends review comments to the agent: each comment with an
+/// ID (`R<n>`), the code it is about, and instructions to answer per ID so
+/// [`split_review_answer`] can put each answer under its comment.
+pub(crate) fn review_question(comments: &[ReviewCommentForAgent], cx: &App) -> String {
+    let mut question = format!(
+        "{REVIEW_QUESTION_MARKER}\n{REVIEW_QUESTION_PREFIX} Answer each comment in its own R<n> section, \
+         starting with its ID alone on a line, like `R1:`. If a comment asks for a \
+         change, make it and say what you changed.\n",
+    );
+    for comment in comments {
+        let path = comment.file_path.as_unix_str();
+        let (location, code) = match &comment.code {
+            ReviewCommentCode::Buffer { buffer, range } => {
+                let buffer = buffer.read(cx);
+                let start = range.start.to_point(buffer).row + 1;
+                let end = range.end.to_point(buffer).row + 1;
+                let code: String = buffer.text_for_range(range.clone()).collect();
+                (
+                    format!("`{path}` lines {start}-{end}"),
+                    format!("```\n{code}\n```"),
+                )
+            }
+            ReviewCommentCode::Diff {
+                text,
+                row,
+                starts_on_removed_line,
+            } => {
+                let file = if *starts_on_removed_line {
+                    "old"
+                } else {
+                    "current"
+                };
+                (
+                    format!(
+                        "`{path}`, diff from line {row} of the {file} file (removed lines start with -)"
+                    ),
+                    format!("```diff\n{text}```"),
+                )
+            }
+        };
+        question.push_str(&format!(
+            "\n{}: {location}\n{code}\n",
+            review_comment_label(comment.id),
+        ));
+        if !comment.earlier_exchange.is_empty() {
+            question.push_str("Earlier on these lines:\n");
+            for (earlier_comment, answer) in &comment.earlier_exchange {
+                question.push_str(&format!(
+                    "> Me: {}\n> You: {}\n",
+                    earlier_comment.replace('\n', "\n> "),
+                    answer.replace('\n', "\n> ")
+                ));
+            }
+            question.push_str("My reply:\n");
+        }
+        question.push_str(&format!("{}\n", comment.comment));
+    }
+    question
+}
+
+fn review_comment_label(id: usize) -> String {
+    format!("R{}", id + 1)
+}
+
+/// The comment ID a line of the answer starts a section for: `R3:`, and
+/// variants agents produce such as `**R3:**`, `### R3` or `- R3 -`.
+fn review_answer_section(line: &str) -> Option<(usize, &str)> {
+    let line =
+        line.trim_start_matches(|c: char| c == '#' || c == '*' || c == '-' || c.is_whitespace());
+    let rest = line.strip_prefix('R')?;
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    let number: usize = rest[..digits].parse().ok()?;
+    let rest = &rest[digits..];
+    let next = rest.chars().next();
+    if !matches!(
+        next,
+        None | Some(':' | '*' | ' ' | ')' | '.' | '-' | '\u{2014}')
+    ) {
+        return None;
+    }
+    let text = rest.trim_start_matches(|c: char| {
+        c == ':'
+            || c == '*'
+            || c == ')'
+            || c == '.'
+            || c == '-'
+            || c == '\u{2014}'
+            || c.is_whitespace()
+    });
+    Some((number.checked_sub(1)?, text))
+}
+
+/// Splits the agent's answer into per-comment replies by the `R<n>:` sections
+/// asked for in [`review_question`]. Without any sections, the whole answer
+/// goes under the first comment; comments the answer skips are marked not
+/// answered, so the next review sends them again.
+pub(crate) fn split_review_answer(
+    ids: &[usize],
+    answer: Result<String>,
+) -> Vec<(usize, AgentReply)> {
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(error) => {
+            let reason = error.to_string();
+            return ids
+                .iter()
+                .map(|id| (*id, AgentReply::Failed(reason.clone())))
+                .collect();
+        }
+    };
+
+    let mut sections: HashMap<usize, String> = HashMap::default();
+    let mut current: Option<usize> = None;
+    for line in answer.lines() {
+        if let Some((id, first_text)) = review_answer_section(line)
+            && ids.contains(&id)
+        {
+            current = Some(id);
+            let section = sections.entry(id).or_default();
+            if !first_text.is_empty() {
+                section.push_str(first_text);
+                section.push('\n');
+            }
+        } else if let Some(id) = current {
+            let section = sections.entry(id).or_default();
+            section.push_str(line);
+            section.push('\n');
+        }
+    }
+
+    if sections.is_empty() {
+        return ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let reply = if index == 0 {
+                    AgentReply::Answered(answer.trim().to_string())
+                } else {
+                    AgentReply::Answered(format!(
+                        "Answered together with {}.",
+                        review_comment_label(ids[0])
+                    ))
+                };
+                (*id, reply)
+            })
+            .collect();
+    }
+
+    ids.iter()
+        .map(|id| {
+            let reply = match sections.remove(id) {
+                Some(text) if !text.trim().is_empty() => {
+                    AgentReply::Answered(text.trim().to_string())
+                }
+                _ => AgentReply::Failed("The agent didn't answer this comment.".to_string()),
+            };
+            (*id, reply)
+        })
+        .collect()
+}
+
+/// The text of the last assistant message from `first_entry` on: the agent's
+/// final answer for the turn, without its reasoning.
+pub(crate) fn final_answer(thread: &AcpThread, first_entry: usize, cx: &App) -> String {
+    let answer = thread
+        .entries()
+        .get(first_entry..)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            AgentThreadEntry::AssistantMessage(message) => Some(
+                message
+                    .chunks
+                    .iter()
+                    .filter_map(|chunk| match chunk {
+                        AssistantMessageChunk::Message { block, .. } => Some(block.to_markdown(cx)),
+                        AssistantMessageChunk::Thought { .. } => None,
+                    })
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if answer.trim().is_empty() {
+        "The agent finished without a text answer; see the agent thread.".to_string()
+    } else {
+        answer
     }
 }
 
@@ -6448,6 +6759,501 @@ pub(crate) mod tests {
         root_view.read_with(cx, |view, _| {
             assert!(view.thread_error.is_none());
             assert!(view.message_queue.auto_send_candidate(false).is_some());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_sending_a_message_records_the_last_turn_snapshot(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            serde_json::json!({ ".git": {}, "a.txt": "one" }),
+        )
+        .await;
+        let project = Project::test(fs, [std::path::Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) = setup_conversation_view_in_project(
+            StubAgentServer::new(connection.clone()),
+            project.clone(),
+            None,
+            cx,
+        )
+        .await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+        let last_turn_snapshot = |cx: &mut VisualTestContext| {
+            project.read_with(cx, |project, cx| {
+                let repository = project.active_repository(cx)?;
+                project
+                    .git_store()
+                    .read(cx)
+                    .last_turn_snapshot(repository.read(cx).id)
+            })
+        };
+        assert_eq!(last_turn_snapshot(cx), None);
+
+        let finish_first = connection.defer_next_prompt_response();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        let first = last_turn_snapshot(cx).expect("sending should snapshot the working tree");
+        finish_first
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, cx| {
+            assert_eq!(view.thread.read(cx).status(), ThreadStatus::Idle);
+        });
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("second", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        let second = last_turn_snapshot(cx).expect("each send should snapshot again");
+        assert_ne!(first, second);
+    }
+
+    #[gpui::test]
+    async fn test_only_answered_elsewhere_turns_hide_the_agent_reply(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+
+        let review_comments = format!(
+            "{REVIEW_QUESTION_MARKER}\n{REVIEW_QUESTION_PREFIX} Answer each comment.\n\nR1: `a.rs` lines 1-1\n```\nx\n```\nWhy?\n"
+        );
+        let messages = [
+            (
+                crate::thread_fork::fork_context_message(Some("Plan"), "## User\n\nhi\n"),
+                false,
+            ),
+            (
+                crate::thread_fork::verdict_message(
+                    crate::thread_fork::ReviewVerdict::ChangesRequested,
+                    Some("Review: Plan"),
+                    "Rename it.",
+                    "",
+                ),
+                false,
+            ),
+            (crate::thread_fork::land_message(Some("Plan"), None), false),
+            (
+                crate::thread_fork::thread_message(Some("Review: Plan"), "All good."),
+                false,
+            ),
+            (review_comments, true),
+        ];
+        for (message, hides_reply) in messages {
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new("Reply".into()),
+            )]);
+            message_editor.update_in(cx, |editor, window, cx| {
+                editor.set_text(&message, window, cx);
+            });
+            thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+            cx.run_until_parked();
+
+            thread_view.read_with(cx, |view, cx| {
+                let entries = view.thread.read(cx).entries();
+                let question_ix = entries
+                    .iter()
+                    .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+                    .expect("the message should be in the thread");
+                let reply_ix = question_ix + 1;
+                assert!(
+                    matches!(
+                        entries.get(reply_ix),
+                        Some(AgentThreadEntry::AssistantMessage(_))
+                    ),
+                    "{message}"
+                );
+                assert_eq!(
+                    view.collapsed_turn_hides_entry(reply_ix, question_ix, &entries[reply_ix], cx),
+                    hides_reply,
+                    "{message}"
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn test_review_comments_do_not_replace_the_last_turn_snapshot(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            serde_json::json!({ ".git": {}, "a.txt": "one" }),
+        )
+        .await;
+        let project = Project::test(fs, [std::path::Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) = setup_conversation_view_in_project(
+            StubAgentServer::new(connection.clone()),
+            project.clone(),
+            None,
+            cx,
+        )
+        .await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+        let last_turn_snapshot = |cx: &mut VisualTestContext| {
+            project.read_with(cx, |project, cx| {
+                let repository = project.active_repository(cx)?;
+                project
+                    .git_store()
+                    .read(cx)
+                    .last_turn_snapshot(repository.read(cx).id)
+            })
+        };
+
+        let review_comments = format!(
+            "{REVIEW_QUESTION_MARKER}\n{REVIEW_QUESTION_PREFIX} Answer each comment.\n\nR1: `a.rs` lines 1-1\n```\nx\n```\nWhy?\n"
+        );
+        let finish_review = connection.defer_next_prompt_response();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text(&review_comments, window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert_eq!(last_turn_snapshot(cx), None);
+        finish_review
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
+
+        let finish_ordinary = connection.defer_next_prompt_response();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Change it", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        let ordinary = last_turn_snapshot(cx).expect("an ordinary prompt should snapshot");
+        finish_ordinary
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text(&review_comments, window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert_eq!(last_turn_snapshot(cx), Some(ordinary));
+    }
+
+    #[gpui::test]
+    async fn test_collapsed_question_turn_shows_pending_authorization(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        let finish_turn = connection.defer_next_prompt_response();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text(
+                &format!(
+                    "{INLINE_QUESTION_MARKER}\n{INLINE_QUESTION_PREFIX}`a.rs` lines 1-1:\n\nWhy?\n\n{INLINE_QUESTION_SUFFIX}"
+                ),
+                window,
+                cx,
+            );
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let tool_call_id = acp_v1::ToolCallId::new("question-tool");
+        thread
+            .update(cx, |thread, cx| {
+                thread.upsert_tool_call(
+                    acp_v1::ToolCall::new(tool_call_id.clone(), "Run a command"),
+                    cx,
+                )
+            })
+            .expect("tool call should be added");
+        let _authorization = thread
+            .update(cx, |thread, cx| {
+                thread.request_tool_call_authorization(
+                    acp_v1::ToolCallUpdate::new(
+                        tool_call_id.clone(),
+                        acp_v1::ToolCallUpdateFields::new(),
+                    ),
+                    PermissionOptions::Flat(vec![acp_v2::PermissionOption::new(
+                        "allow",
+                        "Allow",
+                        acp_v2::PermissionOptionKind::AllowOnce,
+                    )]),
+                    acp_thread::AuthorizationKind::PermissionGrant,
+                    cx,
+                )
+            })
+            .expect("authorization should be requested");
+        cx.run_until_parked();
+
+        let hidden_entries = |cx: &mut VisualTestContext| {
+            thread_view.read_with(cx, |view, cx| {
+                let entries = view.thread.read(cx).entries();
+                assert!(matches!(entries[0], AgentThreadEntry::UserMessage(_)));
+                (1..entries.len())
+                    .filter(|ix| view.collapsed_turn_hides_entry(*ix, 0, &entries[*ix], cx))
+                    .count()
+            })
+        };
+        assert_eq!(hidden_entries(cx), 0);
+
+        thread.update(cx, |thread, cx| {
+            thread.authorize_tool_call(
+                acp_v2::ToolCallId::new(tool_call_id.0.clone()),
+                SelectedPermissionOutcome::new(
+                    acp_v2::PermissionOptionId::new("allow"),
+                    acp_v2::PermissionOptionKind::AllowOnce,
+                ),
+                cx,
+            );
+        });
+        finish_turn
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
+        assert!(hidden_entries(cx) > 0, "a finished turn should collapse");
+    }
+
+    #[gpui::test]
+    async fn test_send_does_not_wait_for_a_slow_last_turn_snapshot(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            serde_json::json!({ ".git": {}, "a.txt": "one" }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [std::path::Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) = setup_conversation_view_in_project(
+            StubAgentServer::new(connection.clone()),
+            project.clone(),
+            None,
+            cx,
+        )
+        .await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+        let last_turn_snapshot = |cx: &mut VisualTestContext| {
+            project.read_with(cx, |project, cx| {
+                let repository = project.active_repository(cx)?;
+                project
+                    .git_store()
+                    .read(cx)
+                    .last_turn_snapshot(repository.read(cx).id)
+            })
+        };
+
+        let finish_first = connection.defer_next_prompt_response();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert!(last_turn_snapshot(cx).is_some());
+        finish_first
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
+
+        fs.set_archive_checkpoint_hangs(std::path::Path::new("/project/.git"), true);
+        let finish_second = connection.defer_next_prompt_response();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("second", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        let user_message_count = |cx: &mut VisualTestContext| {
+            thread_view.read_with(cx, |view, cx| {
+                view.thread
+                    .read(cx)
+                    .entries()
+                    .iter()
+                    .filter(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+                    .count()
+            })
+        };
+        assert_eq!(user_message_count(cx), 1, "waits for the snapshot at first");
+
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        assert_eq!(user_message_count(cx), 2);
+        assert_eq!(
+            last_turn_snapshot(cx),
+            None,
+            "Last Turn must not keep showing the previous turn"
+        );
+        finish_second
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_agent_command_takes_precedence_over_zed_slash_command(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+        let user_message_count = |cx: &mut VisualTestContext| {
+            thread_view.read_with(cx, |view, cx| {
+                view.thread
+                    .read(cx)
+                    .entries()
+                    .iter()
+                    .filter(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+                    .count()
+            })
+        };
+
+        // Without an agent command of that name, Zed's own command runs.
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("/review", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert_eq!(user_message_count(cx), 0);
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "",
+            "Zed's command is taken out of the message box"
+        );
+
+        // With one, the message goes to the agent.
+        thread_view.update(cx, |view, _| {
+            view.session_capabilities
+                .write()
+                .set_available_commands(vec![acp_v2::AvailableCommand::Command(
+                    acp_v2::Command::new("review", "Review the changes"),
+                )]);
+        });
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("/review", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        assert_eq!(user_message_count(cx), 1);
+    }
+
+    #[gpui::test]
+    async fn test_comment_on_transcript_passage(cx: &mut TestAppContext) {
+        use crate::conversation_view::thread_view::{PASSAGE_COMMENT_MARKER, PassageCommentState};
+
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let message_editor = message_editor(&conversation_view, cx);
+
+        // A finished turn to comment on.
+        let finish_first = connection.defer_next_prompt_response();
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        finish_first
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
+
+        // Commenting opens a card under the message, ready to type in; the
+        // message editor is left alone.
+        thread_view.update_in(cx, |view, window, cx| {
+            view.comment_on_passage(0, "first line\n\nsecond line\n", window, cx);
+        });
+        cx.run_until_parked();
+        let input = thread_view.read_with(cx, |view, _| {
+            assert_eq!(view.passage_comments.len(), 1);
+            let comment = &view.passage_comments[0];
+            assert_eq!(comment.entry_ix, 0);
+            assert_eq!(comment.passage.as_ref(), "first line\n\nsecond line");
+            assert_eq!(comment.state, PassageCommentState::Writing);
+            comment.input.clone()
+        });
+        assert!(input.update_in(cx, |input, window, cx| {
+            input.focus_handle(cx).is_focused(window)
+        }));
+        assert_eq!(
+            message_editor.read_with(cx, |editor, cx| editor.text(cx)),
+            ""
+        );
+
+        // Sending passes the comment to the agent with the passage quoted.
+        let finish_answer = connection.defer_next_prompt_response();
+        input.update_in(cx, |input, window, cx| input.set_text("Why?", window, cx));
+        // (Enter in the card runs this; the test loads no keymap.)
+        thread_view.update_in(cx, |view, window, cx| {
+            view.send_passage_comment(0, window, cx)
+        });
+        cx.run_until_parked();
+        let question = thread_view.read_with(cx, |view, cx| {
+            assert_eq!(view.passage_comments[0].state, PassageCommentState::Waiting);
+            assert_eq!(view.passage_comments[0].comment.as_ref(), "Why?");
+            view.thread
+                .read(cx)
+                .entries()
+                .iter()
+                .rev()
+                .find_map(|entry| match entry {
+                    AgentThreadEntry::UserMessage(message) => Some(message.content.to_markdown(cx)),
+                    _ => None,
+                })
+                .unwrap()
+        });
+        assert!(question.starts_with(PASSAGE_COMMENT_MARKER), "{question}");
+        assert!(
+            question.ends_with("> first line\n>\n> second line\n\nWhy?\n"),
+            "{question}"
+        );
+
+        // When the turn ends, its answer lands in the card.
+        finish_answer
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .unwrap();
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, _| {
+            assert!(
+                matches!(
+                    view.passage_comments[0].state,
+                    PassageCommentState::Answered(_)
+                ),
+                "{:?}",
+                view.passage_comments[0].state
+            );
         });
     }
 
@@ -9872,6 +10678,15 @@ pub(crate) mod tests {
     ) -> (Entity<ConversationView>, &mut VisualTestContext) {
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
+        setup_conversation_view_in_project(agent, project, initial_content, cx).await
+    }
+
+    async fn setup_conversation_view_in_project(
+        agent: impl AgentServer + 'static,
+        project: Entity<Project>,
+        initial_content: Option<AgentInitialContent>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<ConversationView>, &mut VisualTestContext) {
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
@@ -11124,6 +11939,69 @@ pub(crate) mod tests {
                     assert!(entry_view_state.entry(2).is_none());
                     assert!(entry_view_state.entry(3).is_none());
                 });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_rewind_drops_state_of_removed_entries(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        let mut second_user_message_id = None;
+        for message in ["first", "second"] {
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new("An answer.".into()),
+            )]);
+            thread
+                .update(cx, |thread, cx| thread.send_raw(message, cx))
+                .await
+                .unwrap();
+            cx.run_until_parked();
+            if message == "first" {
+                thread_view.update_in(cx, |view, window, cx| {
+                    view.comment_on_passage(1, "kept", window, cx);
+                    view.record_sent_note("kept", cx);
+                    view.expanded_editor_questions.insert(0);
+                });
+            } else {
+                second_user_message_id = thread.read_with(cx, |thread, _| {
+                    let AgentThreadEntry::UserMessage(user_message) = &thread.entries()[2] else {
+                        panic!("expected the second user message");
+                    };
+                    user_message.client_id.clone()
+                });
+                thread_view.update_in(cx, |view, window, cx| {
+                    view.comment_on_passage(3, "removed", window, cx);
+                    view.record_sent_note("removed", cx);
+                    view.expanded_editor_questions.insert(2);
+                });
+            }
+        }
+
+        thread
+            .update(cx, |thread, cx| {
+                thread.rewind(second_user_message_id.expect("a second message"), cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, _| {
+            let passages: Vec<_> = view
+                .passage_comments
+                .iter()
+                .map(|comment| comment.passage.to_string())
+                .collect();
+            assert_eq!(passages, ["kept"]);
+            assert_eq!(view.sent_notes(), [(1, SharedString::from("kept"))]);
+            assert_eq!(view.expanded_editor_questions.len(), 1);
+            assert!(view.expanded_editor_questions.contains(&0));
         });
     }
 
@@ -15800,6 +16678,206 @@ pub(crate) mod tests {
 
             assert_eq!(text, expected_txt);
         })
+    }
+
+    #[gpui::test]
+    async fn test_review_question_labels_each_comment(cx: &mut TestAppContext) {
+        init_test(cx);
+        let buffer = cx.new(|cx| Buffer::local("fn a() {}\nlet x = 10 + 10;\n", cx));
+        let range = buffer.read_with(cx, |buffer, _| {
+            buffer.anchor_before(Point::new(1, 0))..buffer.anchor_after(Point::new(1, 16))
+        });
+        let comments = vec![
+            ReviewCommentForAgent {
+                id: 0,
+                file_path: util::rel_path::rel_path("src/a.rs").into_arc(),
+                code: ReviewCommentCode::Buffer { buffer, range },
+                comment: "Use a constant".to_string(),
+                earlier_exchange: Vec::new(),
+            },
+            ReviewCommentForAgent {
+                id: 4,
+                file_path: util::rel_path::rel_path("src/b.rs").into_arc(),
+                code: ReviewCommentCode::Diff {
+                    text: "-old\n".to_string(),
+                    row: 3,
+                    starts_on_removed_line: true,
+                },
+                comment: "Why was this removed?".to_string(),
+                earlier_exchange: vec![(
+                    "Is this dead code?".to_string(),
+                    "Yes.\nNothing calls it.".to_string(),
+                )],
+            },
+        ];
+        let question = cx.update(|cx| review_question(&comments, cx));
+        assert!(question.starts_with("[Zed: review comments]\nReview comments on the diff."));
+        assert!(
+            question
+                .contains("R1: `src/a.rs` lines 2-2\n```\nlet x = 10 + 10;\n```\nUse a constant\n")
+        );
+        assert!(question.contains(
+            "R5: `src/b.rs`, diff from line 3 of the old file (removed lines start with -)\n\
+             ```diff\n-old\n```\nEarlier on these lines:\n\
+             > Me: Is this dead code?\n> You: Yes.\n> Nothing calls it.\nMy reply:\n\
+             Why was this removed?\n"
+        ));
+    }
+
+    #[test]
+    fn test_split_review_answer() {
+        let answered = |text: &str| AgentReply::Answered(text.to_string());
+
+        // Plain, bold and heading section markers.
+        let answer =
+            "Sure.\nR1: It was slow.\nMore detail.\n**R2:** Fixed it.\n### R3\nNo change needed.";
+        assert_eq!(
+            split_review_answer(&[0, 1, 2], Ok(answer.to_string())),
+            vec![
+                (0, answered("It was slow.\nMore detail.")),
+                (1, answered("Fixed it.")),
+                (2, answered("No change needed.")),
+            ]
+        );
+
+        // A skipped comment is not answered, so it is sent again.
+        assert_eq!(
+            split_review_answer(&[0, 1], Ok("R1: Done.".to_string())),
+            vec![
+                (0, answered("Done.")),
+                (
+                    1,
+                    AgentReply::Failed("The agent didn't answer this comment.".to_string())
+                ),
+            ]
+        );
+
+        // Words starting with R are not section markers.
+        assert_eq!(
+            split_review_answer(&[0], Ok("Refactored it.\nRR2 nothing".to_string())),
+            vec![(0, answered("Refactored it.\nRR2 nothing"))]
+        );
+
+        // No sections: the whole answer goes under the first comment.
+        assert_eq!(
+            split_review_answer(&[3, 7], Ok("All good.".to_string())),
+            vec![
+                (3, answered("All good.")),
+                (7, answered("Answered together with R4.")),
+            ]
+        );
+
+        // A failed send marks every comment.
+        assert_eq!(
+            split_review_answer(&[0, 1], Err(anyhow!("The agent is busy."))),
+            vec![
+                (0, AgentReply::Failed("The agent is busy.".to_string())),
+                (1, AgentReply::Failed("The agent is busy.".to_string())),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_ask_active_thread_returns_the_final_answer(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk::new(
+                "thinking about it".into(),
+            )),
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                "Because it was slow.".into(),
+            )),
+        ]);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("my unsent draft", window, cx)
+        });
+
+        let answer = conversation_view
+            .update_in(cx, |view, window, cx| {
+                view.ask_active_thread("Why did you change this?".to_string(), window, cx)
+            })
+            .expect("the thread is idle");
+        cx.run_until_parked();
+        assert_eq!(answer.await.unwrap(), "Because it was slow.");
+
+        // The question is in the thread like a typed message, and the draft in
+        // the message box is untouched.
+        let thread =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        thread.read_with(cx, |thread, _| {
+            assert!(
+                thread
+                    .entries()
+                    .iter()
+                    .any(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+            );
+        });
+        message_editor.read_with(cx, |editor, cx| {
+            assert_eq!(editor.text(cx), "my unsent draft");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_ask_active_thread_reports_cancellation_and_failed_sends(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+
+        // A send that is still being prepared is refused.
+        thread_view.update(cx, |view, _| view.is_loading_contents = true);
+        assert!(
+            conversation_view
+                .update_in(cx, |view, window, cx| {
+                    view.ask_active_thread("Why?".to_string(), window, cx)
+                })
+                .is_err()
+        );
+        thread_view.update(cx, |view, _| view.is_loading_contents = false);
+
+        // Cancelling the turn is not an answer.
+        let finish_turn = connection.defer_next_prompt_response();
+        let answer = conversation_view
+            .update_in(cx, |view, window, cx| {
+                view.ask_active_thread("Why?".to_string(), window, cx)
+            })
+            .expect("the thread is idle");
+        cx.run_until_parked();
+        thread_view.update_in(cx, |view, _window, cx| view.cancel_generation(cx));
+        finish_turn
+            .send(Ok(acp_v1::PromptResponse::new(
+                acp_v1::StopReason::Cancelled,
+            )))
+            .ok();
+        cx.run_until_parked();
+        let error = answer
+            .await
+            .expect_err("a cancelled question has no answer");
+        assert_eq!(error.to_string(), "The question was cancelled.");
+
+        // A send that fails before the turn starts does not leave it waiting.
+        let fail_send = connection.defer_next_prompt_response();
+        let answer = conversation_view
+            .update_in(cx, |view, window, cx| {
+                view.ask_active_thread("Why again?".to_string(), window, cx)
+            })
+            .expect("the thread is idle again");
+        cx.run_until_parked();
+        fail_send
+            .send(Err(anyhow!("no connection to the model")))
+            .ok();
+        cx.run_until_parked();
+        answer.await.expect_err("a failed send has no answer");
     }
 
     #[gpui::test]

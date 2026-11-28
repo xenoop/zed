@@ -202,6 +202,7 @@ impl ActiveEntry {
 
 #[derive(Clone, Debug)]
 struct ActiveThreadInfo {
+    thread_id: ThreadId,
     session_id: acp::SessionId,
     title: SharedString,
     status: AgentThreadStatus,
@@ -363,6 +364,9 @@ struct ThreadEntry {
     highlight_positions: Vec<usize>,
     worktrees: Vec<ThreadItemWorktreeInfo>,
     diff_stats: DiffStats,
+    /// Set when this thread works in a fork of another thread's working
+    /// tree: it is listed, indented, under that thread.
+    fork_parent: Option<agent_ui::ForkLink>,
 }
 
 #[derive(Clone)]
@@ -1415,6 +1419,7 @@ impl Sidebar {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
         };
+        let fork_links = agent_ui::fork_links(cx);
         let mw = multi_workspace.read(cx);
         let workspaces: Vec<_> = mw.workspaces().cloned().collect();
         let active_workspace = Some(mw.workspace().clone());
@@ -1632,30 +1637,36 @@ impl Sidebar {
             if should_load_threads {
                 let thread_store = ThreadMetadataStore::global(cx);
 
-                let make_thread_entry =
-                    |row: ThreadMetadata, workspace: ThreadEntryWorkspace| -> Arc<ThreadEntry> {
-                        let (icon, icon_from_external_svg) = resolve_agent_icon(&row.agent_id);
-                        let worktrees =
-                            worktree_info_from_thread_paths(&row.worktree_paths, &branch_by_path);
-                        // Start drafts as `WithContent`; the post-processing
-                        // pass below downgrades them to `Empty` if no draft
-                        // label can be derived.
-                        let draft = row.is_draft().then_some(DraftKind::WithContent);
-                        Arc::new(ThreadEntry {
-                            metadata: row,
-                            icon,
-                            icon_from_external_svg,
-                            status: AgentThreadStatus::default(),
-                            workspace,
-                            is_live: false,
-                            is_background: false,
-                            is_title_generating: false,
-                            draft,
-                            highlight_positions: Vec::new(),
-                            worktrees,
-                            diff_stats: DiffStats::default(),
-                        })
-                    };
+                let make_thread_entry = |row: ThreadMetadata,
+                                         workspace: ThreadEntryWorkspace|
+                 -> Arc<ThreadEntry> {
+                    let (icon, icon_from_external_svg) = resolve_agent_icon(&row.agent_id);
+                    let fork_parent = fork_links
+                        .iter()
+                        .find(|link| link.is_among(row.worktree_paths.folder_path_list().paths()))
+                        .cloned();
+                    let worktrees =
+                        worktree_info_from_thread_paths(&row.worktree_paths, &branch_by_path);
+                    // Start drafts as `WithContent`; the post-processing
+                    // pass below downgrades them to `Empty` if no draft
+                    // label can be derived.
+                    let draft = row.is_draft().then_some(DraftKind::WithContent);
+                    Arc::new(ThreadEntry {
+                        metadata: row,
+                        icon,
+                        icon_from_external_svg,
+                        status: AgentThreadStatus::default(),
+                        workspace,
+                        is_live: false,
+                        is_background: false,
+                        is_title_generating: false,
+                        draft,
+                        highlight_positions: Vec::new(),
+                        worktrees,
+                        diff_stats: DiffStats::default(),
+                        fork_parent,
+                    })
+                };
 
                 // Main code path: one query per group via main_worktree_paths.
                 // The main_worktree_paths column is set on all new threads and
@@ -1775,7 +1786,9 @@ impl Sidebar {
 
                 // Build a lookup from live_infos and compute running/waiting
                 // counts in a single pass.
-                let mut live_info_by_session: HashMap<acp::SessionId, ActiveThreadInfo> =
+                // Keyed by thread: agents are free to hand out the same session
+                // id to several threads, and each must keep its own title.
+                let mut live_info_by_thread: HashMap<ThreadId, ActiveThreadInfo> =
                     HashMap::new();
                 for info in live_infos {
                     if info.status == AgentThreadStatus::Running {
@@ -1784,14 +1797,14 @@ impl Sidebar {
                     if info.status == AgentThreadStatus::WaitingForConfirmation {
                         waiting_thread_count += 1;
                     }
-                    live_info_by_session.insert(info.session_id.clone(), info);
+                    live_info_by_thread.insert(info.thread_id, info);
                 }
 
                 // Merge live info into threads and update notification state
                 // in a single pass.
                 for thread in &mut threads {
                     if let Some(session_id) = thread.metadata.session_id.clone() {
-                        if let Some(info) = live_info_by_session.get(&session_id) {
+                        if let Some(info) = live_info_by_thread.get(&thread.metadata.thread_id) {
                             let status = info.status;
                             let thread_id = thread.metadata.thread_id;
                             Arc::make_mut(thread).apply_active_info(info);
@@ -5848,7 +5861,7 @@ impl Sidebar {
             .chain(threads.into_iter().map(ListEntry::Thread))
             .sorted_by_key(|right| std::cmp::Reverse(display_time(right)));
 
-        for entry in row_entries {
+        for entry in Self::nest_forks_under_parents(row_entries.collect()) {
             if let ListEntry::Thread(thread) = &entry {
                 if let Some(session_id) = &thread.metadata.session_id {
                     current_session_ids.insert(session_id.clone());
@@ -5857,6 +5870,26 @@ impl Sidebar {
             }
             entries.push(entry);
         }
+    }
+
+    /// Moves each thread that works in a fork to just below the thread it
+    /// was forked from (the recorded thread, or failing that the most recent
+    /// thread of the parent working tree). A fork whose parent is not in the
+    /// list stays where its time puts it.
+    fn nest_forks_under_parents(rows: Vec<ListEntry>) -> Vec<ListEntry> {
+        agent_ui::nest_forks_under_parents(rows, |row| match row {
+            ListEntry::Thread(thread) => Some(agent_ui::ForkListRow {
+                thread_id: thread.metadata.thread_id,
+                folder_paths: thread
+                    .metadata
+                    .worktree_paths
+                    .folder_path_list()
+                    .paths()
+                    .to_vec(),
+                fork_parent: thread.fork_parent.clone(),
+            }),
+            ListEntry::Terminal(_) | ListEntry::ProjectHeader { .. } => None,
+        })
     }
 
     /// The sort order used by the ctrl-tab switcher
@@ -6466,6 +6499,12 @@ impl Sidebar {
                     }
                 })
             });
+
+        // A thread working in a fork sits, indented, under the thread it
+        // was forked from.
+        let thread_item = div()
+            .when(thread.fork_parent.is_some(), |this| this.pl_4())
+            .child(thread_item);
 
         if is_draft || thread.metadata.session_id.is_none() {
             return thread_item.into_any_element();
@@ -8153,6 +8192,7 @@ fn all_thread_infos_for_workspace(
             let diff_stats = thread.action_log().read(cx).diff_stats(cx);
 
             Some(ActiveThreadInfo {
+                thread_id: conversation_thread_id,
                 session_id,
                 title,
                 status,

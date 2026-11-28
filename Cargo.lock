@@ -4306,7 +4306,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote",
- "syn 3.0.3",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -7049,6 +7049,7 @@ dependencies = [
  "buffer_diff",
  "call",
  "client",
+ "clock",
  "collections",
  "component",
  "ctor",
@@ -7103,6 +7104,7 @@ dependencies = [
  "util",
  "watch",
  "workspace",
+ "worktree",
  "zed_actions",
  "zlog",
  "ztracing",
@@ -17311,6 +17313,49 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "strata-core"
+version = "0.1.0"
+source = "git+https://github.com/xenoop/strata?rev=859d01d75727602e693552944ef9ef8fcb731e29#859d01d75727602e693552944ef9ef8fcb731e29"
+dependencies = [
+ "anyhow",
+ "dugong",
+ "serde_json",
+ "strata-spec",
+]
+
+[[package]]
+name = "strata-spec"
+version = "0.1.0"
+source = "git+https://github.com/xenoop/strata?rev=859d01d75727602e693552944ef9ef8fcb731e29#859d01d75727602e693552944ef9ef8fcb731e29"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "strata_view"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "db",
+ "gpui",
+ "language",
+ "log",
+ "multi_buffer",
+ "project",
+ "serde_json",
+ "settings",
+ "strata-core",
+ "strata-spec",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22631,6 +22676,7 @@ dependencies = [
  "smol",
  "snippet_provider",
  "snippets_ui",
+ "strata_view",
  "svg_preview",
  "sysinfo 0.39.6",
  "system_specs",

@@ -37,7 +37,7 @@ impl Vim {
         Vim::take_forced_motion(cx);
 
         self.update_editor(cx, |vim, editor, cx| {
-            if editor.read_only(cx) {
+            if editor.blocks_user_edits(cx) {
                 return;
             }
 

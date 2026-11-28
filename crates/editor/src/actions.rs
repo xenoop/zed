@@ -937,6 +937,16 @@ actions!(
         ToggleReviewCommentsExpanded,
         /// Sends all stored review comments to the Agent panel.
         SendReviewToAgent,
+        /// Stores the review comment being written and sends it to the agent straight away.
+        SendDiffReviewCommentNow,
+        /// Starts a review comment on the selected lines.
+        CommentOnSelection,
+        /// Hides the review comment boxes, leaving a marker on commented lines,
+        /// or shows them again.
+        ToggleReviewCommentsHidden,
+        /// Toggles comment mode, where typing on code starts a review comment
+        /// instead of editing the file.
+        ToggleCommentMode,
         /// Toggles the selection menu.
         ToggleSelectionMenu,
         /// Toggles soft wrap mode.

@@ -36,6 +36,10 @@ impl FeatureFlag for DiffReviewFeatureFlag {
     fn enabled_for_staff() -> bool {
         false
     }
+
+    fn enabled_for_all() -> bool {
+        true
+    }
 }
 register_feature_flag!(DiffReviewFeatureFlag);
 

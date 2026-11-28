@@ -602,6 +602,37 @@ pub mod agent {
             ResetAgentZoom,
             /// Pastes clipboard content without any formatting.
             PasteRaw,
+            /// Opens the Changes view of the active project: what the agent
+            /// thread changed, against the branch base, the last commit or
+            /// the start of the last turn.
+            OpenThreadChanges,
+            /// Starts a comment on the text selected in the agent's
+            /// messages: quotes the passage in the message editor, ready for
+            /// what you want to say about it.
+            CommentOnTranscriptSelection,
+            /// Forks the active thread: a new thread, with the conversation so
+            /// far as context, working on a copy of the working tree in its
+            /// own git worktree.
+            ForkThread,
+            /// In a fork, merges its changes into the working tree it was
+            /// forked from.
+            MergeIntoParent,
+            /// Merges the changes of this working tree's only fork into it.
+            /// With several forks, pick one from the Forks menu.
+            PullFromFork,
+            /// Starts a review of the active thread's changes in a fork: the
+            /// agent there writes a change guide and you comment on it.
+            ReviewThread,
+            /// In a review fork, tells the reviewed thread the changes are
+            /// approved.
+            ApproveReview,
+            /// In a review fork, tells the reviewed thread what to change.
+            RequestReviewChanges,
+            /// Starts a thread that lands the active thread's changes.
+            LandChanges,
+            /// Sends the agent's last reply in this thread to the thread it
+            /// was forked from or started by.
+            SendToParentThread,
         ]
     );
 

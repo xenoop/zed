@@ -19020,6 +19020,60 @@ async fn test_save_actions_are_hidden_for_read_only_files(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+async fn test_review_comment_mode_keeps_editor_saveable(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_file(path!("/file.rs"), b"one\ntwo\n".to_vec())
+        .await;
+    let project = Project::test(fs.clone(), [path!("/file.rs").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/file.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer.clone(), cx));
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        build_editor_with_project(project.clone(), multi_buffer, window, cx)
+    });
+
+    editor.update(cx, |editor, cx| editor.set_comment_mode(true, cx));
+    editor.update_in(cx, |editor, window, cx| {
+        editor.handle_input("typed", window, cx);
+        editor.edit([(MultiBufferOffset(0)..MultiBufferOffset(0), "typed")], cx);
+    });
+    assert_eq!(
+        buffer.read_with(cx, |buffer, _| buffer.text()),
+        "one\ntwo\n"
+    );
+
+    // The agent edits the buffer directly.
+    buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "agent ")], None, cx));
+    assert!(editor.read_with(cx, |editor, cx| editor.blocks_user_edits(cx)));
+    assert!(editor.read_with(cx, |editor, cx| !editor.read_only(cx)));
+    assert!(editor.read_with(cx, |editor, cx| Item::can_save(editor, cx)));
+
+    let save = editor.update_in(cx, |editor, window, cx| {
+        editor.save(
+            SaveOptions {
+                format: false,
+                force_format: false,
+                autosave: false,
+            },
+            project.clone(),
+            window,
+            cx,
+        )
+    });
+    save.await.unwrap();
+    assert_eq!(
+        fs.load(path!("/file.rs").as_ref()).await.unwrap(),
+        "agent one\ntwo\n"
+    );
+}
+
+#[gpui::test]
 async fn test_document_format_during_save(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
@@ -47487,6 +47541,225 @@ fn test_review_comment_update(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_review_comments_for_agent_are_sorted_and_located(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("one\ntwo\nthree\n", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    _ = editor.update(cx, |editor: &mut Editor, window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let line_three =
+            snapshot.anchor_before(Point::new(2, 0))..snapshot.anchor_after(Point::new(2, 5));
+        let line_one =
+            snapshot.anchor_before(Point::new(0, 0))..snapshot.anchor_after(Point::new(0, 3));
+        let key = test_hunk_key_with_anchor("file.rs", line_one.start);
+        editor.add_review_comment(key.clone(), "Second".to_string(), line_three, cx);
+        editor.add_review_comment(key, "First".to_string(), line_one, cx);
+
+        let comments = editor.send_review_comments_to_agent(window, cx);
+        // Sent comments stay in the diff, waiting for the agent's answers.
+        assert_eq!(editor.total_review_comment_count(), 2);
+        assert_eq!(editor.unsent_review_comment_count(), 0);
+
+        let summary = comments
+            .iter()
+            .map(|comment| {
+                let ReviewCommentCode::Buffer { buffer, range } = &comment.code else {
+                    panic!("expected code in the current file");
+                };
+                let text = buffer
+                    .read(cx)
+                    .text_for_range(range.clone())
+                    .collect::<String>();
+                (
+                    comment.file_path.as_unix_str().to_string(),
+                    text,
+                    comment.comment.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    "file.rs".to_string(),
+                    "one".to_string(),
+                    "First".to_string()
+                ),
+                (
+                    "file.rs".to_string(),
+                    "three".to_string(),
+                    "Second".to_string()
+                ),
+            ]
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_review_comments_for_agent_keep_removed_lines(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+
+    cx.set_state("ˇaaa\nbbb\nccc");
+    cx.set_head_text("aaa\nXXX\nbbb\nccc");
+    cx.run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.expand_all_diff_hunks(&Default::default(), window, cx);
+    });
+    cx.run_until_parked();
+
+    // Multi-buffer rows: 0 "aaa", 1 "XXX" (removed), 2 "bbb", 3 "ccc"
+    cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let anchors =
+            |start: Point, end: Point| snapshot.anchor_before(start)..snapshot.anchor_after(end);
+        let key = test_hunk_key_with_anchor("file", snapshot.anchor_before(Point::new(1, 0)));
+        // Only the removed line.
+        editor.add_review_comment(
+            key.clone(),
+            "Why remove this?".to_string(),
+            anchors(Point::new(1, 0), Point::new(1, 3)),
+            cx,
+        );
+        // Across the removed line, with both ends on current lines.
+        editor.add_review_comment(
+            key.clone(),
+            "Across".to_string(),
+            anchors(Point::new(0, 0), Point::new(2, 3)),
+            cx,
+        );
+        // Current lines only.
+        editor.add_review_comment(
+            key,
+            "Current".to_string(),
+            anchors(Point::new(3, 0), Point::new(3, 3)),
+            cx,
+        );
+
+        let comments = editor.send_review_comments_to_agent(window, cx);
+        let summary = comments
+            .iter()
+            .map(|comment| match &comment.code {
+                ReviewCommentCode::Diff {
+                    text,
+                    row,
+                    starts_on_removed_line,
+                } => format!(
+                    "{}: diff {row} {starts_on_removed_line}\n{text}",
+                    comment.comment
+                ),
+                ReviewCommentCode::Buffer { buffer, range } => format!(
+                    "{}: buffer {}",
+                    comment.comment,
+                    buffer
+                        .read(cx)
+                        .text_for_range(range.clone())
+                        .collect::<String>()
+                ),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            vec![
+                "Across: diff 1 false\n aaa\n-XXX\n bbb\n".to_string(),
+                "Why remove this?: diff 2 true\n-XXX\n".to_string(),
+                "Current: buffer ccc".to_string(),
+            ]
+        );
+    });
+}
+
+#[gpui::test]
+fn test_review_comment_agent_replies(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("one\ntwo\nthree\n", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    _ = editor.update(cx, |editor: &mut Editor, window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let line = |row| {
+            snapshot.anchor_before(Point::new(row, 0))..snapshot.anchor_after(Point::new(row, 3))
+        };
+        let key = test_hunk_key_with_anchor("file.rs", line(0).start);
+        let first = editor.add_review_comment(key.clone(), "Why?".to_string(), line(0), cx);
+        let second = editor.add_review_comment(key.clone(), "And this?".to_string(), line(1), cx);
+        let reply_of = |editor: &Editor, id: usize| {
+            editor
+                .stored_review_comments
+                .iter()
+                .flat_map(|(_, comments)| comments)
+                .find(|comment| comment.id == id)
+                .map(|comment| comment.agent_reply.clone())
+        };
+
+        let sent = editor.send_review_comments_to_agent(window, cx);
+        assert_eq!(
+            sent.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(reply_of(editor, first), Some(AgentReply::Waiting));
+        // Nothing is sent twice while waiting.
+        assert!(editor.send_review_comments_to_agent(window, cx).is_empty());
+
+        editor.set_review_comment_replies(
+            vec![
+                (first, AgentReply::Answered("Because.".to_string())),
+                (second, AgentReply::Failed("skipped".to_string())),
+            ],
+            window,
+            cx,
+        );
+        assert_eq!(
+            reply_of(editor, first),
+            Some(AgentReply::Answered("Because.".to_string()))
+        );
+        // Unanswered comments are sent again; answered ones are not.
+        assert_eq!(editor.unsent_review_comment_count(), 1);
+        let resent = editor.send_review_comments_to_agent(window, cx);
+        assert_eq!(
+            resent.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![second]
+        );
+        // A later comment on the same lines is a reply: it carries the
+        // exchange so far.
+        assert_eq!(
+            resent[0].earlier_exchange,
+            vec![("Why?".to_string(), "Because.".to_string())]
+        );
+        assert!(
+            sent.iter()
+                .all(|comment| comment.earlier_exchange.is_empty())
+        );
+
+        // Editing an answered comment makes it a new question.
+        editor.update_review_comment(first, "Why exactly?".to_string(), cx);
+        assert_eq!(reply_of(editor, first), Some(AgentReply::NotSent));
+        assert_eq!(editor.unsent_review_comment_count(), 1);
+
+        // The review box grows with the answer it shows.
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let before = editor.calculate_overlay_height(&key, true, &snapshot);
+        editor.set_review_comment_replies(
+            vec![(first, AgentReply::Answered("a\nb\nc\nd".to_string()))],
+            window,
+            cx,
+        );
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        assert_eq!(
+            editor.calculate_overlay_height(&key, true, &snapshot),
+            before + 5
+        );
+    });
+}
+
+#[gpui::test]
 fn test_review_comment_take_all(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
@@ -51502,4 +51775,215 @@ fn document_color_rows(
         .collect::<Vec<_>>();
     rows.sort();
     rows
+}
+
+#[gpui::test]
+fn test_hidden_review_comments_leave_markers(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("one\ntwo\nthree\nfour\n", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    _ = editor.update(cx, |editor: &mut Editor, window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let line = |row| {
+            snapshot.anchor_before(Point::new(row, 0))..snapshot.anchor_after(Point::new(row, 3))
+        };
+        // Two comments on the first line, one on the third.
+        let first_place = test_hunk_key_with_anchor("file.rs", line(0).start);
+        let second_place = test_hunk_key_with_anchor("file.rs", line(2).start);
+        editor.add_review_comment(first_place.clone(), "Why?".to_string(), line(0), cx);
+        let answered = editor.add_review_comment(first_place, "And this?".to_string(), line(0), cx);
+        editor.add_review_comment(second_place, "Rename".to_string(), line(2), cx);
+        editor.set_review_comment_replies(
+            vec![(answered, AgentReply::Answered("Because.".to_string()))],
+            window,
+            cx,
+        );
+        assert_eq!(
+            crate::git::hidden_review_comment_marker_label(2, 1).as_ref(),
+            "2 comments, partly answered"
+        );
+        assert_eq!(
+            crate::git::hidden_review_comment_marker_label(1, 1).as_ref(),
+            "1 comment, answered"
+        );
+
+        editor.set_review_comments_hidden(true, window, cx);
+        assert!(editor.diff_review_overlays.is_empty());
+        let markers = editor.hidden_review_comment_marker_ranges();
+        assert_eq!(markers.len(), 2);
+        assert_eq!(editor.total_review_comment_count(), 3);
+
+        // Opening one marker opens that place's box and leaves the other
+        // place hidden behind its marker.
+        assert!(editor.open_hidden_review_comments(&markers[0], window, cx));
+        assert_eq!(editor.diff_review_overlays.len(), 1);
+        assert_eq!(editor.hidden_review_comment_marker_ranges().len(), 1);
+        assert!(editor.review_comments_hidden());
+        assert!(!editor.open_hidden_review_comments(&markers[0], window, cx));
+
+        // Showing comments again removes every marker.
+        editor.set_review_comments_hidden(false, window, cx);
+        assert!(editor.hidden_review_comment_marker_ranges().is_empty());
+        assert_eq!(editor.diff_review_overlays.len(), 2);
+    });
+}
+
+#[gpui::test]
+fn test_second_review_comment_keeps_its_own_range(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("one\ntwo\nthree\nfour\n", cx);
+        build_editor(buffer, window, cx)
+    });
+
+    _ = editor.update(cx, |editor: &mut Editor, window, cx| {
+        for (rows, text) in [(0..0, "First"), (0..2, "Second")] {
+            let snapshot = editor.snapshot(window, cx);
+            let display_row = |row: u32| {
+                Point::new(row, 0)
+                    .to_display_point(&snapshot.display_snapshot)
+                    .row()
+            };
+            let prompt_editor = editor
+                .open_diff_review_overlay(
+                    display_row(rows.start)..display_row(rows.end),
+                    true,
+                    window,
+                    cx,
+                )
+                .expect("review box opens");
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.set_text(text, window, cx);
+            });
+            editor.submit_diff_review_comment(window, cx);
+        }
+
+        assert_eq!(editor.diff_review_overlays.len(), 1);
+        let saved = editor.saved_review_comments(cx);
+        assert_eq!(
+            saved
+                .iter()
+                .map(|comment| (comment.comment.as_str(), comment.start_row, comment.end_row))
+                .collect::<Vec<_>>(),
+            vec![("First", 0, 0), ("Second", 0, 2)]
+        );
+    });
+}
+
+async fn editor_on_file_with_one_line_comment(
+    cx: &mut TestAppContext,
+) -> (Entity<Editor>, &mut VisualTestContext) {
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/root"), json!({ "file.rs": "one\ntwo\nthree\n" }))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/root/file.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    cx.add_window_view(|window, cx| {
+        build_editor_with_project(project.clone(), multi_buffer, window, cx)
+    })
+}
+
+fn saved_comment_on_first_line() -> SavedReviewComment {
+    SavedReviewComment {
+        file_path: "file.rs".to_string(),
+        start_row: 0,
+        end_row: 0,
+        code: "one".to_string(),
+        comment: "Why?".to_string(),
+        answer: None,
+        outdated: false,
+    }
+}
+
+#[gpui::test]
+async fn test_hidden_review_comment_markers_follow_the_answers(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let (editor, cx) = editor_on_file_with_one_line_comment(cx).await;
+
+    editor.update_in(cx, |editor, window, cx| {
+        let unplaced =
+            editor.restore_review_comments(vec![saved_comment_on_first_line()], window, cx);
+        assert!(unplaced.is_empty());
+        editor.set_review_comments_hidden(true, window, cx);
+        assert_eq!(
+            editor.hidden_review_comment_marker_labels(),
+            vec![SharedString::from("1 comment, not answered yet")]
+        );
+
+        let id = editor.stored_review_comments[0].1[0].id;
+        editor.set_review_comment_replies(
+            vec![(id, AgentReply::Answered("Because.".to_string()))],
+            window,
+            cx,
+        );
+        assert_eq!(
+            editor.hidden_review_comment_marker_labels(),
+            vec![SharedString::from("1 comment, answered")]
+        );
+        assert_eq!(editor.hidden_review_comment_marker_count(cx), 1);
+    });
+}
+
+#[gpui::test]
+async fn test_hiding_review_comments_collapses_the_box_at_the_cursor(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let (editor, cx) = editor_on_file_with_one_line_comment(cx).await;
+
+    editor.update_in(cx, |editor, window, cx| {
+        let unplaced =
+            editor.restore_review_comments(vec![saved_comment_on_first_line()], window, cx);
+        assert!(unplaced.is_empty());
+        assert_eq!(editor.diff_review_overlays.len(), 1);
+
+        editor.set_review_comments_hidden(true, window, cx);
+        assert!(editor.diff_review_overlays.is_empty());
+        assert_eq!(editor.hidden_review_comment_marker_ranges().len(), 1);
+
+        let marker = editor.hidden_review_comment_marker_ranges()[0].clone();
+        assert!(editor.open_hidden_review_comments(&marker, window, cx));
+        editor.set_review_comments_hidden(true, window, cx);
+        assert!(editor.diff_review_overlays.is_empty());
+        assert_eq!(editor.hidden_review_comment_marker_ranges().len(), 1);
+
+        assert!(editor.open_hidden_review_comments(&marker, window, cx));
+        let prompt_editor = editor.diff_review_overlays[0].prompt_editor.clone();
+        prompt_editor.update(cx, |prompt_editor, cx| {
+            prompt_editor.set_text("Half-written", window, cx);
+        });
+        editor.set_review_comments_hidden(true, window, cx);
+        assert_eq!(editor.diff_review_overlays.len(), 1);
+        assert!(editor.hidden_review_comment_marker_ranges().is_empty());
+    });
+}
+
+#[gpui::test]
+async fn test_restoring_review_comments_while_hidden_opens_no_box(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let (editor, cx) = editor_on_file_with_one_line_comment(cx).await;
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.set_review_comments_hidden(true, window, cx);
+        let unplaced =
+            editor.restore_review_comments(vec![saved_comment_on_first_line()], window, cx);
+        assert!(unplaced.is_empty());
+
+        assert!(editor.diff_review_overlays.is_empty());
+        assert_eq!(editor.total_review_comment_count(), 1);
+        assert_eq!(
+            editor.hidden_review_comment_marker_labels(),
+            vec![SharedString::from("1 comment, not answered yet")]
+        );
+        assert_eq!(editor.hidden_review_comment_marker_count(cx), 1);
+    });
 }
