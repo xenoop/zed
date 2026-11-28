@@ -81,6 +81,20 @@ const EDGE_OPACITY: f32 = 0.7;
 const LABEL_BACKGROUND_OPACITY: f32 = 0.92;
 const GRID_OPACITY: f32 = 0.07;
 
+/// Boxes sized for the card's text plus its header, rather than LikeC4's
+/// taller 320 by 180 minimum, so cards hold no empty space.
+pub fn card_sizing() -> strata_core::layout::NodeSizing {
+    strata_core::layout::NodeSizing {
+        width: CARD_WIDTH,
+        min_height: CARD_MIN_HEIGHT,
+        header: CARD_HEADER_HEIGHT + CARD_HEADER_GAP,
+    }
+}
+
+pub const CARD_WIDTH: f32 = 288.0;
+pub const CARD_MIN_HEIGHT: f32 = 112.0;
+pub const CARD_FIT_TOLERANCE: f32 = 6.0;
+
 /// The card header: the element kind's icon and name, and a change badge.
 pub const CARD_HEADER_HEIGHT: f32 = 20.0;
 pub const CARD_HEADER_GAP: f32 = 10.0;

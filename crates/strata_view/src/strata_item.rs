@@ -15,7 +15,7 @@ use language::{Buffer, BufferEvent};
 use multi_buffer::MultiBuffer;
 use settings::Settings;
 use strata_core::diff::{ElementChange, RelationshipChange, diff_into};
-use strata_core::layout::{self, Layout, LayoutEngine, Measure, Rect};
+use strata_core::layout::{self, EdgeRouting, Layout, LayoutEngine, Measure, Rect};
 use strata_core::timeline::{Timeline, step_timeline};
 use strata_spec::{Diagnostic, Element, Relationship, Spec, Step};
 use theme::ActiveTheme;
@@ -471,12 +471,21 @@ impl StrataView {
         let font = ThemeSettings::get_global(cx).ui_font.clone();
         // Text shaping is bound to this thread, so measure here and lay out in
         // the background from the measured sizes.
-        let measure = Measure::new(&spec, &WindowText::new(window.text_system().clone(), font));
+        let measure = Measure::with_sizing(
+            &spec,
+            &WindowText::new(window.text_system().clone(), font),
+            &diagram_theme::card_sizing(),
+        );
         self.layout_task = cx.spawn_in(window, async move |this, cx| {
             let layout_spec = spec.clone();
             let result = cx
                 .background_spawn(async move {
-                    layout::union_layout(&layout_spec, &measure, LayoutEngine::Dugong)
+                    layout::union_layout_routed(
+                        &layout_spec,
+                        &measure,
+                        LayoutEngine::Dugong,
+                        EdgeRouting::Orthogonal,
+                    )
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {

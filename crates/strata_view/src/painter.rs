@@ -148,21 +148,52 @@ impl TextCache {
         if let Some(block) = self.entries.get(&key) {
             return Some(block.clone());
         }
-        let font = self.font.as_ref()?;
-        let shaped = window
-            .text_system()
-            .shape_text(
-                text.clone(),
-                px(font_size),
-                &[run_for(text, font, weight, tint)],
-                wrap_width.map(px),
-                max_lines,
-            )
-            .map_err(|error| log::error!("strata: could not shape text: {error}"))
-            .ok()?;
-        let block = Rc::new(ShapedBlock {
-            lines: shaped.into_iter().collect(),
-        });
+        let font = self.font.clone()?;
+        let shape = |text: &SharedString| {
+            window
+                .text_system()
+                .shape_text(
+                    text.clone(),
+                    px(font_size),
+                    &[run_for(text, &font, weight, tint)],
+                    wrap_width.map(px),
+                    None,
+                )
+                .map_err(|error| log::error!("strata: could not shape text: {error}"))
+                .ok()
+                .map(|lines| lines.into_iter().collect::<Vec<WrappedLine>>())
+        };
+        let visual_lines = |lines: &[WrappedLine]| {
+            lines
+                .iter()
+                .map(|line| line.wrap_boundaries().len() + 1)
+                .sum::<usize>()
+        };
+        let mut lines = shape(text)?;
+        // GPUI's line clamp cuts a paragraph without wrapping what is left,
+        // so text over its line limit is shortened here, with an ellipsis,
+        // to the longest prefix that wraps within the limit.
+        if let Some(limit) = max_lines
+            && visual_lines(&lines) > limit
+        {
+            let characters: Vec<char> = text.chars().collect();
+            let (mut fits, mut too_long) = (0, characters.len());
+            let mut best = None;
+            while too_long - fits > 1 {
+                let middle = (fits + too_long) / 2;
+                let prefix: String = characters.iter().take(middle).collect();
+                let candidate = SharedString::from(format!("{}\u{2026}", prefix.trim_end()));
+                match shape(&candidate) {
+                    Some(shaped) if visual_lines(&shaped) <= limit => {
+                        fits = middle;
+                        best = Some(shaped);
+                    }
+                    _ => too_long = middle,
+                }
+            }
+            lines = best.unwrap_or_default();
+        }
+        let block = Rc::new(ShapedBlock { lines });
         self.entries.insert(key, block.clone());
         Some(block)
     }
@@ -659,70 +690,86 @@ impl Painter<'_> {
             gap_before: f32,
         }
         let mut entries: Vec<Entry> = Vec::new();
-        let mut push = |this: &mut Self,
-                        text: &SharedString,
-                        role: TextRole,
-                        max_lines: usize,
-                        tint: Hsla,
-                        gap_before: f32| {
-            let block = this.cache.shape(
-                window,
-                text,
-                role.font_size() * scale,
-                role.font_weight(),
-                tint,
-                Some(text_width * scale),
-                Some(max_lines),
-            );
-            if let Some(block) = block {
-                entries.push(Entry {
+        let shape = |this: &mut Self,
+                     text: &SharedString,
+                     role: TextRole,
+                     max_lines: usize,
+                     tint: Hsla,
+                     gap_before: f32| {
+            this.cache
+                .shape(
+                    window,
+                    text,
+                    role.font_size() * scale,
+                    role.font_weight(),
+                    tint,
+                    Some(text_width * scale),
+                    Some(max_lines),
+                )
+                .map(|block| Entry {
                     block,
                     role,
                     gap_before,
-                });
-            }
+                })
         };
-        push(
+        entries.extend(shape(
             self,
             &text.title,
             TextRole::Title,
             TITLE_MAX_LINES,
             title_tint,
             0.0,
-        );
+        ));
         if let Some(technology) = &text.technology {
-            push(
+            entries.extend(shape(
                 self,
                 technology,
                 TextRole::Technology,
                 TECHNOLOGY_MAX_LINES,
                 technology_tint,
                 theme::TECHNOLOGY_GAP,
-            );
+            ));
         }
+        let line_heights = |entries: &[Entry]| -> f32 {
+            entries
+                .iter()
+                .map(|entry| {
+                    Self::block_height(&entry.block, entry.role.line_height() * scale)
+                        + entry.gap_before * scale
+                })
+                .sum()
+        };
+        let available = f32::from(bounds.size.height) - (top + bottom) * scale;
+        let header_height = (theme::CARD_HEADER_HEIGHT + theme::CARD_HEADER_GAP) * scale;
+        let tolerance = theme::CARD_FIT_TOLERANCE * scale;
+        let with_header = line_heights(&entries) + header_height <= available + tolerance;
+        // Shaped at a zoomed size, text can wrap onto a line more than the
+        // layout measured; the description gives up lines so the card keeps
+        // its header and nothing spills out of the box.
         if let Some(description) = &text.description {
-            push(
-                self,
-                description,
-                TextRole::Description,
-                DESCRIPTION_MAX_LINES,
-                secondary,
-                CONTENT_GAP,
-            );
+            let room = available + tolerance
+                - line_heights(&entries)
+                - if with_header { header_height } else { 0.0 }
+                - CONTENT_GAP * scale;
+            let line_height = TextRole::Description.line_height() * scale;
+            let lines = ((room / line_height).floor().max(0.0) as usize).min(DESCRIPTION_MAX_LINES);
+            if lines > 0 {
+                entries.extend(shape(
+                    self,
+                    description,
+                    TextRole::Description,
+                    lines,
+                    secondary,
+                    CONTENT_GAP,
+                ));
+            }
         }
 
         let heights: Vec<f32> = entries
             .iter()
             .map(|entry| Self::block_height(&entry.block, entry.role.line_height() * scale))
             .collect();
-        let text_height = entries
-            .iter()
-            .zip(&heights)
-            .map(|(entry, height)| height + entry.gap_before * scale)
-            .sum::<f32>();
-        let available = f32::from(bounds.size.height) - (top + bottom) * scale;
-        let header_height = (theme::CARD_HEADER_HEIGHT + theme::CARD_HEADER_GAP) * scale;
-        let with_header = text_height + header_height <= available;
+        let text_height = line_heights(&entries);
         let x = f32::from(bounds.origin.x) + left * scale;
         // Cards are sized for their longest text, so a shorter one centers
         // its content rather than leaving the space below it.

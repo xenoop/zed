@@ -4306,7 +4306,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote",
- "syn 3.0.3",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -17315,7 +17315,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "strata-core"
 version = "0.1.0"
-source = "git+https://github.com/xenoop/strata?rev=d044a8209218418173fbd52eca07723eb7ce8a82#d044a8209218418173fbd52eca07723eb7ce8a82"
+source = "git+https://github.com/xenoop/strata?rev=1232631fee970e2ea66d410f6f44cae828a9668a#1232631fee970e2ea66d410f6f44cae828a9668a"
 dependencies = [
  "anyhow",
  "dugong",
@@ -17326,7 +17326,7 @@ dependencies = [
 [[package]]
 name = "strata-spec"
 version = "0.1.0"
-source = "git+https://github.com/xenoop/strata?rev=d044a8209218418173fbd52eca07723eb7ce8a82#d044a8209218418173fbd52eca07723eb7ce8a82"
+source = "git+https://github.com/xenoop/strata?rev=1232631fee970e2ea66d410f6f44cae828a9668a#1232631fee970e2ea66d410f6f44cae828a9668a"
 dependencies = [
  "anyhow",
  "serde",
