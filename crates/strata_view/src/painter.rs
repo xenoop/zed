@@ -343,8 +343,11 @@ impl Painter<'_> {
             border,
             border_style,
         ));
-        // Titles stay legible when zoomed out, like labels on a map.
-        let size_px = theme::COMPOUND_TITLE_SIZE.max(theme::COMPOUND_TITLE_MIN_SCREEN_SIZE / scale);
+        // Titles stay legible when zoomed out, like labels on a map, but no
+        // larger than the title strip the layout keeps for them.
+        let size_px = theme::COMPOUND_TITLE_SIZE.max(
+            (theme::COMPOUND_TITLE_MIN_SCREEN_SIZE / scale).min(theme::COMPOUND_TITLE_MAX_SIZE),
+        );
         let title_origin_y = theme::COMPOUND_TITLE_TOP
             + ((theme::COMPOUND_TITLE_MIN_HEIGHT - size_px) / 2.0).max(0.0);
         let title_color = match (mark, item.look.ghost) {

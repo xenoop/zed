@@ -15,7 +15,7 @@ use language::{Buffer, BufferEvent};
 use multi_buffer::MultiBuffer;
 use settings::Settings;
 use strata_core::diff::{ElementChange, RelationshipChange, diff_into};
-use strata_core::layout::{self, EdgeRouting, Layout, LayoutEngine, Measure, Rect};
+use strata_core::layout::{self, EdgeRouting, Layout, LayoutEngine, LayoutSpacing, Measure, Rect};
 use strata_core::timeline::{Timeline, step_timeline_in};
 use strata_spec::{Diagnostic, Element, Relationship, Spec, Step};
 use theme::ActiveTheme;
@@ -500,11 +500,12 @@ impl StrataView {
             let layout_spec = spec.clone();
             let result = cx
                 .background_spawn(async move {
-                    layout::union_layout_routed(
+                    layout::union_layout_styled(
                         &layout_spec,
                         &measure,
                         LayoutEngine::Dugong,
                         EdgeRouting::Orthogonal,
+                        LayoutSpacing::COMPACT,
                     )
                 })
                 .await;

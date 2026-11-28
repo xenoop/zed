@@ -128,6 +128,9 @@ pub const COMPOUND_BORDER_WIDTH: f32 = 1.0;
 pub const COMPOUND_RADIUS: f32 = 8.0;
 pub const COMPOUND_TITLE_SIZE: f32 = 12.0;
 pub const COMPOUND_TITLE_MIN_SCREEN_SIZE: f32 = 10.0;
+/// The largest a title grows to, in layout pixels: it fits the 40 px title
+/// strip of `LayoutSpacing::COMPACT` with room above and below.
+pub const COMPOUND_TITLE_MAX_SIZE: f32 = 24.0;
 /// Screen pixels kept between a boundary title and the boundary edge.
 pub const COMPOUND_TITLE_MIN_INSET: f32 = 6.0;
 pub const COMPOUND_TITLE_LEFT: f32 = 10.0;
