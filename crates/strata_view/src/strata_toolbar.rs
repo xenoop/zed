@@ -1,6 +1,7 @@
 use gpui::{
-    Context, Entity, EventEmitter, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render,
-    Styled, Subscription, Window, canvas, div, px, relative,
+    Context, DispatchPhase, Entity, EventEmitter, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Render, Styled, Subscription, Window, canvas, div,
+    px, relative,
 };
 use strata_core::timeline::Beat;
 use theme::ActiveTheme;
@@ -128,6 +129,7 @@ impl Render for StrataToolbar {
             None => usize::MAX,
         };
         let scrubber_bounds = view.scrubber_bounds();
+        let scrubbing = view.is_scrubbing();
         let stack_name = spec.stack_name();
         let step_id = step.id.clone();
         let step_title = step.title.clone();
@@ -157,20 +159,6 @@ impl Render for StrataToolbar {
             .bg(colors.toolbar_background)
             .border_b_1()
             .border_color(colors.border_variant)
-            .on_mouse_move({
-                let view = view_entity.clone();
-                move |event, _, cx| {
-                    view.update(cx, |view, cx| view.move_scrub(event, cx));
-                }
-            })
-            .on_mouse_up(MouseButton::Left, {
-                let view = view_entity.clone();
-                move |_, _, cx| view.update(cx, |view, _| view.end_scrub())
-            })
-            .on_mouse_up_out(MouseButton::Left, {
-                let view = view_entity.clone();
-                move |_, _, cx| view.update(cx, |view, _| view.end_scrub())
-            })
             .child(
                 div().min_w_0().truncate().child(
                     Label::new(stack_name)
@@ -230,10 +218,14 @@ impl Render for StrataToolbar {
                     .h(px(20.))
                     .cursor_pointer()
                     .child(
-                        canvas(
-                            move |bounds, _, _| scrubber_bounds.set(Some(bounds)),
-                            |_, _, _, _| {},
-                        )
+                        canvas(move |bounds, _, _| scrubber_bounds.set(Some(bounds)), {
+                            let view = view_entity.clone();
+                            move |_, _, window, _| {
+                                if scrubbing {
+                                    track_scrub_drag(&view, window);
+                                }
+                            }
+                        })
                         .absolute()
                         .size_full(),
                     )
@@ -318,4 +310,25 @@ impl Render for StrataToolbar {
             )
             .into_any_element()
     }
+}
+
+/// While the scrubber is dragged, follow the mouse anywhere in the window, so
+/// the drag keeps going when it leaves the toolbar.
+fn track_scrub_drag(view: &Entity<StrataView>, window: &mut Window) {
+    window.on_mouse_event({
+        let view = view.clone();
+        move |event: &MouseMoveEvent, phase, _, cx| {
+            if phase == DispatchPhase::Capture {
+                view.update(cx, |view, cx| view.move_scrub(event, cx));
+            }
+        }
+    });
+    window.on_mouse_event({
+        let view = view.clone();
+        move |event: &MouseUpEvent, phase, _, cx| {
+            if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                view.update(cx, |view, _| view.end_scrub());
+            }
+        }
+    });
 }

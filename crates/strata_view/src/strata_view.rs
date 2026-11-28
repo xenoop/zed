@@ -184,4 +184,39 @@ mod tests {
             assert_eq!(view.spec().steps[3].title, "Renamed last step");
         });
     }
+
+    /// Prints the time to lay out and paint one frame of the fixture while a
+    /// step plays. Run with
+    /// `cargo test -p strata_view --release -- --ignored --nocapture frame_cost`.
+    #[gpui::test]
+    #[ignore]
+    async fn frame_cost(cx: &mut TestAppContext) {
+        use gpui::{ParentElement as _, Styled as _, div, point, px, size};
+        use std::time::Instant;
+
+        let (_buffer, view, cx) = open_preview(STACK, cx);
+        view.update(cx, |view, cx| {
+            view.play_step(2, cx);
+        });
+        let mut frames = Vec::new();
+        for _ in 0..240 {
+            view.update(cx, |view, _| view.tick(1.0 / 120.0));
+            let started = Instant::now();
+            cx.draw(
+                point(px(0.0), px(0.0)),
+                size(px(1600.0), px(1000.0)),
+                |_, _| div().size_full().child(view.clone()),
+            );
+            frames.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        frames.sort_by(f64::total_cmp);
+        let percentile = |share: f64| frames[((frames.len() - 1) as f64 * share) as usize];
+        println!(
+            "frame cost over {} frames: median {:.2} ms, p95 {:.2} ms, max {:.2} ms",
+            frames.len(),
+            percentile(0.5),
+            percentile(0.95),
+            percentile(1.0)
+        );
+    }
 }

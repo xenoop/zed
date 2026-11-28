@@ -1,7 +1,8 @@
 use anyhow::Result;
+use db::kvp::KeyValueStore;
 use gpui::{
     App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    ParentElement, Pixels, Render, Styled, Subscription, WeakEntity, Window, px,
+    ParentElement, Pixels, Render, Styled, Subscription, Task, WeakEntity, Window, px,
 };
 use strata_core::diff::{ElementChange, StepDiff, diff, diff_into};
 use theme::ActiveTheme;
@@ -9,6 +10,7 @@ use ui::{
     Button, ButtonCommon, ButtonStyle, Clickable, Color, Icon, IconName, IconSize, Label,
     LabelCommon, LabelSize, ListItem, ListItemSpacing, h_flex, v_flex,
 };
+use util::ResultExt;
 use workspace::Workspace;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 
@@ -16,6 +18,8 @@ use crate::{OpenStack, StrataView, ToggleFocus};
 use ui::prelude::*;
 
 const PANEL_KEY: &str = "StrataPanel";
+/// The dock side is a preference, so it is kept for every workspace.
+const POSITION_KEY: &str = "StrataPanel-position";
 const DEFAULT_WIDTH: f32 = 260.0;
 
 /// Lists the steps of the stack that the active stack view shows: the
@@ -27,6 +31,7 @@ pub struct StrataPanel {
     view: Option<WeakEntity<StrataView>>,
     view_subscription: Option<Subscription>,
     _workspace_subscription: Subscription,
+    pending_position_write: Task<()>,
 }
 
 impl EventEmitter<PanelEvent> for StrataPanel {}
@@ -42,8 +47,25 @@ impl StrataPanel {
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
     ) -> Result<Entity<Self>> {
+        let kvp = cx.update(|_, cx| KeyValueStore::global(cx))?;
+        let position = cx
+            .background_spawn(async move { kvp.read_kvp(POSITION_KEY) })
+            .await
+            .log_err()
+            .flatten()
+            .and_then(|stored| match stored.as_str() {
+                "right" => Some(DockPosition::Right),
+                "left" => Some(DockPosition::Left),
+                _ => None,
+            });
         workspace.update_in(&mut cx, |workspace, window, cx| {
-            cx.new(|cx| Self::new(workspace, window, cx))
+            cx.new(|cx| {
+                let mut panel = Self::new(workspace, window, cx);
+                if let Some(position) = position {
+                    panel.position = position;
+                }
+                panel
+            })
         })
     }
 
@@ -73,6 +95,7 @@ impl StrataPanel {
             view: None,
             view_subscription: None,
             _workspace_subscription: workspace_subscription,
+            pending_position_write: Task::ready(()),
         };
         // The workspace is mid-update while it builds its panels, so the
         // active item comes from the reference rather than the entity.
@@ -326,6 +349,16 @@ impl Panel for StrataPanel {
         cx: &mut Context<Self>,
     ) {
         self.position = position;
+        let stored = match position {
+            DockPosition::Right => "right",
+            DockPosition::Left | DockPosition::Bottom => "left",
+        };
+        let kvp = KeyValueStore::global(cx);
+        self.pending_position_write = cx.background_spawn(async move {
+            kvp.write_kvp(POSITION_KEY.to_string(), stored.to_string())
+                .await
+                .log_err();
+        });
         cx.notify();
     }
 

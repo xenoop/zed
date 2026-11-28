@@ -45,6 +45,9 @@ const FIT_MARGIN: f32 = 24.0;
 const CLICK_SLOP: f32 = 4.0;
 const DETAILS_WIDTH: f32 = 320.0;
 const DETAILS_GAP: f32 = 8.0;
+const DETAILS_MIN_HEIGHT: f32 = 360.0;
+/// Room kept free at the canvas's bottom for the zoom controls.
+const ZOOM_CONTROLS_CLEARANCE: f32 = 48.0;
 
 /// How long after the last edit the preview waits before parsing the buffer.
 pub const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
@@ -803,6 +806,10 @@ impl StrataView {
         }
     }
 
+    pub fn is_scrubbing(&self) -> bool {
+        self.scrubbing
+    }
+
     pub fn end_scrub(&mut self) {
         self.scrubbing = false;
     }
@@ -1546,10 +1553,29 @@ impl StrataView {
                 }
             }
         };
+        // Vertically, start level with the element but stay clear of the
+        // zoom controls in the canvas's bottom corner, scrolling if needed.
+        let (top, max_height) = match self.canvas_bounds.get() {
+            None => (target.top(), None),
+            Some(canvas) => {
+                let floor = canvas.bottom() - px(ZOOM_CONTROLS_CLEARANCE);
+                let ceiling = canvas.top() + gap;
+                let top = target
+                    .top()
+                    .min(floor - px(DETAILS_MIN_HEIGHT))
+                    .max(ceiling);
+                (top, Some(floor - top))
+            }
+        };
+        let card = div()
+            .id("strata-details-scroll")
+            .when_some(max_height, |this, height| this.max_h(height))
+            .overflow_y_scroll()
+            .child(card);
         Some(
             gpui::deferred(
                 gpui::anchored()
-                    .position(point(left, target.top()))
+                    .position(point(left, top))
                     .anchor(gpui::Anchor::TopLeft)
                     .snap_to_window_with_margin(px(8.))
                     .child(card),
