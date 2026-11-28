@@ -51,6 +51,10 @@ actions!(
         FitToView,
         /// Frames what the current step changes.
         FrameChanges,
+        /// Switches between one stable layout of every step, where nothing
+        /// that stays moves, and a layout that fits each step on its own,
+        /// where what stays settles into the room the step leaves.
+        ToggleFitEachStep,
     ]
 );
 
@@ -121,6 +125,26 @@ mod tests {
             assert_eq!(view.step_index(), 3);
             assert_eq!(view.phase(), Some(Phase::After));
         });
+    }
+
+    #[gpui::test]
+    async fn a_step_plays_in_either_layout(cx: &mut TestAppContext) {
+        let (_buffer, view, cx) = open_preview(STACK, cx);
+        for fit_each_step in [true, false] {
+            view.update(cx, |view, cx| {
+                view.toggle_fit_each_step(cx);
+                assert_eq!(view.fit_each_step(), fit_each_step);
+                assert!(view.is_ready());
+                assert_eq!(view.phase(), Some(Phase::After));
+                view.play_step(2, cx);
+                let duration = view.duration();
+                assert!(duration > 0.0);
+                view.tick(duration / 2.0);
+                assert_eq!(view.phase(), None);
+                view.tick(duration);
+                assert_eq!(view.phase(), Some(Phase::After));
+            });
+        }
     }
 
     #[gpui::test]

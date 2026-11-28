@@ -15,8 +15,10 @@ use language::{Buffer, BufferEvent};
 use multi_buffer::MultiBuffer;
 use settings::Settings;
 use strata_core::diff::{ElementChange, RelationshipChange, diff_into};
-use strata_core::layout::{self, EdgeRouting, Layout, LayoutEngine, LayoutSpacing, Measure, Rect};
-use strata_core::timeline::{Timeline, step_timeline_in};
+use strata_core::layout::{
+    self, EdgeRouting, LayoutEngine, LayoutSpacing, Measure, Rect, StepLayouts,
+};
+use strata_core::timeline::{Placement, Timeline, step_timeline_placed};
 use strata_spec::{Diagnostic, Element, Relationship, Spec, Step};
 use theme::ActiveTheme;
 use theme_settings::ThemeSettings;
@@ -37,7 +39,7 @@ use crate::scene::{NodeItem, Phase, Scene};
 use crate::{
     CloseDetails, FitToView, FrameChanges, NextStep, OpenPreview, OpenPreviewToTheSide,
     PreviousStep, ScrubBackward, ScrubForward, ShowAfter, ShowBefore, SlowDown, SpeedUp,
-    TogglePlayback, ZoomIn, ZoomOut,
+    ToggleFitEachStep, TogglePlayback, ZoomIn, ZoomOut,
 };
 
 const ZOOM_PER_PIXEL: f32 = 0.005;
@@ -137,6 +139,41 @@ fn interpolate_view(
         scale,
         offset: point(middle.x - center.x * scale, middle.y - center.y * scale),
     }
+}
+
+/// How fast every animation clock of the view runs: 1 normally. Recording
+/// the view in a slow environment (software rendering draws only a few
+/// frames a second) sets `STRATA_RECORDING_TIME_SCALE` below 1, so the
+/// animation plays in slow motion and a recording sped back up by the same
+/// factor shows every frame.
+fn recording_time_scale() -> f32 {
+    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("STRATA_RECORDING_TIME_SCALE")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .filter(|scale| *scale > 0.0 && *scale <= 1.0)
+            .unwrap_or(1.0)
+    })
+}
+
+/// Seconds of animation time since `since`.
+fn seconds_since(since: Instant) -> f32 {
+    since.elapsed().as_secs_f32() * recording_time_scale()
+}
+
+/// The layouts at the two ends of `step_index`: the stable layout at both,
+/// or with `fit_each_step`, the previous step's own layout and this one's.
+fn placement(layouts: &StepLayouts, step_index: usize, fit_each_step: bool) -> Placement<'_> {
+    if !fit_each_step {
+        return Placement::stable(&layouts.union);
+    }
+    let after = layouts.steps.get(step_index).unwrap_or(&layouts.union);
+    let before = step_index
+        .checked_sub(1)
+        .and_then(|index| layouts.steps.get(index))
+        .unwrap_or(after);
+    Placement { before, after }
 }
 
 fn union(first: Rect, second: Rect) -> Rect {
@@ -243,7 +280,7 @@ impl Camera {
                 false,
             );
         };
-        let progress = glide.started.elapsed().as_secs_f32() / GLIDE_SECONDS;
+        let progress = seconds_since(glide.started) / GLIDE_SECONDS;
         if progress >= 1.0 {
             let target = glide.to;
             self.glide = None;
@@ -273,7 +310,7 @@ enum State {
     Waiting,
     Laying,
     Ready {
-        layout: Rc<Layout>,
+        layouts: Rc<StepLayouts>,
         timeline: Rc<Timeline>,
         scene: Rc<Scene>,
     },
@@ -318,6 +355,9 @@ pub struct StrataView {
     hovered: Option<String>,
     /// Playback of a newly shown step waits while the camera glides to it.
     awaiting_camera: bool,
+    /// Lay each step out on its own, fitting what it holds, instead of the
+    /// stable layout of every step at once.
+    fit_each_step: bool,
     /// The picture of the step shown before the current one, fading out
     /// since the moment the step changed.
     outgoing: Option<(Rc<Scene>, Instant)>,
@@ -375,6 +415,7 @@ impl StrataView {
             framing: Framing::Changes,
             hovered: None,
             awaiting_camera: false,
+            fit_each_step: false,
             outgoing: None,
             change_rects: Vec::new(),
             change_region_step: None,
@@ -500,7 +541,7 @@ impl StrataView {
             let layout_spec = spec.clone();
             let result = cx
                 .background_spawn(async move {
-                    layout::union_layout_styled(
+                    layout::step_layouts(
                         &layout_spec,
                         &measure,
                         LayoutEngine::Dugong,
@@ -511,7 +552,7 @@ impl StrataView {
                 .await;
             this.update_in(cx, |this, window, cx| {
                 match result {
-                    Ok(layout) => this.install(spec, Rc::new(layout), keep, window, cx),
+                    Ok(layouts) => this.install(spec, Rc::new(layouts), keep, window, cx),
                     Err(error) => {
                         log::error!("strata: layout failed: {error:#}");
                         this.state = State::Failed(format!("Layout failed: {error:#}"));
@@ -526,7 +567,7 @@ impl StrataView {
     fn install(
         &mut self,
         spec: Arc<Spec>,
-        layout: Rc<Layout>,
+        layouts: Rc<StepLayouts>,
         keep: Option<String>,
         _window: &mut Window,
         cx: &mut Context<Self>,
@@ -538,9 +579,13 @@ impl StrataView {
         self.spec = spec;
         self.step_index = step_index;
         self.state = State::Ready {
-            timeline: Rc::new(step_timeline_in(&self.spec, step_index, &layout)),
+            timeline: Rc::new(step_timeline_placed(
+                &self.spec,
+                step_index,
+                placement(&layouts, step_index, self.fit_each_step),
+            )),
             scene: Rc::new(Scene::empty()),
-            layout,
+            layouts,
         };
         let end = self.duration();
         self.seek(end);
@@ -577,23 +622,24 @@ impl StrataView {
         }
     }
 
-    /// Samples the scene at the playback time. The layout never changes, so
-    /// unchanged elements stay put.
+    /// Samples the scene at the playback time. With the stable layout,
+    /// unchanged elements stay put; with a layout per step, they settle from
+    /// the previous step's layout into this step's.
     fn rebuild_scene(&mut self) {
         let State::Ready {
-            layout,
+            layouts,
             timeline,
             scene,
         } = &mut self.state
         else {
             return;
         };
-        match Scene::at(
+        match Scene::at_placed(
             &self.spec,
             self.step_index,
             timeline,
             self.playback.t,
-            layout,
+            placement(layouts, self.step_index, self.fit_each_step),
         ) {
             Some(built) => *scene = Rc::new(built),
             None => self.state = State::Failed("The spec has no steps".into()),
@@ -602,15 +648,16 @@ impl StrataView {
 
     fn update_change_region(&mut self) {
         let State::Ready {
-            layout, timeline, ..
+            layouts, timeline, ..
         } = &self.state
         else {
             return;
         };
+        let placed = placement(layouts, self.step_index, self.fit_each_step);
         let ends = [0.0, timeline.duration];
         self.change_rects = ends
             .iter()
-            .filter_map(|&t| Scene::at(&self.spec, self.step_index, timeline, t, layout))
+            .filter_map(|&t| Scene::at_placed(&self.spec, self.step_index, timeline, t, placed))
             .flat_map(|scene| {
                 let nodes = scene
                     .nodes
@@ -738,10 +785,14 @@ impl StrataView {
         }
         self.step_index = step_index;
         if let State::Ready {
-            timeline, layout, ..
+            timeline, layouts, ..
         } = &mut self.state
         {
-            *timeline = Rc::new(step_timeline_in(&self.spec, step_index, layout));
+            *timeline = Rc::new(step_timeline_placed(
+                &self.spec,
+                step_index,
+                placement(layouts, step_index, self.fit_each_step),
+            ));
         }
         self.seek(match phase {
             Phase::Before => 0.0,
@@ -804,6 +855,47 @@ impl StrataView {
         cx.notify();
     }
 
+    pub fn fit_each_step(&self) -> bool {
+        self.fit_each_step
+    }
+
+    /// Switches between the stable layout and one that fits each step. The
+    /// step shows its after view in the new layout, faded in from the old
+    /// picture while the camera frames it again.
+    pub fn toggle_fit_each_step(&mut self, cx: &mut Context<Self>) {
+        self.fit_each_step = !self.fit_each_step;
+        if let State::Ready {
+            timeline,
+            layouts,
+            scene,
+        } = &mut self.state
+        {
+            if !cx.reduce_motion() {
+                self.outgoing = Some((scene.clone(), Instant::now()));
+            }
+            *timeline = Rc::new(step_timeline_placed(
+                &self.spec,
+                self.step_index,
+                placement(layouts, self.step_index, self.fit_each_step),
+            ));
+        }
+        let end = self.duration();
+        self.seek(end);
+        self.update_change_region();
+        self.framing = Framing::Changes;
+        self.camera.reframe();
+        cx.notify();
+    }
+
+    fn toggle_fit_each_step_action(
+        &mut self,
+        _: &ToggleFitEachStep,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_fit_each_step(cx);
+    }
+
     pub fn cycle_speed(&mut self, cx: &mut Context<Self>) {
         self.playback.speed = (self.playback.speed + 1) % SPEEDS.len();
         cx.notify();
@@ -840,7 +932,7 @@ impl StrataView {
         let elapsed = self
             .playback
             .last_tick
-            .map(|last| now.duration_since(last).as_secs_f32())
+            .map(|last| now.duration_since(last).as_secs_f32() * recording_time_scale())
             .unwrap_or(0.0);
         self.playback.last_tick = Some(now);
         self.tick(elapsed);
@@ -1042,7 +1134,7 @@ impl StrataView {
                 lit.insert(edge.to.to_string());
             }
         }
-        let elapsed = since.elapsed().as_secs_f32();
+        let elapsed = seconds_since(since);
         let cycle = (elapsed % diagram_theme::FLOW_SECONDS) / diagram_theme::FLOW_SECONDS;
         Some(Focus {
             lit,
@@ -1280,7 +1372,7 @@ impl StrataView {
                 // The previous step's picture fades out while the new one
                 // fades in, over the camera's glide.
                 let outgoing = self.outgoing.take().and_then(|(previous, since)| {
-                    let progress = since.elapsed().as_secs_f32() / GLIDE_SECONDS;
+                    let progress = seconds_since(since) / GLIDE_SECONDS;
                     (progress < 1.0).then(|| {
                         self.outgoing = Some((previous.clone(), since));
                         (previous, FOCUS_EASING.ease(progress))
@@ -1893,6 +1985,7 @@ impl Render for StrataView {
             .on_action(cx.listener(Self::zoom_out_action))
             .on_action(cx.listener(Self::fit_to_view))
             .on_action(cx.listener(Self::frame_changes))
+            .on_action(cx.listener(Self::toggle_fit_each_step_action))
             .children(self.render_problems(cx))
             .children(self.render_description(cx))
             .child(canvas_area)

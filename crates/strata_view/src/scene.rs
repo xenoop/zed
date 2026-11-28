@@ -3,10 +3,12 @@
 //! and after views are simply the first and last moments.
 
 use gpui::SharedString;
-use strata_core::layout::{self, Layout, Point, Rect};
+#[cfg(test)]
+use strata_core::layout::Layout;
+use strata_core::layout::{self, Point, Rect};
 #[cfg(test)]
 use strata_core::timeline::step_timeline;
-use strata_core::timeline::{Frame, Side, Timeline, frame_path, sample};
+use strata_core::timeline::{Frame, Placement, Side, Timeline, frame_path_in, sample_in};
 use strata_spec::{Element, ElementKind, Relationship, RelationshipKind, Spec, Step};
 
 pub use strata_core::timeline::Mark;
@@ -174,7 +176,8 @@ impl Scene {
         Scene::at(spec, step_index, &timeline, t, layout)
     }
 
-    /// The step `t` seconds into its animation.
+    /// The step `t` seconds into its animation, on a stable layout.
+    #[cfg(test)]
     pub fn at(
         spec: &Spec,
         step_index: usize,
@@ -182,11 +185,23 @@ impl Scene {
         t: f32,
         layout: &Layout,
     ) -> Option<Scene> {
+        Scene::at_placed(spec, step_index, timeline, t, Placement::stable(layout))
+    }
+
+    /// The step `t` seconds into its animation, between the layouts of its
+    /// two ends.
+    pub fn at_placed(
+        spec: &Spec,
+        step_index: usize,
+        timeline: &Timeline,
+        t: f32,
+        placement: Placement,
+    ) -> Option<Scene> {
         let next = spec.steps.get(step_index)?;
         let previous = step_index
             .checked_sub(1)
             .and_then(|index| spec.steps.get(index));
-        let frame: Frame = sample(timeline, layout, previous, next, t);
+        let frame: Frame = sample_in(timeline, placement, previous, next, t);
         let step_of = |side: Side| match side {
             Side::Next => Some(next),
             Side::Previous => previous,
@@ -208,6 +223,7 @@ impl Scene {
                 ghost: item.ghost,
                 glow: item.glow,
             };
+            let layout = placement.of(item.side);
             if layout.is_boundary(step, element) {
                 let previous_title = before
                     .filter(|before| item.content_mix < 1.0 && before.label != element.label)
@@ -247,13 +263,14 @@ impl Scene {
             let Some(relationship) = find_relationship(step, &item.from, &item.to) else {
                 continue;
             };
-            let Some((points, arrow_tip)) = frame_path(layout, previous, next, item) else {
+            let Some((points, arrow_tip)) = frame_path_in(placement, previous, next, item) else {
                 continue;
             };
             let Some(&last) = points.last() else {
                 continue;
             };
-            let label = layout
+            let label = placement
+                .of(item.side)
                 .edge_label_rect(step, relationship)
                 .and_then(|rect| {
                     let text = trimmed(relationship.display_label());
@@ -287,7 +304,10 @@ impl Scene {
             });
         }
         Some(Scene {
-            size: layout.size,
+            size: layout::Size {
+                w: placement.before.size.w.max(placement.after.size.w),
+                h: placement.before.size.h.max(placement.after.size.h),
+            },
             boundaries,
             edges,
             nodes,

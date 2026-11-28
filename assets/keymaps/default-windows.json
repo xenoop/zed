@@ -1470,6 +1470,7 @@
       "-": "strata::ZoomOut",
       "0": "strata::FitToView",
       "f": "strata::FrameChanges",
+      "l": "strata::ToggleFitEachStep",
     },
   },
   {

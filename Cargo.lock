@@ -17315,7 +17315,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "strata-core"
 version = "0.1.0"
-source = "git+https://github.com/xenoop/strata?rev=6913f8add4f998d5d77ba1d6750da05a94877c09#6913f8add4f998d5d77ba1d6750da05a94877c09"
+source = "git+https://github.com/xenoop/strata?rev=859d01d75727602e693552944ef9ef8fcb731e29#859d01d75727602e693552944ef9ef8fcb731e29"
 dependencies = [
  "anyhow",
  "dugong",
@@ -17326,7 +17326,7 @@ dependencies = [
 [[package]]
 name = "strata-spec"
 version = "0.1.0"
-source = "git+https://github.com/xenoop/strata?rev=6913f8add4f998d5d77ba1d6750da05a94877c09#6913f8add4f998d5d77ba1d6750da05a94877c09"
+source = "git+https://github.com/xenoop/strata?rev=859d01d75727602e693552944ef9ef8fcb731e29#859d01d75727602e693552944ef9ef8fcb731e29"
 dependencies = [
  "anyhow",
  "serde",

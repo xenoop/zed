@@ -12,6 +12,7 @@ use ui::{
 };
 use workspace::{ItemHandle, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView};
 
+use crate::ToggleFitEachStep;
 use crate::scene::Phase;
 use crate::strata_item::{SPEEDS, StrataView};
 
@@ -130,6 +131,7 @@ impl Render for StrataToolbar {
         };
         let scrubber_bounds = view.scrubber_bounds();
         let scrubbing = view.is_scrubbing();
+        let fit_each_step = view.fit_each_step();
         let stack_name = spec.stack_name();
         let step_id = step.id.clone();
         let step_title = step.title.clone();
@@ -264,6 +266,23 @@ impl Render for StrataToolbar {
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                 ),
+            )
+            .child(
+                IconButton::new("strata-fit-each-step", IconName::FoldVertical)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(fit_each_step)
+                    .tooltip(Tooltip::for_action_title(
+                        if fit_each_step {
+                            "Layout: Fit Each Step"
+                        } else {
+                            "Layout: Stable"
+                        },
+                        &ToggleFitEachStep,
+                    ))
+                    .on_click({
+                        let view = view_entity.clone();
+                        move |_, _, cx| view.update(cx, |view, cx| view.toggle_fit_each_step(cx))
+                    }),
             )
             .child(
                 ButtonLike::new("strata-speed")
