@@ -21,7 +21,8 @@ use strata_spec::{Diagnostic, Element, Relationship, Spec, Step};
 use theme::ActiveTheme;
 use theme_settings::ThemeSettings;
 use ui::{
-    Divider, Icon, IconButton, IconName, IconSize, Label, LabelSize, Popover, Tooltip, prelude::*,
+    ButtonLike, ButtonSize, ButtonStyle, Divider, Icon, IconButton, IconName, IconSize, Label,
+    LabelSize, Popover, Tooltip, prelude::*,
 };
 use util::ResultExt;
 use workspace::item::{Item, ItemEvent};
@@ -30,7 +31,7 @@ use workspace::{Pane, Workspace};
 use crate::diagram_theme::{self, DiagramColors};
 use crate::painter::{
     FOCUS_EASING, Focus, Highlight, MAX_SCALE, MIN_SCALE, TextCache, ViewState, WindowText,
-    has_ancestor, paint_scene,
+    card_icon, has_ancestor, paint_scene,
 };
 use crate::scene::{NodeItem, Phase, Scene};
 use crate::{
@@ -46,6 +47,8 @@ const CLICK_SLOP: f32 = 4.0;
 const DETAILS_WIDTH: f32 = 320.0;
 const DETAILS_GAP: f32 = 8.0;
 const DETAILS_MIN_HEIGHT: f32 = 360.0;
+/// The step's story scrolls beyond this, so the canvas keeps its room.
+const STORY_MAX_HEIGHT: f32 = 220.0;
 /// Room kept free at the canvas's bottom for the zoom controls.
 const ZOOM_CONTROLS_CLEARANCE: f32 = 48.0;
 
@@ -64,6 +67,8 @@ const READABLE_SCALE: f32 = 0.6;
 /// Framing never zooms past actual size, so a single change keeps context.
 const MAX_FRAME_SCALE: f32 = 1.0;
 const ZOOM_STEP: f32 = 1.25;
+/// Layout pixels kept around an element the camera glides to.
+const SELECTION_FRAME_MARGIN: f32 = 160.0;
 /// How long the camera takes to glide to a new framing.
 const GLIDE_SECONDS: f32 = 0.55;
 
@@ -169,6 +174,8 @@ pub enum Framing {
     /// The whole stack when it is readable, otherwise what the step changes.
     Changes,
     Everything,
+    /// The selected element and its surroundings.
+    Selection,
 }
 
 struct Glide {
@@ -294,6 +301,8 @@ pub struct StrataView {
     selected: Option<String>,
     focus_since: Option<Instant>,
     framing: Framing,
+    /// The element under the mouse, outlined and given a pointer cursor.
+    hovered: Option<String>,
     /// What the current step changes, before or after it.
     change_rects: Vec<Rect>,
     change_region_step: Option<usize>,
@@ -346,6 +355,7 @@ impl StrataView {
             selected: None,
             focus_since: None,
             framing: Framing::Changes,
+            hovered: None,
             change_rects: Vec::new(),
             change_region_step: None,
             stack_collapsed: false,
@@ -598,8 +608,20 @@ impl StrataView {
             w: content.w,
             h: content.h,
         };
-        if self.framing == Framing::Everything {
-            return everything;
+        match self.framing {
+            Framing::Everything => return everything,
+            Framing::Selection => {
+                if let Some(rect) = self.selected.as_deref().and_then(|id| self.scene_rect(id)) {
+                    let margin = SELECTION_FRAME_MARGIN;
+                    return Rect {
+                        x: rect.x - margin,
+                        y: rect.y - margin,
+                        w: rect.w + 2.0 * margin,
+                        h: rect.h + 2.0 * margin,
+                    };
+                }
+            }
+            Framing::Changes => {}
         }
         let readable = |region: Rect| frame_view(region, viewport).scale >= READABLE_SCALE;
         if readable(everything) {
@@ -1020,6 +1042,29 @@ impl StrataView {
         matches.first().map(|(rect, _)| *rect)
     }
 
+    /// The element card under a canvas point, ignoring ghosts and boundaries.
+    fn hit_node(&self, canvas_point: gpui::Point<f32>) -> Option<String> {
+        let State::Ready { scene, .. } = &self.state else {
+            return None;
+        };
+        let view = self.camera.view?;
+        let world = layout::Point {
+            x: (canvas_point.x - view.offset.x) / view.scale,
+            y: (canvas_point.y - view.offset.y) / view.scale,
+        };
+        scene
+            .nodes
+            .iter()
+            .filter(|node| !node.look.ghost)
+            .find(|node| {
+                world.x >= node.rect.x
+                    && world.x <= node.rect.right()
+                    && world.y >= node.rect.y
+                    && world.y <= node.rect.bottom()
+            })
+            .map(|node| node.id.to_string())
+    }
+
     /// The element under a canvas point: nodes over boundaries, and the
     /// innermost boundary when several contain it.
     fn hit(&self, canvas_point: gpui::Point<f32>) -> Option<String> {
@@ -1103,6 +1148,11 @@ impl StrataView {
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if event.pressed_button != Some(MouseButton::Left) {
             self.press = None;
+            let hovered = self.hit_node(self.canvas_point(event.position));
+            if hovered != self.hovered {
+                self.hovered = hovered;
+                cx.notify();
+            }
             return;
         }
         let Some(press) = self.press.as_mut() else {
@@ -1176,6 +1226,7 @@ impl StrataView {
                     window.request_animation_frame();
                 }
                 let cache = self.text_cache.clone();
+                let hovered = self.hovered.clone();
                 let colors = DiagramColors::from_theme(cx);
                 canvas(
                     |_, _, _| {},
@@ -1186,6 +1237,7 @@ impl StrataView {
                                 Highlight {
                                     focus: focus.as_ref(),
                                     selected,
+                                    hovered: hovered.as_deref(),
                                 },
                                 view,
                                 bounds,
@@ -1278,23 +1330,51 @@ impl StrataView {
     }
 
     /// The step's summary, takeaway and notes in one slim strip.
-    fn render_description(&self, cx: &App) -> Option<AnyElement> {
+    /// The step's story above the canvas: its summary, the takeaway as a
+    /// callout, and per-element notes whose element chips select and frame
+    /// that element.
+    fn render_description(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let step = self.step()?;
         let shown = self.spec.steps.get(self.shown_step_index());
         let note_steps: Vec<&Step> = [Some(step), shown].into_iter().flatten().collect();
+        let colors = cx.theme().colors();
+        let accent = cx.theme().players().local().cursor;
         let notes: Vec<AnyElement> = step
             .notes
             .iter()
-            .map(|(id, note)| {
+            .enumerate()
+            .map(|(index, (id, note))| {
+                let kind = element_in(&note_steps, id).map(|element| element.kind);
+                let id = id.clone();
                 h_flex()
-                    .gap_1()
+                    .gap_2()
                     .items_start()
                     .child(
-                        Label::new(format!("{}:", label_of(&note_steps, id)))
-                            .size(LabelSize::Small),
+                        ButtonLike::new(("strata-note-element", index))
+                            .style(ButtonStyle::Filled)
+                            .size(ButtonSize::Compact)
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .px_0p5()
+                                    .children(kind.map(|kind| {
+                                        Icon::new(card_icon(kind))
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted)
+                                    }))
+                                    .child(
+                                        Label::new(label_of(&note_steps, &id))
+                                            .size(LabelSize::Small),
+                                    ),
+                            )
+                            .tooltip(Tooltip::text("Show this element"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select(Some(id.clone()));
+                                this.set_framing(Framing::Selection, cx);
+                            })),
                     )
                     .child(
-                        div().flex_1().min_w_0().child(
+                        div().flex_1().min_w_0().pt_0p5().child(
                             Label::new(note.clone())
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
@@ -1308,26 +1388,33 @@ impl StrataView {
         }
         Some(
             v_flex()
+                .id("strata-step-story")
                 .flex_none()
-                .gap_1()
+                .max_h(px(STORY_MAX_HEIGHT))
+                .overflow_y_scroll()
+                .gap_2()
                 .px_3()
-                .py_2()
-                .bg(cx.theme().colors().editor_background)
+                .py_2p5()
+                .bg(colors.editor_background)
                 .border_b_1()
-                .border_color(cx.theme().colors().border_variant)
-                .children(step.summary.clone().map(|summary| {
-                    Label::new(summary)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                }))
+                .border_color(colors.border_variant)
+                .children(step.summary.clone().map(Label::new))
                 .children(step.takeaway.clone().map(|takeaway| {
                     h_flex()
                         .items_start()
-                        .gap_1p5()
+                        .gap_2()
+                        .px_2()
+                        .py_1p5()
+                        .rounded_md()
+                        .bg(accent.opacity(0.08))
+                        .border_l_2()
+                        .border_color(accent.opacity(0.6))
                         .child(
-                            Icon::new(IconName::Info)
-                                .size(IconSize::XSmall)
-                                .color(Color::Accent),
+                            div().pt_0p5().child(
+                                Icon::new(IconName::Info)
+                                    .size(IconSize::Small)
+                                    .color(Color::Accent),
+                            ),
                         )
                         .child(
                             div()
@@ -1690,6 +1777,12 @@ impl Render for StrataView {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_hover(cx.listener(|this, hovering: &bool, _, cx| {
+                if !hovering && this.hovered.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .when(self.hovered.is_some(), |canvas| canvas.cursor_pointer())
             .on_scroll(cx.listener(Self::on_scroll))
             .on_pinch(cx.listener(Self::on_pinch))
             .child(canvas_content)

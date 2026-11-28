@@ -4,15 +4,17 @@ use std::rc::Rc;
 
 use gpui::{
     BorderStyle, Bounds, BoxShadow, Corners, Font, FontWeight, Hsla, PathBuilder, Pixels,
-    SharedString, TextAlign, TextRun, Window, WindowTextSystem, WrappedLine, px, size,
+    SharedString, TextAlign, TextRun, TransformationMatrix, Window, WindowTextSystem, WrappedLine,
+    px, size,
 };
 use strata_core::easing::CubicBezier;
 use strata_core::layout::{self, EstimatedText, Rect, TextMeasure, TextRole};
 use strata_core::timeline::partial_path;
 use strata_spec::{Element, ElementKind, Step};
+use ui::IconName;
 
 use crate::diagram_theme::{self as theme, DiagramColors};
-use crate::scene::{BoundaryItem, EdgeItem, LabelItem, Look, NodeItem, NodeText, Scene};
+use crate::scene::{BoundaryItem, EdgeItem, LabelItem, Look, Mark, NodeItem, NodeText, Scene};
 
 pub const MIN_SCALE: f32 = 0.05;
 pub const MAX_SCALE: f32 = 4.0;
@@ -215,6 +217,8 @@ struct Painter<'a> {
     /// For a relationship connected to the focused element: how far its
     /// dashes have flowed, in layout pixels.
     flow: Option<f32>,
+    /// Whether the element being painted is under the mouse.
+    hovered: bool,
 }
 
 impl Painter<'_> {
@@ -340,8 +344,10 @@ impl Painter<'_> {
             };
             Self::paint_block(
                 &block,
-                f32::from(bounds.origin.x) + theme::COMPOUND_TITLE_LEFT * scale,
-                f32::from(bounds.origin.y) + title_origin_y * scale,
+                f32::from(bounds.origin.x)
+                    + (theme::COMPOUND_TITLE_LEFT * scale).max(theme::COMPOUND_TITLE_MIN_INSET),
+                f32::from(bounds.origin.y)
+                    + (title_origin_y * scale).max(theme::COMPOUND_TITLE_MIN_INSET),
                 f32::from(bounds.size.width),
                 size_px * scale,
                 TextAlign::Left,
@@ -553,24 +559,21 @@ impl Painter<'_> {
 
         match item.kind {
             ElementKind::Store => self.paint_cylinder(&item.rect, window),
-            ElementKind::Person => {
+            ElementKind::Person
+            | ElementKind::System
+            | ElementKind::Container
+            | ElementKind::Component => {
+                let border = if self.hovered {
+                    self.colors.node_border_hover
+                } else {
+                    self.colors.node_border
+                };
                 window.paint_quad(gpui::quad(
                     bounds,
                     radii,
                     self.tint_color(self.colors.node_fill),
                     px(theme::NODE_BORDER_WIDTH),
-                    self.tint_color(self.colors.node_border),
-                    BorderStyle::Solid,
-                ));
-                self.paint_person_icon(&item.rect, window);
-            }
-            ElementKind::System | ElementKind::Container | ElementKind::Component => {
-                window.paint_quad(gpui::quad(
-                    bounds,
-                    radii,
-                    self.tint_color(self.colors.node_fill),
-                    px(theme::NODE_BORDER_WIDTH),
-                    self.tint_color(self.colors.node_border),
+                    self.tint_color(border),
                     BorderStyle::Solid,
                 ));
             }
@@ -622,6 +625,10 @@ impl Painter<'_> {
         self.set_item(alpha, saturation);
     }
 
+    /// A Zed card: a header with the element kind's icon and name and, for
+    /// a change, a status badge; then the title, technology and description,
+    /// left-aligned. Without room for the header (a tall description), the
+    /// text is drawn on its own.
     #[allow(clippy::too_many_arguments)]
     fn paint_text_blocks(
         &mut self,
@@ -649,29 +656,39 @@ impl Painter<'_> {
         struct Entry {
             block: Rc<ShapedBlock>,
             role: TextRole,
+            gap_before: f32,
         }
         let mut entries: Vec<Entry> = Vec::new();
-        let mut push =
-            |this: &mut Self, text: &SharedString, role: TextRole, max_lines: usize, tint: Hsla| {
-                let block = this.cache.shape(
-                    window,
-                    text,
-                    role.font_size() * scale,
-                    role.font_weight(),
-                    tint,
-                    Some(text_width * scale),
-                    Some(max_lines),
-                );
-                if let Some(block) = block {
-                    entries.push(Entry { block, role });
-                }
-            };
+        let mut push = |this: &mut Self,
+                        text: &SharedString,
+                        role: TextRole,
+                        max_lines: usize,
+                        tint: Hsla,
+                        gap_before: f32| {
+            let block = this.cache.shape(
+                window,
+                text,
+                role.font_size() * scale,
+                role.font_weight(),
+                tint,
+                Some(text_width * scale),
+                Some(max_lines),
+            );
+            if let Some(block) = block {
+                entries.push(Entry {
+                    block,
+                    role,
+                    gap_before,
+                });
+            }
+        };
         push(
             self,
             &text.title,
             TextRole::Title,
             TITLE_MAX_LINES,
             title_tint,
+            0.0,
         );
         if let Some(technology) = &text.technology {
             push(
@@ -680,6 +697,7 @@ impl Painter<'_> {
                 TextRole::Technology,
                 TECHNOLOGY_MAX_LINES,
                 technology_tint,
+                theme::TECHNOLOGY_GAP,
             );
         }
         if let Some(description) = &text.description {
@@ -689,35 +707,212 @@ impl Painter<'_> {
                 TextRole::Description,
                 DESCRIPTION_MAX_LINES,
                 secondary,
+                CONTENT_GAP,
             );
         }
 
-        let gap = if entries.len() == 3 {
-            CONTENT_GAP_DENSE
-        } else {
-            CONTENT_GAP
-        } * scale;
         let heights: Vec<f32> = entries
             .iter()
             .map(|entry| Self::block_height(&entry.block, entry.role.line_height() * scale))
             .collect();
-        let total = heights.iter().sum::<f32>() + gap * entries.len().saturating_sub(1) as f32;
-        let available_top = f32::from(bounds.origin.y) + top * scale;
+        let text_height = entries
+            .iter()
+            .zip(&heights)
+            .map(|(entry, height)| height + entry.gap_before * scale)
+            .sum::<f32>();
         let available = f32::from(bounds.size.height) - (top + bottom) * scale;
-        let mut y = available_top + ((available - total) / 2.0).max(0.0);
+        let header_height = (theme::CARD_HEADER_HEIGHT + theme::CARD_HEADER_GAP) * scale;
+        let with_header = text_height + header_height <= available;
         let x = f32::from(bounds.origin.x) + left * scale;
+        // Cards are sized for their longest text, so a shorter one centers
+        // its content rather than leaving the space below it.
+        let content_height = text_height + if with_header { header_height } else { 0.0 };
+        let mut y = f32::from(bounds.origin.y)
+            + top * scale
+            + ((available - content_height) / 2.0).max(0.0);
+        if with_header {
+            self.paint_card_header(
+                item,
+                x,
+                y,
+                text_width * scale,
+                secondary,
+                ghost_color,
+                window,
+                cx,
+            );
+            y += header_height;
+        }
         for (entry, height) in entries.iter().zip(heights) {
+            y += entry.gap_before * scale;
             Self::paint_block(
                 &entry.block,
                 x,
                 y,
                 text_width * scale,
                 entry.role.line_height() * scale,
-                TextAlign::Center,
+                TextAlign::Left,
                 window,
                 cx,
             );
-            y += height + gap;
+            y += height;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn paint_card_header(
+        &mut self,
+        item: &NodeItem,
+        x: f32,
+        y: f32,
+        width: f32,
+        tint: Hsla,
+        ghost_color: Option<Hsla>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) {
+        let scale = self.scale();
+        let height = theme::CARD_HEADER_HEIGHT * scale;
+        let icon_size = theme::CARD_ICON_SIZE * scale;
+        let icon_bounds = Bounds {
+            origin: gpui::point(px(x), px(y + (height - icon_size) / 2.0)),
+            size: size(px(icon_size), px(icon_size)),
+        };
+        if let Err(error) = window.paint_svg(
+            icon_bounds,
+            card_icon(item.kind).path().into(),
+            None,
+            TransformationMatrix::unit(),
+            tint,
+            cx,
+        ) {
+            log::error!("strata: could not paint an element icon: {error}");
+        }
+        let label_size = theme::CARD_LABEL_SIZE * scale;
+        let label_x = x + icon_size + theme::CARD_ICON_GAP * scale;
+        if let Some(block) = self.cache.shape(
+            window,
+            &SharedString::new_static(item.kind.display_name()),
+            label_size,
+            500.0,
+            tint,
+            None,
+            Some(1),
+        ) {
+            Self::paint_block(
+                &block,
+                label_x,
+                y + (height - label_size * 1.3) / 2.0,
+                width,
+                label_size * 1.3,
+                TextAlign::Left,
+                window,
+                cx,
+            );
+        }
+
+        let Some(mark) = item.look.mark.filter(|_| ghost_color.is_none()) else {
+            return;
+        };
+        let color = self.tint_color(self.colors.mark(mark));
+        let badge_size = theme::BADGE_TEXT_SIZE * scale;
+        let Some(block) = self.cache.shape(
+            window,
+            &SharedString::new_static(mark_label(mark)),
+            badge_size,
+            600.0,
+            color,
+            None,
+            Some(1),
+        ) else {
+            return;
+        };
+        let text_width = block
+            .lines
+            .first()
+            .map_or(0.0, |line| f32::from(line.width()));
+        let padding = theme::BADGE_PADDING_X * scale;
+        let badge_height = theme::BADGE_HEIGHT * scale;
+        let badge = Bounds {
+            origin: gpui::point(
+                px(x + width - text_width - 2.0 * padding),
+                px(y + (height - badge_height) / 2.0),
+            ),
+            size: size(px(text_width + 2.0 * padding), px(badge_height)),
+        };
+        window.paint_quad(gpui::quad(
+            badge,
+            Corners::all(px(theme::BADGE_RADIUS * scale)),
+            color.opacity(theme::BADGE_FILL_OPACITY),
+            0.0,
+            gpui::transparent_black(),
+            BorderStyle::default(),
+        ));
+        Self::paint_block(
+            &block,
+            f32::from(badge.origin.x) + padding,
+            f32::from(badge.origin.y) + (badge_height - badge_size * 1.3) / 2.0,
+            text_width,
+            badge_size * 1.3,
+            TextAlign::Left,
+            window,
+            cx,
+        );
+    }
+
+    /// A soft accent glow under the element whose details are open.
+    fn paint_selection_glow(&mut self, rect: Rect, window: &mut Window) {
+        let scale = self.scale();
+        let bounds = self.transform.bounds(&rect);
+        window.paint_drop_shadows(
+            bounds,
+            Corners::all(px(theme::NODE_RADIUS * scale)),
+            &[BoxShadow {
+                color: self.colors.accent.opacity(theme::SELECTION_GLOW_OPACITY),
+                offset: gpui::point(px(0.0), px(0.0)),
+                blur_radius: px(theme::SELECTION_GLOW_BLUR * scale.max(0.5)),
+                spread_radius: px(theme::SELECTION_GLOW_SPREAD * scale.max(0.5)),
+                inset: false,
+            }],
+        );
+    }
+
+    /// A dot grid, as on design canvases, so panning reads as movement.
+    /// Dots thin out when zoomed out so they never turn into a texture.
+    fn paint_grid(&mut self, window: &mut Window) {
+        let scale = self.scale();
+        let mut spacing = theme::GRID_SPACING * scale;
+        while spacing < theme::GRID_MIN_SCREEN_SPACING {
+            spacing *= 2.0;
+        }
+        let dot = theme::GRID_DOT_SIZE;
+        let origin = self.transform.origin;
+        let offset = self.transform.offset;
+        let left = f32::from(self.viewport.origin.x);
+        let top = f32::from(self.viewport.origin.y);
+        let right = f32::from(self.viewport.right());
+        let bottom = f32::from(self.viewport.bottom());
+        let first_x = f32::from(origin.x) + offset.x.rem_euclid(spacing);
+        let first_y = f32::from(origin.y) + offset.y.rem_euclid(spacing);
+        let color = self.colors.grid;
+        let mut y = first_y;
+        while y < bottom {
+            if y >= top {
+                let mut x = first_x;
+                while x < right {
+                    if x >= left {
+                        window.paint_quad(gpui::fill(
+                            Bounds {
+                                origin: gpui::point(px(x - dot / 2.0), px(y - dot / 2.0)),
+                                size: size(px(dot), px(dot)),
+                            },
+                            color,
+                        ));
+                    }
+                    x += spacing;
+                }
+            }
+            y += spacing;
         }
     }
 
@@ -733,49 +928,6 @@ impl Painter<'_> {
             self.tint_color(self.colors.selection_ring),
             BorderStyle::Solid,
         ));
-    }
-
-    fn paint_person_icon(&mut self, rect: &Rect, window: &mut Window) {
-        let origin = layout::Point {
-            x: rect.x + rect.w - theme::PERSON_ICON_WIDTH - theme::PERSON_ICON_RIGHT_MARGIN,
-            y: rect.y + rect.h - theme::PERSON_ICON_HEIGHT,
-        };
-        let at = |x: f32, y: f32| {
-            self.transform.point(layout::Point {
-                x: origin.x + x,
-                y: origin.y + y,
-            })
-        };
-        let mut builder = PathBuilder::fill();
-        builder.move_to(at(57.9197, 0.0));
-        let curves: [[f32; 6]; 10] = [
-            [10.9124, 0.0, 33.5766, 54.75, 33.5766, 54.75],
-            [38.6131, 62.25, 45.3285, 60.75, 45.3285, 66.0],
-            [45.3285, 70.5, 39.4526, 72.0, 33.5766, 72.75],
-            [24.3431, 72.75, 15.9489, 71.25, 7.55474, 84.75],
-            [2.51825, 93.0, 0.0, 120.0, 0.0, 120.0],
-            [115.0, 120.0, 112.482, 93.0, 108.285, 84.75],
-            [99.8905, 70.5, 91.4963, 72.75, 82.2628, 72.0],
-            [76.3869, 71.25, 70.5109, 69.75, 70.5109, 65.25],
-            [70.5109, 60.75, 77.2263, 62.25, 82.2628, 54.0],
-            [82.2628, 54.75, 104.927, 0.0, 57.9197, 0.0],
-        ];
-        for (index, curve) in curves.iter().enumerate() {
-            if index == 5 {
-                builder.line_to(at(115.0, 120.0));
-            }
-            builder.cubic_bezier_to(
-                at(curve[4], curve[5]),
-                at(curve[0], curve[1]),
-                at(curve[2], curve[3]),
-            );
-        }
-        builder.close();
-        let tint = self.tint_color(self.colors.node_detail);
-        match builder.build() {
-            Ok(path) => window.paint_path(path, tint),
-            Err(error) => log::error!("strata: could not tessellate person icon: {error}"),
-        }
     }
 
     fn paint_cylinder(&mut self, rect: &Rect, window: &mut Window) {
@@ -856,6 +1008,24 @@ impl Painter<'_> {
 pub const FOCUS_EASING: CubicBezier = CubicBezier::new(0.5, 0.0, 0.2, 1.0);
 
 /// Whether `ancestor` is on `element`'s parent chain in `step`.
+pub fn card_icon(kind: ElementKind) -> IconName {
+    match kind {
+        ElementKind::Person => IconName::Person,
+        ElementKind::System => IconName::Server,
+        ElementKind::Container => IconName::Box,
+        ElementKind::Component => IconName::Blocks,
+        ElementKind::Store => IconName::DatabaseZap,
+    }
+}
+
+fn mark_label(mark: Mark) -> &'static str {
+    match mark {
+        Mark::Added => "Added",
+        Mark::Changed => "Changed",
+        Mark::Removed => "Removed",
+    }
+}
+
 /// The tip, the base where the line meets the head, and the two back corners
 /// of a relationship's arrowhead.
 fn arrow_corners(item: &EdgeItem) -> Option<[layout::Point; 4]> {
@@ -968,6 +1138,7 @@ fn present(look: &Look) -> Look {
 pub struct Highlight<'a> {
     pub focus: Option<&'a Focus>,
     pub selected: Option<Rect>,
+    pub hovered: Option<&'a str>,
 }
 
 pub fn paint_scene(
@@ -995,8 +1166,14 @@ pub fn paint_scene(
         alpha: 1.0,
         saturation: 1.0,
         flow: None,
+        hovered: false,
     };
-    let Highlight { focus, selected } = highlight;
+    let Highlight {
+        focus,
+        selected,
+        hovered,
+    } = highlight;
+    painter.paint_grid(window);
     let element = |id: &str, look: &Look| {
         let look = present(look);
         match focus {
@@ -1047,11 +1224,20 @@ pub fn paint_scene(
             painter.paint_label(label, window, cx);
         }
     }
+    // Only cards glow: under a translucent boundary a glow would fill it.
+    if let Some(selected) =
+        selected.filter(|rect| scene.nodes.iter().any(|node| node.rect == *rect))
+    {
+        painter.set_item(1.0, 1.0);
+        painter.paint_selection_glow(selected, window);
+    }
     for node in &scene.nodes {
         let (alpha, saturation) = element(&node.id, &node.look);
         painter.set_item(alpha, saturation);
+        painter.hovered = hovered == Some(node.id.as_ref());
         painter.paint_node(node, window, cx);
     }
+    painter.hovered = false;
     if let Some(selected) = selected {
         painter.set_item(1.0, 1.0);
         painter.paint_selection(selected, window);

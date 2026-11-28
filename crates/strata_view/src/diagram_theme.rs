@@ -14,6 +14,7 @@ pub struct DiagramColors {
     pub accent: Hsla,
     pub node_fill: Hsla,
     pub node_border: Hsla,
+    pub node_border_hover: Hsla,
     /// The person silhouette and the cylinder cap.
     pub node_detail: Hsla,
     pub node_title: Hsla,
@@ -25,6 +26,7 @@ pub struct DiagramColors {
     pub label_background: Hsla,
     pub label_text: Hsla,
     pub shadow: Hsla,
+    pub grid: Hsla,
     pub created: Hsla,
     pub modified: Hsla,
     pub deleted: Hsla,
@@ -44,6 +46,7 @@ impl DiagramColors {
             accent: theme.players().local().cursor,
             node_fill,
             node_border: colors.border,
+            node_border_hover: colors.text_muted,
             node_detail: node_fill.blend(colors.icon_muted.opacity(NODE_DETAIL_OPACITY)),
             node_title: colors.text,
             node_secondary: colors.text_muted,
@@ -54,6 +57,7 @@ impl DiagramColors {
             label_background: colors.editor_background.opacity(LABEL_BACKGROUND_OPACITY),
             label_text: colors.text_muted,
             shadow: gpui::black(),
+            grid: colors.text.opacity(GRID_OPACITY),
             created: status.created,
             modified: status.modified,
             deleted: status.deleted,
@@ -75,6 +79,29 @@ const NODE_DETAIL_OPACITY: f32 = 0.35;
 const BOUNDARY_FILL_OPACITY: f32 = 0.025;
 const EDGE_OPACITY: f32 = 0.7;
 const LABEL_BACKGROUND_OPACITY: f32 = 0.92;
+const GRID_OPACITY: f32 = 0.07;
+
+/// The card header: the element kind's icon and name, and a change badge.
+pub const CARD_HEADER_HEIGHT: f32 = 20.0;
+pub const CARD_HEADER_GAP: f32 = 10.0;
+pub const CARD_ICON_SIZE: f32 = 16.0;
+pub const CARD_ICON_GAP: f32 = 6.0;
+pub const CARD_LABEL_SIZE: f32 = 13.0;
+pub const TECHNOLOGY_GAP: f32 = 2.0;
+pub const BADGE_TEXT_SIZE: f32 = 11.0;
+pub const BADGE_HEIGHT: f32 = 18.0;
+pub const BADGE_PADDING_X: f32 = 6.0;
+pub const BADGE_RADIUS: f32 = 4.0;
+pub const BADGE_FILL_OPACITY: f32 = 0.16;
+
+pub const SELECTION_GLOW_OPACITY: f32 = 0.35;
+pub const SELECTION_GLOW_BLUR: f32 = 16.0;
+pub const SELECTION_GLOW_SPREAD: f32 = 2.0;
+
+/// Layout pixels between grid dots at actual size.
+pub const GRID_SPACING: f32 = 24.0;
+pub const GRID_MIN_SCREEN_SPACING: f32 = 16.0;
+pub const GRID_DOT_SIZE: f32 = 1.5;
 pub const NODE_BORDER_WIDTH: f32 = 1.0;
 
 /// Compounds are drawn translucent: the default `opacity: 15` of the fill,
@@ -83,6 +110,8 @@ pub const COMPOUND_BORDER_WIDTH: f32 = 1.0;
 pub const COMPOUND_RADIUS: f32 = 8.0;
 pub const COMPOUND_TITLE_SIZE: f32 = 12.0;
 pub const COMPOUND_TITLE_MIN_SCREEN_SIZE: f32 = 10.0;
+/// Screen pixels kept between a boundary title and the boundary edge.
+pub const COMPOUND_TITLE_MIN_INSET: f32 = 6.0;
 pub const COMPOUND_TITLE_LEFT: f32 = 10.0;
 pub const COMPOUND_TITLE_TOP: f32 = 2.0;
 pub const COMPOUND_TITLE_MIN_HEIGHT: f32 = 28.0;
@@ -97,11 +126,6 @@ pub const NODE_SHADOWS: [(f32, f32, f32, bool); 2] =
 /// Cylinder cap tilt, from `cylinderSVGPath`.
 pub const CYLINDER_TILT: f32 = 0.07;
 pub const CYLINDER_STROKE_WIDTH: f32 = 2.0;
-
-/// Person icon, 115 x 120 (`PersonIcon` in LikeC4's `ElementShape`).
-pub const PERSON_ICON_WIDTH: f32 = 115.0;
-pub const PERSON_ICON_HEIGHT: f32 = 120.0;
-pub const PERSON_ICON_RIGHT_MARGIN: f32 = 6.0;
 
 pub const EDGE_WIDTH: f32 = 1.5;
 pub const EDGE_DASH: [f32; 2] = [6.0, 4.0];
