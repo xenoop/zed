@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use gpui::{
     AnyElement, App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Font,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Render, ScrollEvent, SharedString, Styled, Subscription, Task, WeakEntity, Window, canvas, div,
-    point, prelude::*, px, size,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
+    PinchEvent, Pixels, Render, ScrollEvent, SharedString, Styled, Subscription, Task, WeakEntity,
+    Window, canvas, div, point, prelude::*, px, size,
 };
 use language::{Buffer, BufferEvent};
 use multi_buffer::MultiBuffer;
@@ -20,7 +20,9 @@ use strata_core::timeline::{Timeline, step_timeline};
 use strata_spec::{Diagnostic, Element, Relationship, Spec, Step};
 use theme::ActiveTheme;
 use theme_settings::ThemeSettings;
-use ui::{Divider, Icon, IconName, IconSize, Label, LabelSize, Popover, prelude::*};
+use ui::{
+    Divider, Icon, IconButton, IconName, IconSize, Label, LabelSize, Popover, Tooltip, prelude::*,
+};
 use util::ResultExt;
 use workspace::item::{Item, ItemEvent};
 use workspace::{Pane, Workspace};
@@ -32,11 +34,12 @@ use crate::painter::{
 };
 use crate::scene::{NodeItem, Phase, Scene};
 use crate::{
-    CloseDetails, NextStep, OpenPreview, OpenPreviewToTheSide, PreviousStep, ScrubBackward,
-    ScrubForward, ShowAfter, ShowBefore, SlowDown, SpeedUp, TogglePlayback,
+    CloseDetails, FitToView, FrameChanges, NextStep, OpenPreview, OpenPreviewToTheSide,
+    PreviousStep, ScrubBackward, ScrubForward, ShowAfter, ShowBefore, SlowDown, SpeedUp,
+    TogglePlayback, ZoomIn, ZoomOut,
 };
 
-const ZOOM_PER_PIXEL: f32 = 0.0015;
+const ZOOM_PER_PIXEL: f32 = 0.005;
 const LINE_SCROLL_PIXELS: f32 = 20.0;
 const FIT_MARGIN: f32 = 24.0;
 const CLICK_SLOP: f32 = 4.0;
@@ -52,44 +55,193 @@ const NORMAL_SPEED: usize = 2;
 /// How far scrubbing with the keyboard moves, in seconds of step time.
 const SCRUB_STEP: f32 = 0.05;
 
-fn fit_view(content: layout::Size, viewport: gpui::Size<Pixels>) -> ViewState {
+/// Below this scale element text gets too small to read, so the camera frames
+/// the step's changes instead of the whole stack.
+const READABLE_SCALE: f32 = 0.6;
+/// Framing never zooms past actual size, so a single change keeps context.
+const MAX_FRAME_SCALE: f32 = 1.0;
+const ZOOM_STEP: f32 = 1.25;
+/// How long the camera takes to glide to a new framing.
+const GLIDE_SECONDS: f32 = 0.55;
+
+/// The view that fits `region` (in layout coordinates) centered in `viewport`.
+fn frame_view(region: Rect, viewport: gpui::Size<Pixels>) -> ViewState {
     let width = f32::from(viewport.width);
     let height = f32::from(viewport.height);
     let available_width = (width - 2.0 * FIT_MARGIN).max(1.0);
     let available_height = (height - 2.0 * FIT_MARGIN).max(1.0);
-    let scale = if content.w > 0.0 && content.h > 0.0 {
-        (available_width / content.w).min(available_height / content.h)
+    let scale = if region.w > 0.0 && region.h > 0.0 {
+        (available_width / region.w).min(available_height / region.h)
     } else {
         1.0
     }
+    .min(MAX_FRAME_SCALE)
     .clamp(MIN_SCALE, MAX_SCALE);
+    let center = region.center();
     ViewState {
         scale,
         offset: point(
-            (width - content.w * scale) / 2.0,
-            (height - content.h * scale) / 2.0,
+            width / 2.0 - center.x * scale,
+            height / 2.0 - center.y * scale,
         ),
     }
+}
+
+/// Between two views, moving the layout point at the viewport's center in a
+/// straight line while the scale changes geometrically, so a glide that
+/// zooms reads as one steady motion.
+fn interpolate_view(
+    from: ViewState,
+    to: ViewState,
+    progress: f32,
+    viewport: gpui::Size<Pixels>,
+) -> ViewState {
+    let middle = point(
+        f32::from(viewport.width) / 2.0,
+        f32::from(viewport.height) / 2.0,
+    );
+    let center_of = |view: ViewState| {
+        point(
+            (middle.x - view.offset.x) / view.scale,
+            (middle.y - view.offset.y) / view.scale,
+        )
+    };
+    let (from_center, to_center) = (center_of(from), center_of(to));
+    let scale = from.scale * (to.scale / from.scale).powf(progress);
+    let center = point(
+        from_center.x + (to_center.x - from_center.x) * progress,
+        from_center.y + (to_center.y - from_center.y) * progress,
+    );
+    ViewState {
+        scale,
+        offset: point(middle.x - center.x * scale, middle.y - center.y * scale),
+    }
+}
+
+fn union(first: Rect, second: Rect) -> Rect {
+    let x = first.x.min(second.x);
+    let y = first.y.min(second.y);
+    Rect {
+        x,
+        y,
+        w: first.right().max(second.right()) - x,
+        h: first.bottom().max(second.bottom()) - y,
+    }
+}
+
+/// Of the windows of `size` centered on each rect, the one holding the most
+/// rects entirely, shrunk to those rects. Ties go to the larger total area.
+fn densest_window(rects: &[Rect], size: layout::Size) -> Option<Rect> {
+    let inside = |window: &Rect, rect: &Rect| {
+        rect.x >= window.x
+            && rect.y >= window.y
+            && rect.right() <= window.right()
+            && rect.bottom() <= window.bottom()
+    };
+    rects
+        .iter()
+        .map(|candidate| {
+            let center = candidate.center();
+            let window = Rect {
+                x: center.x - size.w / 2.0,
+                y: center.y - size.h / 2.0,
+                w: size.w,
+                h: size.h,
+            };
+            let held: Vec<Rect> = rects
+                .iter()
+                .filter(|rect| inside(&window, rect))
+                .copied()
+                .collect();
+            let area: f32 = held.iter().map(|rect| rect.w * rect.h).sum();
+            (held.len(), area, held)
+        })
+        .max_by(|first, second| first.0.cmp(&second.0).then(first.1.total_cmp(&second.1)))
+        .and_then(|(_, _, held)| held.into_iter().reduce(union))
+}
+
+/// What the camera frames while the user has not moved it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Framing {
+    /// The whole stack when it is readable, otherwise what the step changes.
+    Changes,
+    Everything,
+}
+
+struct Glide {
+    from: ViewState,
+    to: ViewState,
+    started: Instant,
 }
 
 #[derive(Default)]
 struct Camera {
     view: Option<ViewState>,
-    fitted_for: Option<gpui::Size<Pixels>>,
+    /// The region and viewport the view was last framed for.
+    framed: Option<(Rect, gpui::Size<Pixels>)>,
     user_adjusted: bool,
+    glide: Option<Glide>,
 }
 
 impl Camera {
-    fn view_for(&mut self, content: layout::Size, viewport: gpui::Size<Pixels>) -> ViewState {
-        match self.view {
-            Some(view) if self.user_adjusted || self.fitted_for == Some(viewport) => view,
-            _ => {
-                let fitted = fit_view(content, viewport);
-                self.view = Some(fitted);
-                self.fitted_for = Some(viewport);
-                fitted
-            }
+    /// The view for this frame, and whether it is still gliding.
+    fn view_for(
+        &mut self,
+        region: Rect,
+        viewport: gpui::Size<Pixels>,
+        reduce_motion: bool,
+    ) -> (ViewState, bool) {
+        if let (Some(view), true) = (self.view, self.user_adjusted) {
+            return (view, false);
         }
+        if self.framed != Some((region, viewport)) {
+            let target = frame_view(region, viewport);
+            let resized = self
+                .framed
+                .is_some_and(|(_, framed_viewport)| framed_viewport != viewport);
+            match self.view {
+                Some(current) if !reduce_motion && !resized => {
+                    self.glide = Some(Glide {
+                        from: current,
+                        to: target,
+                        started: Instant::now(),
+                    });
+                }
+                _ => {
+                    self.glide = None;
+                    self.view = Some(target);
+                }
+            }
+            self.framed = Some((region, viewport));
+        }
+        let Some(glide) = &self.glide else {
+            return (
+                self.view.unwrap_or_else(|| frame_view(region, viewport)),
+                false,
+            );
+        };
+        let progress = glide.started.elapsed().as_secs_f32() / GLIDE_SECONDS;
+        if progress >= 1.0 {
+            let target = glide.to;
+            self.glide = None;
+            self.view = Some(target);
+            return (target, false);
+        }
+        let view = interpolate_view(glide.from, glide.to, FOCUS_EASING.ease(progress), viewport);
+        self.view = Some(view);
+        (view, true)
+    }
+
+    /// The user moved the view: it stays where they put it until the next
+    /// step or a fit.
+    fn adjust(&mut self) -> Option<&mut ViewState> {
+        self.user_adjusted = true;
+        self.glide = None;
+        self.view.as_mut()
+    }
+
+    fn reframe(&mut self) {
+        self.user_adjusted = false;
     }
 }
 
@@ -138,6 +290,10 @@ pub struct StrataView {
     canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     selected: Option<String>,
     focus_since: Option<Instant>,
+    framing: Framing,
+    /// What the current step changes, before or after it.
+    change_rects: Vec<Rect>,
+    change_region_step: Option<usize>,
     stack_collapsed: bool,
     reload_task: Task<()>,
     layout_task: Task<()>,
@@ -186,6 +342,9 @@ impl StrataView {
             canvas_bounds: Rc::new(Cell::new(None)),
             selected: None,
             focus_since: None,
+            framing: Framing::Changes,
+            change_rects: Vec::new(),
+            change_region_step: None,
             stack_collapsed: false,
             reload_task: Task::ready(()),
             layout_task: Task::ready(()),
@@ -340,10 +499,11 @@ impl StrataView {
             scene: Rc::new(Scene::empty()),
             layout,
         };
-        // A new layout has new sizes, so fit the view to it again.
-        self.camera = Camera::default();
         let end = self.duration();
         self.seek(end);
+        // Edits keep a view the user moved; otherwise the camera glides to
+        // what the edited step now changes.
+        self.update_change_region();
         if self
             .selected
             .as_deref()
@@ -397,6 +557,112 @@ impl StrataView {
         }
     }
 
+    fn update_change_region(&mut self) {
+        let State::Ready {
+            layout, timeline, ..
+        } = &self.state
+        else {
+            return;
+        };
+        let ends = [0.0, timeline.duration];
+        self.change_rects = ends
+            .iter()
+            .filter_map(|&t| Scene::at(&self.spec, self.step_index, timeline, t, layout))
+            .flat_map(|scene| {
+                let nodes = scene
+                    .nodes
+                    .iter()
+                    .filter(|node| node.look.mark.is_some())
+                    .map(|node| node.rect)
+                    .collect::<Vec<_>>();
+                let boundaries = scene
+                    .boundaries
+                    .iter()
+                    .filter(|boundary| boundary.look.mark.is_some())
+                    .map(|boundary| boundary.rect)
+                    .collect::<Vec<_>>();
+                nodes.into_iter().chain(boundaries)
+            })
+            .collect();
+        self.change_region_step = Some(self.step_index);
+    }
+
+    /// The layout region the camera frames when the user has not moved it.
+    fn framing_region(&self, content: layout::Size, viewport: gpui::Size<Pixels>) -> Rect {
+        let everything = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: content.w,
+            h: content.h,
+        };
+        if self.framing == Framing::Everything {
+            return everything;
+        }
+        let readable = |region: Rect| frame_view(region, viewport).scale >= READABLE_SCALE;
+        if readable(everything) {
+            return everything;
+        }
+        let Some(changes) = self.change_rects.iter().copied().reduce(union) else {
+            return everything;
+        };
+        if readable(changes) {
+            return changes;
+        }
+        // The changes spread wider than one readable view: frame the window
+        // at the smallest readable scale that holds the most of them.
+        let window = layout::Size {
+            w: (f32::from(viewport.width) - 2.0 * FIT_MARGIN).max(1.0) / READABLE_SCALE,
+            h: (f32::from(viewport.height) - 2.0 * FIT_MARGIN).max(1.0) / READABLE_SCALE,
+        };
+        densest_window(&self.change_rects, window).unwrap_or(changes)
+    }
+
+    pub fn zoom_percent(&self) -> Option<u32> {
+        self.camera
+            .view
+            .map(|view| (view.scale * 100.0).round() as u32)
+    }
+
+    pub fn framing(&self) -> Framing {
+        self.framing
+    }
+
+    /// Zooms by `factor` around `anchor`, a canvas point, or the center.
+    fn zoom_by(&mut self, factor: f32, anchor: Option<gpui::Point<f32>>, cx: &mut Context<Self>) {
+        let center = self.canvas_bounds.get().map(|bounds| {
+            point(
+                f32::from(bounds.size.width) / 2.0,
+                f32::from(bounds.size.height) / 2.0,
+            )
+        });
+        let Some(anchor) = anchor.or(center) else {
+            return;
+        };
+        let Some(view) = self.camera.adjust() else {
+            return;
+        };
+        let new_scale = (view.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
+        let ratio = new_scale / view.scale;
+        view.offset.x = anchor.x - (anchor.x - view.offset.x) * ratio;
+        view.offset.y = anchor.y - (anchor.y - view.offset.y) * ratio;
+        view.scale = new_scale;
+        cx.notify();
+    }
+
+    pub fn zoom_in(&mut self, cx: &mut Context<Self>) {
+        self.zoom_by(ZOOM_STEP, None, cx);
+    }
+
+    pub fn zoom_out(&mut self, cx: &mut Context<Self>) {
+        self.zoom_by(1.0 / ZOOM_STEP, None, cx);
+    }
+
+    pub fn set_framing(&mut self, framing: Framing, cx: &mut Context<Self>) {
+        self.framing = framing;
+        self.camera.reframe();
+        cx.notify();
+    }
+
     /// Jumps to `t` in the current step and stops playing.
     pub fn seek(&mut self, t: f32) {
         self.playback.t = t.clamp(0.0, self.duration());
@@ -417,6 +683,12 @@ impl StrataView {
             Phase::Before => 0.0,
             Phase::After => self.duration(),
         });
+        let step_changed = self.change_region_step != Some(step_index);
+        self.update_change_region();
+        if step_changed {
+            self.framing = Framing::Changes;
+            self.camera.reframe();
+        }
         if self
             .selected
             .as_deref()
@@ -585,6 +857,79 @@ impl StrataView {
     fn close_details(&mut self, _: &CloseDetails, _: &mut Window, cx: &mut Context<Self>) {
         self.select(None);
         cx.notify();
+    }
+
+    fn zoom_in_action(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_in(cx);
+    }
+
+    fn zoom_out_action(&mut self, _: &ZoomOut, _: &mut Window, cx: &mut Context<Self>) {
+        self.zoom_out(cx);
+    }
+
+    fn fit_to_view(&mut self, _: &FitToView, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_framing(Framing::Everything, cx);
+    }
+
+    fn frame_changes(&mut self, _: &FrameChanges, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_framing(Framing::Changes, cx);
+    }
+
+    /// Floats over the canvas's bottom right corner, like a map's controls.
+    fn render_zoom_controls(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let percent = self.zoom_percent()?;
+        let framed = !self.camera.user_adjusted;
+        let framing = self.framing;
+        Some(
+            h_flex()
+                .absolute()
+                .bottom_2()
+                .right_2()
+                .gap_0p5()
+                .p_0p5()
+                .elevation_2(cx)
+                .child(
+                    IconButton::new("strata-zoom-out", IconName::Dash)
+                        .icon_size(IconSize::Small)
+                        .tooltip(|_, cx| Tooltip::for_action("Zoom Out", &ZoomOut, cx))
+                        .on_click(cx.listener(|this, _, _, cx| this.zoom_out(cx))),
+                )
+                .child(
+                    div().w(px(40.)).flex().justify_center().child(
+                        Label::new(format!("{percent}%"))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+                )
+                .child(
+                    IconButton::new("strata-zoom-in", IconName::Plus)
+                        .icon_size(IconSize::Small)
+                        .tooltip(|_, cx| Tooltip::for_action("Zoom In", &ZoomIn, cx))
+                        .on_click(cx.listener(|this, _, _, cx| this.zoom_in(cx))),
+                )
+                .child(Divider::vertical())
+                .child(
+                    IconButton::new("strata-frame-changes", IconName::Crosshair)
+                        .icon_size(IconSize::Small)
+                        .toggle_state(framed && framing == Framing::Changes)
+                        .tooltip(|_, cx| {
+                            Tooltip::for_action("Frame This Step's Changes", &FrameChanges, cx)
+                        })
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.set_framing(Framing::Changes, cx)),
+                        ),
+                )
+                .child(
+                    IconButton::new("strata-fit-to-view", IconName::Maximize)
+                        .icon_size(IconSize::Small)
+                        .toggle_state(framed && framing == Framing::Everything)
+                        .tooltip(|_, cx| Tooltip::for_action("Fit Stack to View", &FitToView, cx))
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.set_framing(Framing::Everything, cx)),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The focus for the selected element, at the current time.
@@ -763,29 +1108,37 @@ impl StrataView {
         press.dragged = true;
         let delta = event.position - press.last;
         press.last = event.position;
-        let Some(view) = self.camera.view.as_mut() else {
+        self.pan_by(delta, cx);
+    }
+
+    fn pan_by(&mut self, delta: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(view) = self.camera.adjust() else {
             return;
         };
         view.offset.x += f32::from(delta.x);
         view.offset.y += f32::from(delta.y);
-        self.camera.user_adjusted = true;
         cx.notify();
     }
 
+    /// Scrolling pans and Cmd or Ctrl with scrolling zooms, as in Zed's
+    /// image viewer.
     fn on_scroll(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let cursor = self.canvas_point(event.position);
-        let Some(view) = self.camera.view.as_mut() else {
-            return;
-        };
         let delta = event.delta.pixel_delta(px(LINE_SCROLL_PIXELS));
-        let new_scale =
-            (view.scale * (f32::from(delta.y) * ZOOM_PER_PIXEL).exp()).clamp(MIN_SCALE, MAX_SCALE);
-        let ratio = new_scale / view.scale;
-        view.offset.x = cursor.x - (cursor.x - view.offset.x) * ratio;
-        view.offset.y = cursor.y - (cursor.y - view.offset.y) * ratio;
-        view.scale = new_scale;
-        self.camera.user_adjusted = true;
-        cx.notify();
+        if event.modifiers.control || event.modifiers.platform {
+            let cursor = self.canvas_point(event.position);
+            self.zoom_by(
+                (f32::from(delta.y) * ZOOM_PER_PIXEL).exp(),
+                Some(cursor),
+                cx,
+            );
+        } else {
+            self.pan_by(delta, cx);
+        }
+    }
+
+    fn on_pinch(&mut self, event: &PinchEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let cursor = self.canvas_point(event.position);
+        self.zoom_by(1.0 + event.delta, Some(cursor), cx);
     }
 
     fn render_canvas(
@@ -803,7 +1156,11 @@ impl StrataView {
                 .child(Label::new(message.clone()).color(Color::Error))
                 .into_any_element(),
             State::Ready { scene, .. } => {
-                let view = self.camera.view_for(scene.size, viewport);
+                let region = self.framing_region(scene.size, viewport);
+                let (view, gliding) = self.camera.view_for(region, viewport, cx.reduce_motion());
+                if gliding {
+                    window.request_animation_frame();
+                }
                 let scene = scene.clone();
                 let selected = self.selected.as_deref().and_then(|id| self.scene_rect(id));
                 let focus = self.focus();
@@ -1308,8 +1665,10 @@ impl Render for StrataView {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll(cx.listener(Self::on_scroll))
+            .on_pinch(cx.listener(Self::on_pinch))
             .child(canvas_content)
-            .children(self.render_details(cx));
+            .children(self.render_details(cx))
+            .children(self.render_zoom_controls(cx));
 
         v_flex()
             .id("StrataView")
@@ -1328,6 +1687,10 @@ impl Render for StrataView {
             .on_action(cx.listener(Self::show_before))
             .on_action(cx.listener(Self::show_after))
             .on_action(cx.listener(Self::close_details))
+            .on_action(cx.listener(Self::zoom_in_action))
+            .on_action(cx.listener(Self::zoom_out_action))
+            .on_action(cx.listener(Self::fit_to_view))
+            .on_action(cx.listener(Self::frame_changes))
             .children(self.render_problems(cx))
             .children(self.render_description(cx))
             .child(canvas_area)
@@ -1499,5 +1862,54 @@ impl StrataView {
     #[cfg(any(test, feature = "test-support"))]
     pub fn selected_id(&self) -> Option<&str> {
         self.selected.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod camera_tests {
+    use super::*;
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    fn viewport() -> gpui::Size<Pixels> {
+        size(px(800.0), px(600.0))
+    }
+
+    #[test]
+    fn framing_centers_the_region_and_never_passes_actual_size() {
+        let view = frame_view(rect(100.0, 100.0, 50.0, 50.0), viewport());
+        assert_eq!(view.scale, MAX_FRAME_SCALE);
+        let center = point(
+            125.0 * view.scale + view.offset.x,
+            125.0 * view.scale + view.offset.y,
+        );
+        assert_eq!(center, point(400.0, 300.0));
+    }
+
+    #[test]
+    fn a_glide_starts_and_ends_on_its_views() {
+        let from = frame_view(rect(0.0, 0.0, 2000.0, 1000.0), viewport());
+        let to = frame_view(rect(600.0, 300.0, 200.0, 100.0), viewport());
+        assert_eq!(interpolate_view(from, to, 0.0, viewport()), from);
+        let end = interpolate_view(from, to, 1.0, viewport());
+        assert!((end.scale - to.scale).abs() < 1e-4);
+        assert!((end.offset.x - to.offset.x).abs() < 1e-2);
+        assert!((end.offset.y - to.offset.y).abs() < 1e-2);
+    }
+
+    #[test]
+    fn the_densest_window_holds_the_largest_cluster() {
+        let cluster = [
+            rect(0.0, 0.0, 100.0, 60.0),
+            rect(150.0, 0.0, 100.0, 60.0),
+            rect(0.0, 100.0, 100.0, 60.0),
+        ];
+        let outlier = rect(5000.0, 5000.0, 100.0, 60.0);
+        let mut rects = cluster.to_vec();
+        rects.push(outlier);
+        let framed = densest_window(&rects, layout::Size { w: 600.0, h: 400.0 });
+        assert_eq!(framed, Some(rect(0.0, 0.0, 250.0, 160.0)));
     }
 }

@@ -43,6 +43,14 @@ actions!(
         ShowAfter,
         /// Closes the details of the selected element.
         CloseDetails,
+        /// Zooms the stack in.
+        ZoomIn,
+        /// Zooms the stack out.
+        ZoomOut,
+        /// Fits the whole stack in view.
+        FitToView,
+        /// Frames what the current step changes.
+        FrameChanges,
     ]
 );
 

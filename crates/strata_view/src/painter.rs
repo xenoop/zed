@@ -87,7 +87,7 @@ impl TextMeasure for WindowText {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct ViewState {
     pub offset: gpui::Point<f32>,
     pub scale: f32,
@@ -294,8 +294,8 @@ impl Painter<'_> {
             (None, _) => (
                 self.tint_color(fill),
                 self.tint_color(self.colors.boundary_border),
-                theme::COMPOUND_BORDER_WIDTH * scale,
-                BorderStyle::Dashed,
+                (theme::COMPOUND_BORDER_WIDTH * scale).max(1.0),
+                BorderStyle::Solid,
             ),
         };
         window.paint_quad(gpui::quad(
@@ -306,9 +306,10 @@ impl Painter<'_> {
             border,
             border_style,
         ));
-        let size_px = theme::COMPOUND_TITLE_SIZE;
-        let title_origin_y =
-            theme::COMPOUND_TITLE_TOP + (theme::COMPOUND_TITLE_MIN_HEIGHT - size_px) / 2.0;
+        // Titles stay legible when zoomed out, like labels on a map.
+        let size_px = theme::COMPOUND_TITLE_SIZE.max(theme::COMPOUND_TITLE_MIN_SCREEN_SIZE / scale);
+        let title_origin_y = theme::COMPOUND_TITLE_TOP
+            + ((theme::COMPOUND_TITLE_MIN_HEIGHT - size_px) / 2.0).max(0.0);
         let title_color = match (mark, item.look.ghost) {
             (Some(mark), true) => mark,
             _ => self.colors.boundary_title,
@@ -359,11 +360,14 @@ impl Painter<'_> {
         let width = px(match self.flow {
             Some(_) => theme::ACTIVE_EDGE_WIDTH,
             None => theme::EDGE_WIDTH,
-        } * scale);
-        let edge_color = match item.look.mark {
-            Some(mark) => self.tint_color(self.colors.mark(mark)),
-            None => self.tint_color(self.colors.edge),
+        } * scale)
+        .max(px(1.0));
+        let edge_color = match (item.look.mark, self.flow) {
+            (Some(mark), _) => self.tint_color(self.colors.mark(mark)),
+            (None, Some(_)) => self.tint_color(self.colors.accent),
+            (None, None) => self.tint_color(self.colors.edge),
         };
+        let arrow = (item.drawn >= 1.0).then(|| arrow_corners(item)).flatten();
         let mut builder = PathBuilder::stroke(width);
         if let Some(flow) = self.flow {
             let pattern = flowing_dash(theme::FLOW_DASH[0], theme::FLOW_DASH[1], flow);
@@ -395,37 +399,21 @@ impl Painter<'_> {
                 );
             }
         }
+        // The layout leaves room for a larger arrowhead; the line runs on to
+        // meet the smaller one.
+        if let Some([_, base, _, _]) = arrow {
+            builder.line_to(self.transform.point(base));
+        }
         match builder.build() {
             Ok(path) => window.paint_path(path, edge_color),
             Err(error) => log::error!("strata: could not tessellate edge: {error}"),
         }
 
         // The arrowhead lands once the line has been drawn all the way.
-        if item.drawn < 1.0 {
-            return;
-        }
-        let Some(&base) = item.points.last() else {
+        let Some([tip, _, left, right]) = arrow else {
             return;
         };
-        let tip = item.tip;
-        let (dx, dy) = (tip.x - base.x, tip.y - base.y);
-        let length = dx.hypot(dy);
-        if length < 0.01 {
-            return;
-        }
-        let normal = (-dy / length, dx / length);
-        let half_width = length * 0.42;
-        let corners = [
-            tip,
-            layout::Point {
-                x: base.x + normal.0 * half_width,
-                y: base.y + normal.1 * half_width,
-            },
-            layout::Point {
-                x: base.x - normal.0 * half_width,
-                y: base.y - normal.1 * half_width,
-            },
-        ];
+        let corners = [tip, left, right];
         let mut head = if item.hollow_head {
             PathBuilder::stroke(px(theme::EDGE_WIDTH * 0.66 * scale))
         } else {
@@ -455,7 +443,9 @@ impl Painter<'_> {
         window.paint_quad(gpui::quad(
             bounds,
             Corners::all(px(theme::EDGE_LABEL_RADIUS * scale)),
-            self.tint_color(self.colors.label_background),
+            // A knockout in the canvas color, so it hides lines crossing the
+            // label however faded the label's own relationship is.
+            self.colors.label_background,
             0.0,
             gpui::transparent_black(),
             BorderStyle::default(),
@@ -866,6 +856,38 @@ impl Painter<'_> {
 pub const FOCUS_EASING: CubicBezier = CubicBezier::new(0.5, 0.0, 0.2, 1.0);
 
 /// Whether `ancestor` is on `element`'s parent chain in `step`.
+/// The tip, the base where the line meets the head, and the two back corners
+/// of a relationship's arrowhead.
+fn arrow_corners(item: &EdgeItem) -> Option<[layout::Point; 4]> {
+    let tip = item.tip;
+    let last = *item.points.last()?;
+    let (dx, dy) = (tip.x - last.x, tip.y - last.y);
+    let length = dx.hypot(dy);
+    if length < 0.01 {
+        return None;
+    }
+    let direction = (dx / length, dy / length);
+    let arrow_length = theme::ARROW_LENGTH.min(length);
+    let base = layout::Point {
+        x: tip.x - direction.0 * arrow_length,
+        y: tip.y - direction.1 * arrow_length,
+    };
+    let normal = (-direction.1, direction.0);
+    let half_width = theme::ARROW_HALF_WIDTH * arrow_length / theme::ARROW_LENGTH;
+    Some([
+        tip,
+        base,
+        layout::Point {
+            x: base.x + normal.0 * half_width,
+            y: base.y + normal.1 * half_width,
+        },
+        layout::Point {
+            x: base.x - normal.0 * half_width,
+            y: base.y - normal.1 * half_width,
+        },
+    ])
+}
+
 pub fn has_ancestor(step: &Step, element: &Element, ancestor: &str) -> bool {
     let mut current = element.parent.as_deref();
     let mut remaining = step.elements.len();
@@ -929,6 +951,19 @@ impl Focus {
     }
 }
 
+/// Unchanged items step back to the timeline's dim opacity, which on Zed's
+/// low-contrast cards reads as gone rather than as context; this curve keeps
+/// them legible (0.3 shows at about 0.5) while marked items stay as they are.
+fn present(look: &Look) -> Look {
+    if look.mark.is_some() || look.ghost {
+        return *look;
+    }
+    Look {
+        alpha: look.alpha.clamp(0.0, 1.0).powf(theme::UNCHANGED_PRESENCE),
+        ..*look
+    }
+}
+
 /// What the click selected: its focus, and the rect to ring.
 pub struct Highlight<'a> {
     pub focus: Option<&'a Focus>,
@@ -962,11 +997,15 @@ pub fn paint_scene(
         flow: None,
     };
     let Highlight { focus, selected } = highlight;
-    let element = |id: &str, look: &Look| match focus {
-        Some(focus) => focus.element_look(id, look),
-        None => (look.alpha, 1.0),
+    let element = |id: &str, look: &Look| {
+        let look = present(look);
+        match focus {
+            Some(focus) => focus.element_look(id, &look),
+            None => (look.alpha, 1.0),
+        }
     };
     let relationship = |edge: &EdgeItem| -> ((f32, f32), Option<f32>) {
+        let look = present(&edge.look);
         match focus {
             Some(focus)
                 if focus
@@ -985,8 +1024,8 @@ pub fn paint_scene(
                     Some(focus.flow),
                 )
             }
-            Some(focus) => (focus.dimmed(edge.look.alpha), None),
-            None => ((edge.look.alpha, 1.0), None),
+            Some(focus) => (focus.dimmed(look.alpha), None),
+            None => ((look.alpha, 1.0), None),
         }
     };
     for boundary in &scene.boundaries {
