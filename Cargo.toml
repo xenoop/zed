@@ -920,8 +920,8 @@ sqlformat = "0.2"
 sqlx = { version = "0.8", default-features = false }
 stacksafe = "1.0"
 streaming-iterator = "0.1"
-strata-core = { git = "https://github.com/xenoop/strata", rev = "1232631fee970e2ea66d410f6f44cae828a9668a", default-features = false }
-strata-spec = { git = "https://github.com/xenoop/strata", rev = "1232631fee970e2ea66d410f6f44cae828a9668a" }
+strata-core = { git = "https://github.com/xenoop/strata", rev = "acd829ac0cb603cc7a649006c10f39c4a4b817ee", default-features = false }
+strata-spec = { git = "https://github.com/xenoop/strata", rev = "acd829ac0cb603cc7a649006c10f39c4a4b817ee" }
 strsim = "0.11"
 strum = { version = "0.28", features = ["derive"] }
 swash = "0.2.6"

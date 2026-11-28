@@ -250,6 +250,8 @@ struct Painter<'a> {
     flow: Option<f32>,
     /// Whether the element being painted is under the mouse.
     hovered: bool,
+    /// The scene's own opacity, applied on top of each item's.
+    opacity: f32,
 }
 
 impl Painter<'_> {
@@ -264,7 +266,7 @@ impl Painter<'_> {
     /// shaped text instead of shaping it again on every frame.
     fn set_item(&mut self, alpha: f32, saturation: f32) {
         let quantize = |value: f32| (value.clamp(0.0, 1.0) * 64.0).round();
-        self.alpha = quantize(alpha) / 64.0;
+        self.alpha = quantize(alpha * self.opacity) / 64.0;
         self.saturation = quantize(saturation) / 64.0;
     }
 
@@ -482,7 +484,9 @@ impl Painter<'_> {
             Corners::all(px(theme::EDGE_LABEL_RADIUS * scale)),
             // A knockout in the canvas color, so it hides lines crossing the
             // label however faded the label's own relationship is.
-            self.colors.label_background,
+            self.colors
+                .label_background
+                .opacity(self.opacity.clamp(0.0, 1.0)),
             0.0,
             gpui::transparent_black(),
             BorderStyle::default(),
@@ -587,6 +591,19 @@ impl Painter<'_> {
             })
             .collect();
         window.paint_drop_shadows(bounds, radii, &shadows);
+        if let Some(mark) = mark.filter(|_| item.look.glow > 0.0) {
+            window.paint_drop_shadows(
+                bounds,
+                radii,
+                &[BoxShadow {
+                    color: mark.opacity(theme::LANDING_GLOW_OPACITY * item.look.glow),
+                    offset: gpui::point(px(0.0), px(0.0)),
+                    blur_radius: px(theme::LANDING_GLOW_BLUR * scale.max(0.5)),
+                    spread_radius: px(theme::LANDING_GLOW_SPREAD * scale.max(0.5)),
+                    inset: false,
+                }],
+            );
+        }
 
         match item.kind {
             ElementKind::Store => self.paint_cylinder(&item.rect, window),
@@ -1186,6 +1203,10 @@ pub struct Highlight<'a> {
     pub focus: Option<&'a Focus>,
     pub selected: Option<Rect>,
     pub hovered: Option<&'a str>,
+    /// The whole scene's opacity, for fading one step's picture into the next.
+    pub opacity: f32,
+    /// Whether to paint the dot grid under this scene.
+    pub grid: bool,
 }
 
 pub fn paint_scene(
@@ -1214,13 +1235,18 @@ pub fn paint_scene(
         saturation: 1.0,
         flow: None,
         hovered: false,
+        opacity: highlight.opacity,
     };
     let Highlight {
         focus,
         selected,
         hovered,
+        grid,
+        ..
     } = highlight;
-    painter.paint_grid(window);
+    if grid {
+        painter.paint_grid(window);
+    }
     let element = |id: &str, look: &Look| {
         let look = present(look);
         match focus {

@@ -6,7 +6,7 @@ use gpui::SharedString;
 use strata_core::layout::{self, Layout, Point, Rect};
 #[cfg(test)]
 use strata_core::timeline::step_timeline;
-use strata_core::timeline::{Frame, Side, Timeline, sample};
+use strata_core::timeline::{Frame, Side, Timeline, frame_path, sample};
 use strata_spec::{Element, ElementKind, Relationship, RelationshipKind, Spec, Step};
 
 pub use strata_core::timeline::Mark;
@@ -27,6 +27,8 @@ pub struct Look {
     pub mark: Option<Mark>,
     /// Drawn as a dashed outline only: where an element was, or will be.
     pub ghost: bool,
+    /// How brightly the item glows as it lands, 0 to 1.
+    pub glow: f32,
 }
 
 #[cfg(test)]
@@ -35,11 +37,13 @@ impl Look {
         alpha: 1.0,
         mark: None,
         ghost: false,
+        glow: 0.0,
     };
     const DIMMED: Look = Look {
         alpha: strata_core::timeline::timing::UNCHANGED_OPACITY,
         mark: None,
         ghost: false,
+        glow: 0.0,
     };
 }
 
@@ -202,6 +206,7 @@ impl Scene {
                 alpha: item.opacity,
                 mark: item.mark,
                 ghost: item.ghost,
+                glow: item.glow,
             };
             if layout.is_boundary(step, element) {
                 let previous_title = before
@@ -242,10 +247,10 @@ impl Scene {
             let Some(relationship) = find_relationship(step, &item.from, &item.to) else {
                 continue;
             };
-            let Some(path) = layout.edge_path(step, relationship) else {
+            let Some((points, arrow_tip)) = frame_path(layout, previous, next, item) else {
                 continue;
             };
-            let Some(&last) = path.points.last() else {
+            let Some(&last) = points.last() else {
                 continue;
             };
             let label = layout
@@ -260,22 +265,24 @@ impl Scene {
                         technology,
                     })
                 })
-                .filter(|_| !item.ghost);
-            let tip = path.arrow_tip.unwrap_or(last);
+                // A label waits for a morphing path to reach its new route.
+                .filter(|_| !item.ghost && item.morph.is_none());
+            let tip = arrow_tip.unwrap_or(last);
             edges.push(EdgeItem {
                 from: relationship.from.clone().into(),
                 to: relationship.to.clone().into(),
-                points: path.points.clone(),
+                bounds: bounds_of(&points, Some(tip)),
+                points,
                 tip,
                 dashed: item.ghost || relationship.kind == RelationshipKind::Implements,
                 hollow_head: relationship.kind == RelationshipKind::Implements,
-                bounds: bounds_of(&path.points, Some(tip)),
                 label,
                 drawn: item.drawn,
                 look: Look {
                     alpha: item.opacity,
                     mark: item.mark,
                     ghost: item.ghost,
+                    glow: 0.0,
                 },
             });
         }

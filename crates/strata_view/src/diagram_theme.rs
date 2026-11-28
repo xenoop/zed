@@ -109,6 +109,10 @@ pub const BADGE_RADIUS: f32 = 4.0;
 pub const BADGE_FILL_OPACITY: f32 = 0.16;
 
 pub const SELECTION_GLOW_OPACITY: f32 = 0.35;
+/// The glow of an element landing in a step, in its change color.
+pub const LANDING_GLOW_OPACITY: f32 = 0.55;
+pub const LANDING_GLOW_BLUR: f32 = 22.0;
+pub const LANDING_GLOW_SPREAD: f32 = 3.0;
 pub const SELECTION_GLOW_BLUR: f32 = 16.0;
 pub const SELECTION_GLOW_SPREAD: f32 = 2.0;
 

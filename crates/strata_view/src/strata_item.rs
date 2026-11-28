@@ -16,7 +16,7 @@ use multi_buffer::MultiBuffer;
 use settings::Settings;
 use strata_core::diff::{ElementChange, RelationshipChange, diff_into};
 use strata_core::layout::{self, EdgeRouting, Layout, LayoutEngine, Measure, Rect};
-use strata_core::timeline::{Timeline, step_timeline};
+use strata_core::timeline::{Timeline, step_timeline_in};
 use strata_spec::{Diagnostic, Element, Relationship, Spec, Step};
 use theme::ActiveTheme;
 use theme_settings::ThemeSettings;
@@ -70,7 +70,11 @@ const ZOOM_STEP: f32 = 1.25;
 /// Layout pixels kept around an element the camera glides to.
 const SELECTION_FRAME_MARGIN: f32 = 160.0;
 /// How long the camera takes to glide to a new framing.
-const GLIDE_SECONDS: f32 = 0.55;
+const GLIDE_SECONDS: f32 = 0.6;
+/// A glide zooms out on the way once it travels further than this share of
+/// the viewport, by up to this factor.
+const GLIDE_DIP_FROM: f32 = 0.35;
+const GLIDE_MAX_DIP: f32 = 1.5;
 
 /// The view that fits `region` (in layout coordinates) centered in `viewport`.
 fn frame_view(region: Rect, viewport: gpui::Size<Pixels>) -> ViewState {
@@ -115,7 +119,16 @@ fn interpolate_view(
         )
     };
     let (from_center, to_center) = (center_of(from), center_of(to));
-    let scale = from.scale * (to.scale / from.scale).powf(progress);
+    // A glide between places far apart zooms out on the way, as maps do when
+    // they fly between places, so it never crosses only empty canvas.
+    let distance =
+        (to_center.x - from_center.x).hypot(to_center.y - from_center.y) * from.scale.min(to.scale);
+    let span = f32::from(viewport.width)
+        .max(f32::from(viewport.height))
+        .max(1.0);
+    let dip = (distance / span - GLIDE_DIP_FROM).clamp(0.0, GLIDE_MAX_DIP);
+    let scale = from.scale * (to.scale / from.scale).powf(progress)
+        / (1.0 + dip * (std::f32::consts::PI * progress).sin());
     let center = point(
         from_center.x + (to_center.x - from_center.x) * progress,
         from_center.y + (to_center.y - from_center.y) * progress,
@@ -303,6 +316,11 @@ pub struct StrataView {
     framing: Framing,
     /// The element under the mouse, outlined and given a pointer cursor.
     hovered: Option<String>,
+    /// Playback of a newly shown step waits while the camera glides to it.
+    awaiting_camera: bool,
+    /// The picture of the step shown before the current one, fading out
+    /// since the moment the step changed.
+    outgoing: Option<(Rc<Scene>, Instant)>,
     /// What the current step changes, before or after it.
     change_rects: Vec<Rect>,
     change_region_step: Option<usize>,
@@ -356,6 +374,8 @@ impl StrataView {
             focus_since: None,
             framing: Framing::Changes,
             hovered: None,
+            awaiting_camera: false,
+            outgoing: None,
             change_rects: Vec::new(),
             change_region_step: None,
             stack_collapsed: false,
@@ -517,7 +537,7 @@ impl StrataView {
         self.spec = spec;
         self.step_index = step_index;
         self.state = State::Ready {
-            timeline: Rc::new(step_timeline(&self.spec, step_index)),
+            timeline: Rc::new(step_timeline_in(&self.spec, step_index, &layout)),
             scene: Rc::new(Scene::empty()),
             layout,
         };
@@ -709,9 +729,18 @@ impl StrataView {
         if step_index >= self.spec.steps.len() {
             return;
         }
+        if step_index != self.step_index
+            && !cx.reduce_motion()
+            && let State::Ready { scene, .. } = &self.state
+        {
+            self.outgoing = Some((scene.clone(), Instant::now()));
+        }
         self.step_index = step_index;
-        if let State::Ready { timeline, .. } = &mut self.state {
-            *timeline = Rc::new(step_timeline(&self.spec, step_index));
+        if let State::Ready {
+            timeline, layout, ..
+        } = &mut self.state
+        {
+            *timeline = Rc::new(step_timeline_in(&self.spec, step_index, layout));
         }
         self.seek(match phase {
             Phase::Before => 0.0,
@@ -722,6 +751,7 @@ impl StrataView {
         if step_changed {
             self.framing = Framing::Changes;
             self.camera.reframe();
+            self.awaiting_camera = true;
         }
         if self
             .selected
@@ -796,6 +826,13 @@ impl StrataView {
     fn advance(&mut self, window: &Window) {
         if !self.playback.playing {
             self.playback.last_tick = None;
+            return;
+        }
+        // The step's change starts once the camera has arrived at it, so the
+        // beats play where the eye already is rather than during the move.
+        if self.awaiting_camera {
+            self.playback.last_tick = None;
+            window.request_animation_frame();
             return;
         }
         let now = Instant::now();
@@ -1226,6 +1263,8 @@ impl StrataView {
                 let (view, gliding) = self.camera.view_for(region, viewport, cx.reduce_motion());
                 if gliding {
                     window.request_animation_frame();
+                } else {
+                    self.awaiting_camera = false;
                 }
                 let scene = scene.clone();
                 let selected = self.selected.as_deref().and_then(|id| self.scene_rect(id));
@@ -1237,16 +1276,50 @@ impl StrataView {
                 let cache = self.text_cache.clone();
                 let hovered = self.hovered.clone();
                 let colors = DiagramColors::from_theme(cx);
+                // The previous step's picture fades out while the new one
+                // fades in, over the camera's glide.
+                let outgoing = self.outgoing.take().and_then(|(previous, since)| {
+                    let progress = since.elapsed().as_secs_f32() / GLIDE_SECONDS;
+                    (progress < 1.0).then(|| {
+                        self.outgoing = Some((previous.clone(), since));
+                        (previous, FOCUS_EASING.ease(progress))
+                    })
+                });
+                if outgoing.is_some() {
+                    window.request_animation_frame();
+                }
+                let incoming = outgoing.as_ref().map_or(1.0, |(_, progress)| *progress);
                 canvas(
                     |_, _, _| {},
                     move |bounds: Bounds<Pixels>, _, window, cx| {
                         window.paint_layer(|window| {
+                            if let Some((previous, progress)) = &outgoing {
+                                paint_scene(
+                                    previous,
+                                    Highlight {
+                                        focus: None,
+                                        selected: None,
+                                        hovered: None,
+                                        opacity: 1.0 - progress,
+                                        grid: true,
+                                    },
+                                    view,
+                                    bounds,
+                                    &cache,
+                                    &font,
+                                    colors,
+                                    window,
+                                    cx,
+                                );
+                            }
                             paint_scene(
                                 &scene,
                                 Highlight {
                                     focus: focus.as_ref(),
                                     selected,
                                     hovered: hovered.as_deref(),
+                                    opacity: incoming,
+                                    grid: outgoing.is_none(),
                                 },
                                 view,
                                 bounds,
